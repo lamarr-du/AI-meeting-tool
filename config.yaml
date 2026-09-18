@@ -1,0 +1,60 @@
+# AI 会议纪要小工具 — 用户配置（缺项自动使用代码内置默认值，见 meetmin/config.py）
+
+output_dir: data
+
+recorder:
+  device: null        # 内录设备索引或名称片段；null = 默认输出设备的 loopback（python main.py devices 查看）
+  channels: null
+  sample_rate: null
+
+asr:
+  provider: faster_whisper   # faster_whisper（本地离线，零 token）| dashscope（云端 Paraformer，自带分离）
+  language: zh               # null = 自动检测语种
+  model_size: small          # 电脑弱用 tiny/base；追求精度用 medium / large-v3-turbo（首次运行自动下载）
+  device: auto               # auto / cpu / cuda
+  compute_type: int8
+  beam_size: 1
+  word_timestamps: true      # 说话人分离对齐需要
+  hf_endpoint: null          # 国内下不动模型时改: https://hf-mirror.com
+  hf_disable_xet: true       # 规避 Xet 重建服务 401；需要 Xet 时设 false
+
+diarization:
+  enabled: true
+  provider: ecapa_speechbrain   # ecapa_speechbrain | single（未装 speechbrain 会自动降级并提示）
+  num_speakers: null            # 已知参会人数时填写，分离效果更好
+  window_sec: 1.5
+  hop_sec: 0.75
+  cluster_threshold: 0.55       # 分不清谁是谁时调大；把一人拆成多人时调小
+  min_window_rms: 0.003
+  min_group_sec: 0.4
+
+dashscope_asr:               # 仅 asr.provider=dashscope 时使用
+  base_url: https://dashscope.aliyuncs.com
+  api_key_env: DASHSCOPE_API_KEY
+  model: paraformer-v2
+  speaker_count: null
+  language_hints: [zh, en]
+  poll_interval_sec: 3
+  timeout_sec: 1800
+
+llm:
+  provider: openai_compatible  # openai_compatible | mock（不调 API、离线联调用）
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1  # 其它 OpenAI 兼容服务同样可用
+  api_key_env: DASHSCOPE_API_KEY   # $env:DASHSCOPE_API_KEY="sk-xxx"
+  model: qwen-3.8-flash            # ← 按你实际使用的模型名修改
+  temperature: 0.3
+  max_output_tokens: 2000
+  timeout_sec: 120
+  retries: 3
+  extra_request: {}                # 例如 DashScope 思考模型可设 {enable_thinking: false} 省输出 token
+
+summarizer:
+  strategy: auto                   # auto | direct | map_reduce
+  merge_same_speaker: true         # 省 token：相邻同发言人的句子合并成一条
+  with_timestamps: false           # 省 token：默认不把时间戳喂给模型
+  max_chunk_chars: 4000
+  direct_threshold_chars: 9000
+  chars_per_token: 1.5             # 用量估算系数
+  price_per_1k_input: 0.0          # 元/千token，填了才输出成本估算
+  price_per_1k_output: 0.0
+  guess_speaker_roles: false       # 让模型推断"说话人A≈主持人"等角色

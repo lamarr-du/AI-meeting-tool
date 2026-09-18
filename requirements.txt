@@ -1,0 +1,7 @@
+# 核心依赖（Windows / Python 3.9–3.13）
+numpy>=1.26
+PyYAML>=6.0
+requests>=2.31
+soxr>=0.3                 # 高质量重采样（缺失时自动降级为线性插值）
+pyaudiowpatch>=0.2.12.3   # Windows WASAPI loopback 内录
+faster-whisper>=1.0.3     # 本地离线语音转文字（含 Silero VAD，解码支持 wav/mp3 等）

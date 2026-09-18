@@ -1,0 +1,8 @@
+extends_note: 仅冒烟用（tiny 模型 + 关闭分离 + mock LLM）
+asr:
+  model_size: tiny
+  hf_endpoint: https://hf-mirror.com
+diarization:
+  enabled: false
+llm:
+  provider: mock
