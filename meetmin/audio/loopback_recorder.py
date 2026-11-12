@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import threading
 import wave
+
+import numpy as np
 from pathlib import Path
 
 
@@ -48,17 +50,27 @@ class LoopbackRecorder:
         channels: int | None = None,
         sample_rate: int | None = None,
         chunk_ms: int = 100,
+        silence_threshold: float = 0.003,
     ):
         self.device = device
         self.channels = channels
         self.sample_rate = sample_rate
         self.chunk_ms = max(20, int(chunk_ms))
+        self.silence_threshold = float(silence_threshold)
+        if not 0 <= self.silence_threshold <= 1:
+            raise ValueError("silence_threshold 必须在 0 到 1 之间")
+        self._level_lock = threading.Lock()
+        self._frames = 0
+        self._silent_frames = 0
+        self._active_frames = 0
+        self._level = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
         self._pa = None
         self._stream = None
         self._wf = None
+        self._audio_file = None
         self._chunks = 0
         self._chunk_frames = 0
         self.device_name = ""
@@ -92,7 +104,7 @@ class LoopbackRecorder:
         raise RuntimeError("未找到 WASAPI loopback 设备（需要 Windows，且系统有可用输出设备）")
 
     # ---------------- 生命周期 ----------------
-    def start(self, wav_path: str | Path) -> None:
+    def start(self, wav_path: str | Path, *, overwrite: bool = False) -> None:
         if self._thread is not None:
             raise RuntimeError("录音已在进行中")
         pyaudio = _import_pyaudio()
@@ -104,7 +116,8 @@ class LoopbackRecorder:
             path = Path(wav_path)
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            self._wf = wave.open(str(path), "wb")
+            self._audio_file = path.open("wb" if overwrite else "xb")
+            self._wf = wave.open(self._audio_file, "wb")
             self._wf.setnchannels(ch)
             self._wf.setsampwidth(2)
             self._wf.setframerate(sr)
@@ -137,6 +150,7 @@ class LoopbackRecorder:
                 data = self._stream.read(self._chunk_frames, exception_on_overflow=False)
                 self._wf.writeframes(data)
                 self._chunks += 1
+                self._update_level(data)
         except Exception as e:  # 记录错误，由 stop() 抛出
             self._error = e
         finally:
@@ -145,12 +159,37 @@ class LoopbackRecorder:
             except Exception:
                 pass
 
+    def _update_level(self, data: bytes) -> None:
+        samples = np.frombuffer(data, dtype="<i2").astype(np.float64)
+        frames = len(samples) // self.channels_actual
+        if not frames:
+            return
+        level = float(np.sqrt(np.mean((samples / 32768.0) ** 2)))
+        with self._level_lock:
+            self._level = level
+            self._frames += frames
+            if level < self.silence_threshold:
+                self._silent_frames += frames
+            else:
+                self._silent_frames = 0
+                self._active_frames += frames
+
+    def status(self) -> dict:
+        with self._level_lock:
+            sr = self.sample_rate_actual or 1
+            return {"duration_sec": self._frames / sr, "level": self._level,
+                    "silent_sec": self._silent_frames / sr,
+                    "active_fraction": self._active_frames / self._frames if self._frames else 0.0,
+                    "failed": self._error is not None}
+
     def stop(self) -> dict:
         if self._thread is None:
             raise RuntimeError("未在录音")
         self._stop.set()
         self._thread.join(timeout=5)
+        stats = self.status()
         info = self._cleanup()
+        info.update(stats)
         if self._error is not None:
             raise self._error
         return info
@@ -170,6 +209,9 @@ class LoopbackRecorder:
             except Exception:
                 pass
             self._wf = None
+        if self._audio_file is not None:
+            self._audio_file.close()
+            self._audio_file = None
         if self._pa is not None:
             try:
                 self._pa.terminate()

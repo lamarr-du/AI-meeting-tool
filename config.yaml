@@ -6,6 +6,7 @@ recorder:
   device: null        # 内录设备索引或名称片段；null = 默认输出设备的 loopback（python main.py devices 查看）
   channels: null
   sample_rate: null
+  silence_threshold: 0.003  # 归一化 RMS；低于此值连续 30 秒告警
 
 asr:
   provider: faster_whisper   # faster_whisper（本地离线，零 token）| dashscope（云端 Paraformer，自带分离）

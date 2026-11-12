@@ -1,4 +1,4 @@
 # 可选：本地说话人分离（会引入 torch，体积较大；不装则自动降级为单说话人）
 -r requirements.txt
-speechbrain>=0.5.16
+speechbrain>=1.0.2
 scikit-learn>=1.3

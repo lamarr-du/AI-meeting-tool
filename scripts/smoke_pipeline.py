@@ -61,7 +61,8 @@ def main() -> None:
     dsp.save_wav_mono(session.audio_path, tone, 16000)
 
     pipe = Pipeline(cfg)
-    transcript = pipe.transcribe(session)
+    pipe.transcribe(session)
+    transcript = pipe.diarize(session)
     assert transcript["speakers"], "说话人名单为空"
     assert len(transcript["utterances"]) == 3
     # 用 MockLLM 生成纪要

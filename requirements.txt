@@ -1,7 +1,8 @@
-# 核心依赖（Windows / Python 3.9–3.13）
-numpy>=1.26
-PyYAML>=6.0
-requests>=2.31
-soxr>=0.3                 # 高质量重采样（缺失时自动降级为线性插值）
-pyaudiowpatch>=0.2.12.3   # Windows WASAPI loopback 内录
-faster-whisper>=1.0.3     # 本地离线语音转文字（含 Silero VAD，解码支持 wav/mp3 等）
+# 核心依赖（Python 3.9–3.13；系统内录仅支持 Windows）
+numpy>=1.26,<3
+PyYAML>=6.0,<7
+requests>=2.31,<3
+soxr>=0.3,<2              # 高质量重采样（缺失时自动降级为线性插值）
+pyaudiowpatch>=0.2.12.3,<0.3; sys_platform == "win32"  # Windows WASAPI loopback 内录
+faster-whisper>=1.0.3,<2  # 本地离线语音转文字（含 Silero VAD）
+av>=16.1.0,<17            # 避免新版 PyAV 与 faster-whisper 的解码接口不兼容
