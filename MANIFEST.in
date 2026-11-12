@@ -1,0 +1,3 @@
+include main.py config.yaml
+include requirements.txt requirements-optional.txt requirements-win-py312.lock
+recursive-include scripts *.py *.yaml

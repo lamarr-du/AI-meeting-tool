@@ -1,4 +1,5 @@
 """ASR 抽象层：统一输出带时间戳的 Utterance 列表。"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod

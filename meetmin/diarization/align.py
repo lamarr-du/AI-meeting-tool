@@ -1,4 +1,5 @@
 """把说话人时间段对齐到 ASR 句子：优先用词级时间戳逐词判人，并在换人处把长句切开。"""
+
 from __future__ import annotations
 
 from dataclasses import replace

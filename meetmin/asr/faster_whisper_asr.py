@@ -2,8 +2,10 @@
 
 首次运行会自动从 HuggingFace 下载模型权重到本地缓存。
 """
+
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -32,12 +34,35 @@ class FasterWhisperASR(ASRProvider):
             raise RuntimeError("缺少依赖 faster-whisper，请先: pip install faster-whisper") from e
         self.acfg = acfg
         size = acfg.get("model_size", "small")
+        self._model_class = WhisperModel
+        self._size = size
+        self._device = acfg.get("device", "auto")
+        self._compute = acfg.get("compute_type", "int8")
+        if self._device == "auto":
+            from ..doctor import gpu_status
+
+            gpu = gpu_status()
+            # 保守预算；未知模型一律走 CPU。保留显式 compute_type。
+            budget = {
+                "tiny": 2048,
+                "base": 2048,
+                "small": 3072,
+                "medium": 5120,
+                "large-v3-turbo": 6144,
+                "large-v3": 8192,
+            }.get(str(size))
+            self._device = "cuda" if gpu and not gpu[3] and budget and gpu[1] >= budget else "cpu"
+            if self._device == "cuda" and self._compute == "int8":
+                self._compute = "int8_float16"
         try:
-            self.model = WhisperModel(
-                size,
-                device=acfg.get("device", "auto"),
-                compute_type=acfg.get("compute_type", "int8"),
-            )
+            try:
+                self.model = WhisperModel(size, device=self._device, compute_type=self._compute)
+            except Exception as e:
+                if self._device != "cuda" or not self._is_oom(e):
+                    raise
+                logging.getLogger("meetmin").warning("GPU 显存不足，回退 CPU int8：%s", e)
+                self._device, self._compute = "cpu", "int8"
+                self.model = WhisperModel(size, device="cpu", compute_type="int8")
         except Exception as e:
             raise RuntimeError(
                 f"加载/下载 whisper 模型失败（{size}）：{e}\n"
@@ -46,7 +71,24 @@ class FasterWhisperASR(ASRProvider):
                 "  · 或先手动下载模型，把 asr.model_size 指向本地模型目录"
             ) from e
 
-    def transcribe(
+    @staticmethod
+    def _is_oom(error: Exception) -> bool:
+        message = str(error).lower()
+        return "out of memory" in message or "cuda_error_out_of_memory" in message
+
+    def transcribe(self, audio, *, file_path=None, progress_cb=None, **kwargs):
+        try:
+            return self._transcribe(audio, file_path=file_path, progress_cb=progress_cb, **kwargs)
+        except Exception as e:
+            if self._device != "cuda" or not self._is_oom(e):
+                raise
+            logging.getLogger("meetmin").warning("GPU 显存不足，回退 CPU int8 重试：%s", e)
+            del self.model
+            self._device, self._compute = "cpu", "int8"
+            self.model = self._model_class(self._size, device="cpu", compute_type="int8")
+            return self._transcribe(audio, file_path=file_path, progress_cb=progress_cb, **kwargs)
+
+    def _transcribe(
         self,
         audio: np.ndarray | None,
         *,
@@ -90,5 +132,9 @@ class FasterWhisperASR(ASRProvider):
             utterances=utterances,
             language=getattr(info, "language", None),
             audio_16k=audio,
-            extra={"asr_model": self.acfg.get("model_size", "small")},
+            extra={
+                "asr_model": self.acfg.get("model_size", "small"),
+                "effective_device": self._device,
+                "effective_compute_type": self._compute,
+            },
         )
