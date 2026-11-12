@@ -7,6 +7,7 @@
   * 换成其它云端 ASR（讯飞/腾讯云/OpenAI 兼容音频接口）时，照抄本类的
     「提交 → 轮询 → 解析成 Utterance」结构即可。
 """
+
 from __future__ import annotations
 
 import os

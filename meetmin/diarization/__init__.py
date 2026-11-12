@@ -1,4 +1,5 @@
 """说话人分离（diarization）工厂：不可用时自动降级为单说话人。"""
+
 from __future__ import annotations
 
 import logging

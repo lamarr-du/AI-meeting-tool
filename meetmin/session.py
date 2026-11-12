@@ -8,26 +8,31 @@
   transcript.md    人类可读转写
   minutes.md       AI 会议纪要
 """
+
 from __future__ import annotations
 
 import datetime as dt
 import json
-import re
 import os
+import re
 import secrets
 from pathlib import Path
 
 
 def clean_session_name(name: str) -> str:
     """将名称限制为跨平台安全的单个目录名前缀。"""
-    name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', '-', str(name))
-    name = re.sub(r'\.{2,}', '-', name).strip(' .-').rstrip(' .')
+    name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "-", str(name))
+    name = re.sub(r"\.{2,}", "-", name).strip(" .-").rstrip(" .")
     return name or "session"
 
 
 def new_session_id(prefix: str | None = None) -> str:
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S%f") + "-" + secrets.token_hex(2)
-    return f"{clean_session_name(prefix)[:100].rstrip(' .-') or 'session'}-{stamp}" if prefix else stamp
+    return (
+        f"{clean_session_name(prefix)[:100].rstrip(' .-') or 'session'}-{stamp}"
+        if prefix
+        else stamp
+    )
 
 
 class Session:

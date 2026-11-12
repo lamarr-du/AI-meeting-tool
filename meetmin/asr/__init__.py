@@ -1,4 +1,5 @@
 """ASR provider 工厂。要接入自己的语音转文字服务：新建一个 ASRProvider 子类并在此注册。"""
+
 from __future__ import annotations
 
 from .base import ASRProvider, ASRResult, Utterance  # noqa: F401

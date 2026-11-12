@@ -1,4 +1,4 @@
-# 核心依赖（Python 3.9–3.13；系统内录仅支持 Windows）
+# 核心依赖（由 pyproject.toml 读取；Python >=3.10，系统内录仅支持 Windows）
 numpy>=1.26,<3
 PyYAML>=6.0,<7
 requests>=2.31,<3

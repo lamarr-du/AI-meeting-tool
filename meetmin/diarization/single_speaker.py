@@ -1,4 +1,5 @@
 """单说话人兜底（关闭分离 / 依赖缺失时使用）。"""
+
 from __future__ import annotations
 
 import numpy as np

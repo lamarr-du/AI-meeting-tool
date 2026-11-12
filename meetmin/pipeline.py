@@ -1,4 +1,5 @@
 """三步流水线编排：录音(1) → 转写+分离(2) → 纪要(3)。各步可独立重跑。"""
+
 from __future__ import annotations
 
 import datetime as dt
@@ -57,8 +58,9 @@ class Pipeline:
         )
 
     # ---------------- (2) 转写 + 说话人分离 ----------------
-    def transcribe(self, session: Session, *, audio_path: str | Path | None = None,
-                   file_url: str | None = None) -> dict:
+    def transcribe(
+        self, session: Session, *, audio_path: str | Path | None = None, file_url: str | None = None
+    ) -> dict:
         audio = Path(audio_path) if audio_path else session.audio_path
         if not Path(audio).exists() and not file_url:
             raise FileNotFoundError(f"找不到音频：{audio}（请先 record，或用 --audio 指定文件）")
@@ -73,10 +75,14 @@ class Pipeline:
         audio16k = to_mono_16k(audio) if local_like else None
 
         def on_seg(pos: float, total: float) -> None:
-            self.progress(f"  … {ts(pos)}/{ts(total)}（{pos / max(total, 1):.0%}）", throttle_sec=5.0)
+            self.progress(
+                f"  … {ts(pos)}/{ts(total)}（{pos / max(total, 1):.0%}）", throttle_sec=5.0
+            )
 
         result: ASRResult = provider.transcribe(
-            audio16k, file_path=str(audio), file_url=file_url,
+            audio16k,
+            file_path=str(audio),
+            file_url=file_url,
             progress_cb=on_seg if local_like else None,
         )
         utterances = [u for u in result.utterances if u.text.strip()]
@@ -92,9 +98,11 @@ class Pipeline:
         else:
             duration = audio_duration(audio) if audio.exists() else 0.0
 
-        raw = {
+        raw: dict[str, Any] = {
             "session_id": session.session_id,
-            "audio_path": str(Path(audio).resolve()) if Path(audio).exists() else (file_url or str(audio)),
+            "audio_path": str(Path(audio).resolve())
+            if Path(audio).exists()
+            else (file_url or str(audio)),
             "meeting_time": (
                 dt.datetime.fromtimestamp(Path(audio).stat().st_mtime)
                 if Path(audio).exists()
@@ -104,7 +112,10 @@ class Pipeline:
             "language": result.language,
             "schema_version": 1,
             "created_at": dt.datetime.now().isoformat(timespec="seconds"),
-            "asr": {"provider": provider_name, **({k: v for k, v in result.extra.items() if k != "duration"})},
+            "asr": {
+                "provider": provider_name,
+                **({k: v for k, v in result.extra.items() if k != "duration"}),
+            },
             "utterances": [u.to_dict() for u in utterances],
         }
         # 在任何分离/对齐操作前保存原始词级数据。
@@ -113,7 +124,9 @@ class Pipeline:
         raw["asr"]["parameters"] = {k: acfg[k] for k in keys if k in acfg}
         if provider_name == "dashscope":
             dc = self.cfg.get("dashscope_asr", {})
-            raw["asr"]["parameters"] = {k: dc[k] for k in ("model", "speaker_count", "language_hints") if k in dc}
+            raw["asr"]["parameters"] = {
+                k: dc[k] for k in ("model", "speaker_count", "language_hints") if k in dc
+            }
         session.save_json("asr_raw.json", raw)
         self.progress(f"  ✓ 原始转写已保存：{session.root / 'asr_raw.json'}")
         return raw
@@ -121,17 +134,24 @@ class Pipeline:
     def diarize(self, session: Session) -> dict:
         """从原始转写重建精简转写；绝不调用 ASR。"""
         import json
+
         raw = json.loads(session._require("asr_raw.json").read_text(encoding="utf-8"))
         utterances = [Utterance.from_dict(u) for u in raw["utterances"] if u["text"].strip()]
         result = ASRResult(utterances=utterances, language=raw.get("language"))
         dcfg = self.cfg.get("diarization", {}) or {}
-        needs_audio = (dcfg.get("enabled", True) and dcfg.get("provider", "ecapa_speechbrain") != "single"
-                       and not any(u.speaker is not None for u in utterances) and bool(utterances))
+        needs_audio = (
+            dcfg.get("enabled", True)
+            and dcfg.get("provider", "ecapa_speechbrain") != "single"
+            and not any(u.speaker is not None for u in utterances)
+            and bool(utterances)
+        )
         audio16k = None
         if needs_audio:
             source = Path(raw["audio_path"])
             if not source.is_file():
-                raise FileNotFoundError(f"分离需要原始本地音频：{source}；原始转写仍在 asr_raw.json")
+                raise FileNotFoundError(
+                    f"分离需要原始本地音频：{source}；原始转写仍在 asr_raw.json"
+                )
             audio16k = to_mono_16k(source)
         speakers = self._diarize(result, utterances, audio16k, session=session)
         transcript = {k: v for k, v in raw.items() if k != "schema_version"}
@@ -145,7 +165,9 @@ class Pipeline:
         self.progress(f"  ✓ 分离结果已保存：{session.root}")
         return transcript
 
-    def _diarize(self, result: ASRResult, utterances: list[Utterance], audio16k, *, session: Session) -> list[str]:
+    def _diarize(
+        self, result: ASRResult, utterances: list[Utterance], audio16k, *, session: Session
+    ) -> list[str]:
         """云端自带 speaker 时仅做名单映射；本地 ASR 按配置跑分离。"""
         dcfg = self.cfg.get("diarization", {}) or {}
         has_speaker = any(u.speaker is not None for u in utterances)
@@ -170,7 +192,7 @@ class Pipeline:
         from .diarization import get_diarizer
 
         diarizer = get_diarizer(self.cfg)
-        options = {"speech_spans": [(u.start, u.end) for u in utterances]}
+        options: dict[str, Any] = {"speech_spans": [(u.start, u.end) for u in utterances]}
         if diarizer.name == "ecapa_speechbrain":
             options["cache_path"] = session.root / "embeddings.npz"
         segments = diarizer.diarize(audio16k, **options)
@@ -206,7 +228,9 @@ class Pipeline:
         self.progress(f"[3/3] 生成纪要（LLM：{llm.name}/{self.cfg['llm'].get('model')}）…")
         t0 = time.time()
         md, usage = generate_minutes(
-            transcript, llm, config=self.cfg,
+            transcript,
+            llm,
+            config=self.cfg,
             progress_cb=lambda m: self.progress(m, throttle_sec=1.0),
         )
         scfg = self.cfg.get("summarizer", {})
@@ -231,8 +255,9 @@ class Pipeline:
         return path, usage
 
     # ---------------- 组合 ----------------
-    def process(self, audio_path: str | Path, *, session: Session | None = None,
-                file_url: str | None = None) -> Session:
+    def process(
+        self, audio_path: str | Path, *, session: Session | None = None, file_url: str | None = None
+    ) -> Session:
         session = session or self.new_session()
         self.transcribe(session, audio_path=audio_path, file_url=file_url)
         self.diarize(session)

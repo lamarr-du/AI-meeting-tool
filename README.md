@@ -18,10 +18,10 @@ Windows PowerShell，使用固定的核心依赖组合：
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-python -m pip install -r requirements-win-py312.lock
+python -m pip install -c requirements-win-py312.lock .
 
 # 可选：本地说话人分离；使用约束文件保持核心依赖版本
-python -m pip install -c requirements-win-py312.lock -r requirements-optional.txt
+python -m pip install -c requirements-win-py312.lock ".[diar]"
 ```
 
 macOS / Linux，使用兼容版本范围：
@@ -29,12 +29,12 @@ macOS / Linux，使用兼容版本范围：
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install .
 # 可选：本地说话人分离
-python -m pip install -r requirements-optional.txt
+python -m pip install ".[diar]"
 ```
 
-Windows 其他 Python 版本也可用 `requirements.txt` 按范围安装。`pyaudiowpatch` 带 Windows 平台条件，macOS/Linux 会跳过。PyAV 限制为 `>=16.1.0,<17`，避免与 faster-whisper 的解码接口不兼容；SpeechBrain 要求 `>=1.0.2`，以支持当前的导入路径和复制下载策略。可选依赖会引入 PyTorch，安装体积取决于平台和所选版本。
+以上命令从仓库根目录安装本地项目。Windows 其他 Python 版本可用 `python -m pip install .` 按范围安装。核心版本范围保存在 `requirements.txt`，由 `pyproject.toml` 读取；`diar` extra 统一定义在 `pyproject.toml`。`requirements-optional.txt` 保留旧命令入口，内容引用本地 `.[diar]`，也须从仓库根目录安装。`pyaudiowpatch` 带 Windows 平台条件，macOS/Linux 会跳过。PyAV 限制为 `>=16.1.0,<17`，避免与 faster-whisper 的解码接口不兼容；SpeechBrain 要求 `>=1.0.2`，以支持当前的导入路径和复制下载策略。可选依赖会引入 PyTorch，安装体积取决于平台和所选版本。
 
 `requirements-win-py312.lock` 针对 Windows / Python 3.12 固定核心及传递依赖，**不包含可选分离依赖**。其中除 Windows 专用组件外的对应版本已在 Linux Python 3.12 验证解码和离线测试；Windows 内录、真实 GPU 推理和真实 ECAPA 提取尚未实机验证。锁文件不代表所有平台和 Python 版本都已验证。
 
@@ -48,40 +48,40 @@ uv pip compile requirements.txt --python-platform windows --python-version 3.12 
 
 ## 快速开始
 
-从仓库根目录执行。配置默认读取当前目录的 `config.yaml`，缺项使用内置默认值；自定义配置使用 `python main.py --config my-config.yaml <子命令>`，`--config` 放在子命令之前。
+安装后可使用 `meetmin` 或 `python -m meetmin`；从源码运行的 `python main.py` 仍保留。以下示例在仓库根目录执行，以便读取仓库中的配置。配置默认读取当前目录的 `config.yaml`，缺项使用内置默认值；自定义配置使用 `meetmin --config my-config.yaml <子命令>`，`--config` 放在子命令之前。
 
 Windows 分步处理：
 
 ```powershell
 # 预检及设备列表
-python main.py doctor
-python main.py devices
+meetmin doctor
+meetmin devices
 
 # 1. 录音，Ctrl+C 结束；也可加 --device 设备索引
-python main.py record -n weekly
+meetmin record -n weekly
 
 # 2a. 只转写，保存 asr_raw.json
-python main.py transcribe -n weekly
+meetmin transcribe -n weekly
 
 # 2b. 分离/对齐，保存 transcript.json 和 transcript.md
-python main.py diarize -n weekly
+meetmin diarize -n weekly
 
 # 3. 按 config.yaml 中 llm.api_key_env 配置密钥，并确认 llm.model 可用
 $env:DASHSCOPE_API_KEY = "sk-..."
-python main.py summarize -n weekly
+meetmin summarize -n weekly
 
 # 或自动执行录音 → 转写 → 分离 → 纪要
-python main.py run -n weekly
+meetmin run -n weekly
 ```
 
 已有音频（Windows / macOS / Linux 均可使用，路径按实际修改）：
 
 ```bash
-python main.py doctor --no-record
-python main.py run --audio "recordings/meeting.m4a" -n review
+meetmin doctor --no-record
+meetmin run --audio "recordings/meeting.m4a" -n review
 ```
 
-也可将已有音频分步处理：`python main.py transcribe --audio "recordings/meeting.m4a" -n review`，随后执行 `diarize -n review`、`summarize -n review`。`transcribe` 只保存原始转写，完成分离后才能生成新的纪要。
+也可将已有音频分步处理：`meetmin transcribe --audio "recordings/meeting.m4a" -n review`，随后执行 `diarize -n review`、`summarize -n review`。`transcribe` 只保存原始转写，完成分离后才能生成新的纪要。
 
 ## 命令与会话选择
 
@@ -107,7 +107,7 @@ python main.py run --audio "recordings/meeting.m4a" -n review
 录音默认拒绝覆盖已有文件。确需重新录制时，必须指定完整现有会话 ID 和 `--overwrite`：
 
 ```bash
-python main.py record -n weekly-20261113-090000123456-ab12 --overwrite
+meetmin record -n weekly-20261113-090000123456-ab12 --overwrite
 ```
 
 `run` 也支持相同用法；`--overwrite` 不能与 `--audio` 同用。覆盖录音不会删除旧转写、嵌入缓存或纪要，后续应重新执行转写、分离和纪要。`transcribe`、`diarize`、`summarize` 在同一会话重跑时会替换各自的输出，不需要 `--overwrite`。
@@ -170,8 +170,8 @@ ECAPA 模型按需加载到用户目录 `~/.cache/meetmin/speechbrain`，使用 
 分离失败时，已完成的原始转写仍在，可直接重跑：
 
 ```bash
-python main.py diarize -n weekly-20261113-090000123456-ab12
-python main.py summarize -n weekly-20261113-090000123456-ab12
+meetmin diarize -n weekly-20261113-090000123456-ab12
+meetmin summarize -n weekly-20261113-090000123456-ab12
 ```
 
 修改 `config.yaml` 中的 `cluster_threshold`、`num_speakers` 或 `min_group_sec` 后，同样只需重跑分离和纪要。原始转写不会被分离过程修改；失败的重跑不会自动清除上次已有的输出，须确认命令成功后再使用结果。
@@ -213,28 +213,44 @@ python main.py summarize -n weekly-20261113-090000123456-ab12
 DashScope ASR 需设置 `asr.provider: dashscope`、有效的 `dashscope_asr.api_key_env` 和 `--file-url`（或配置 `dashscope_asr.file_url`）。工具不上传本地录音，也不会自动把 `audio.wav` 变成 URL。可对已有本地文件和其已上传的 URL 运行：
 
 ```bash
-python main.py run --audio "recordings/meeting.wav" --file-url "https://example.com/meeting.wav" -n cloud
+meetmin run --audio "recordings/meeting.wav" --file-url "https://example.com/meeting.wav" -n cloud
 ```
 
 该模式实际转写的是 URL 指向的音频，须保证与本地文件相对应。云端结果已含说话人时，`diarize` 仅映射说话人名称，不提取本地 ECAPA 嵌入。
 
-## 测试与项目结构
+## 开发、检查与 CI
+
+开发环境从仓库根目录安装：
 
 ```bash
-python tests/test_offline.py
+python -m pip install -e ".[dev]"
+# 同时开发可选分离功能时使用：python -m pip install -e ".[dev,diar]"
+ruff check .
+ruff format --check .
+mypy
+python -m pytest
 python scripts/smoke_pipeline.py
 ```
+
+`ruff format .` 可统一格式。Ruff 检查基础错误、未使用导入和导入顺序；mypy 以 Python 3.12 为类型检查基线，检查 `meetmin/` 与兼容入口 `main.py`，包含未标注函数体，但不要求所有函数完全标注。缺少类型信息的第三方库按配置跳过。pytest 自动收集 `tests/`，替代原来的手动测试 runner；测试需先安装项目。
+
+GitHub Actions（`.github/workflows/ci.yml`）在 push 和 PR 时运行 Ruff、格式检查和 mypy，并在 Linux Python 3.10 / 3.12 / 3.13、Windows Python 3.12 构建 sdist/wheel、安装 wheel、检查仓库目录外的命令入口，再运行离线测试和冒烟。测试阶段设置 Hugging Face 离线模式；安装依赖仍需要网络。CI 不安装 `diar` extra、不下载 Whisper/ECAPA 权重、不调用云端 API，也不验证真实录音设备或 GPU。
 
 离线测试包含真实音频解码和本地 VAD，以及用模拟对象覆盖的设备、显存回退、分离失败恢复和缓存行为。冒烟脚本合成音频，使用假 ASR、单说话人和 mock LLM 跑完整流程，不下载大模型、不访问云端；这些检查不能替代 Windows、GPU 或 ECAPA 实机验证。`scripts/smoke_config.yaml` 另供手动 CLI 冒烟使用（tiny + 关闭分离 + mock），其中真实 Whisper 首次使用仍会下载。
 
 ```text
 AI-meeting-tool/
-├── main.py                         # doctor/devices/record/transcribe/diarize/summarize/run
+├── main.py                         # 兼容 python main.py 的薄入口
+├── pyproject.toml                  # 打包、meetmin 命令、extras、检查工具配置
+├── MANIFEST.in                     # 源码分发包含配置、脚本和兼容入口
+├── .github/workflows/ci.yml        # lint、类型检查、构建及离线测试
 ├── config.yaml                     # 用户配置，覆盖内置默认值
 ├── requirements.txt                # 核心兼容版本范围
-├── requirements-optional.txt       # 可选分离依赖，包含核心依赖
+├── requirements-optional.txt       # 旧安装命令兼容入口，引用 .[diar]
 ├── requirements-win-py312.lock     # Windows / Python 3.12 核心固定版本
 ├── meetmin/
+│   ├── cli.py                      # 所有子命令实现，meetmin 命令入口
+│   ├── __main__.py                 # python -m meetmin 入口
 │   ├── config.py                   # 默认配置与加载
 │   ├── doctor.py                   # 预检与 GPU 探测
 │   ├── pipeline.py                 # 转写保存、独立分离、纪要编排
@@ -246,7 +262,7 @@ AI-meeting-tool/
 ├── scripts/smoke_pipeline.py       # 假 ASR + mock LLM 的离线冒烟
 ├── scripts/smoke_config.yaml       # 手动 CLI 冒烟配置
 ├── scripts/sandbox_fix/            # 受限沙箱安装兼容处理
-└── tests/test_offline.py
+└── tests/                         # 离线行为及安装后 CLI 测试
 ```
 
 扩展时可分别实现 `ASRProvider`（返回 `ASRResult`）、`Diarizer`（返回带 `start/end/label` 的时间段）或 `BaseLLM.chat()`，在对应工厂中注册。纪要提示词位于 `meetmin/summarizer/prompts.py`。

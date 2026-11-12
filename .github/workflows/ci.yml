@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  HF_HUB_OFFLINE: "1"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+
+jobs:
+  quality:
+    name: Ruff and mypy (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.txt
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+
+  offline-tests:
+    name: Offline tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.txt
+      - run: python -m pip install 'build>=1.2,<2'
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Install wheel and development tools
+        shell: python
+        run: |
+          import subprocess
+          import sys
+          from pathlib import Path
+          wheel = next(Path("dist").glob("*.whl"))
+          subprocess.check_call([sys.executable, "-m", "pip", "install", f"{wheel}[dev]"])
+      - name: Check CLI outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          meetmin --help
+          python -m meetmin --help
+      - run: python -m pytest
+      - run: python scripts/smoke_pipeline.py

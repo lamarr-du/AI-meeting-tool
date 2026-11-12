@@ -3,13 +3,15 @@
 录的是"电脑正在播放的声音"（会议远端发言、以及会议软件混入输出的任何声音）。
 注意：本地麦克风说话默认不会出现在电脑输出里，因此不会进内录（README 有解决办法）。
 """
+
 from __future__ import annotations
 
 import threading
 import wave
+from pathlib import Path
+from typing import Any, BinaryIO
 
 import numpy as np
-from pathlib import Path
 
 
 def _import_pyaudio():
@@ -67,10 +69,10 @@ class LoopbackRecorder:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
-        self._pa = None
-        self._stream = None
-        self._wf = None
-        self._audio_file = None
+        self._pa: Any = None
+        self._stream: Any = None
+        self._wf: wave.Wave_write | None = None
+        self._audio_file: BinaryIO | None = None
         self._chunks = 0
         self._chunk_frames = 0
         self.device_name = ""
@@ -87,7 +89,9 @@ class LoopbackRecorder:
             for d in pa.get_loopback_device_info_generator():
                 if key in str(d["name"]).lower():
                     return d
-            raise RuntimeError(f"未找到名称包含 {self.device!r} 的 loopback 设备，可用: python main.py devices")
+            raise RuntimeError(
+                f"未找到名称包含 {self.device!r} 的 loopback 设备，可用: python main.py devices"
+            )
         pyaudio = _import_pyaudio()
         try:
             wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
@@ -95,7 +99,9 @@ class LoopbackRecorder:
             if default_out.get("is_loopback_dev"):
                 return default_out
             for d in pa.get_loopback_device_info_generator():
-                if str(default_out["name"]) in str(d["name"]) or str(d["name"]) in str(default_out["name"]):
+                if str(default_out["name"]) in str(d["name"]) or str(d["name"]) in str(
+                    default_out["name"]
+                ):
                     return d
         except OSError:
             pass
@@ -146,6 +152,7 @@ class LoopbackRecorder:
 
     def _run(self) -> None:
         try:
+            assert self._wf is not None
             while not self._stop.is_set():
                 data = self._stream.read(self._chunk_frames, exception_on_overflow=False)
                 self._wf.writeframes(data)
@@ -155,7 +162,8 @@ class LoopbackRecorder:
             self._error = e
         finally:
             try:
-                self._wf.close()
+                if self._wf is not None:
+                    self._wf.close()
             except Exception:
                 pass
 
@@ -177,10 +185,13 @@ class LoopbackRecorder:
     def status(self) -> dict:
         with self._level_lock:
             sr = self.sample_rate_actual or 1
-            return {"duration_sec": self._frames / sr, "level": self._level,
-                    "silent_sec": self._silent_frames / sr,
-                    "active_fraction": self._active_frames / self._frames if self._frames else 0.0,
-                    "failed": self._error is not None}
+            return {
+                "duration_sec": self._frames / sr,
+                "level": self._level,
+                "silent_sec": self._silent_frames / sr,
+                "active_fraction": self._active_frames / self._frames if self._frames else 0.0,
+                "failed": self._error is not None,
+            }
 
     def stop(self) -> dict:
         if self._thread is None:

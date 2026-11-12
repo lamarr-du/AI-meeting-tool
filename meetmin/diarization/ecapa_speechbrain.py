@@ -3,14 +3,16 @@
 流程：滑窗（只在 ASR 语音区间内取窗）→ 逐窗嵌入 → cosine 平均链接聚类 →
 相邻同簇窗合并为说话人时间段。首次运行自动下载 ECAPA 模型（约 80MB）。
 """
+
 from __future__ import annotations
 
-from pathlib import Path
 import hashlib
 import json
 import os
 import secrets
 import zipfile
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -35,7 +37,7 @@ class EcapaSpeechbrainDiarizer(Diarizer):
         self._torch = torch
         self._classifier = EncoderClassifier
         self._strategy = LocalStrategy.COPY
-        self.encoder = None
+        self.encoder: Any = None
 
     def _load_encoder(self):
         if self.encoder is None:
@@ -75,9 +77,13 @@ class EcapaSpeechbrainDiarizer(Diarizer):
             starts.append(st)
             wavs.append(w)
         metadata = {
-            "schema_version": 1, "model": "speechbrain/spkrec-ecapa-voxceleb",
-            "sample_rate": SR, "window_samples": win, "hop_samples": hop,
-            "min_window_rms": min_rms, "speech_spans": speech_spans,
+            "schema_version": 1,
+            "model": "speechbrain/spkrec-ecapa-voxceleb",
+            "sample_rate": SR,
+            "window_samples": win,
+            "hop_samples": hop,
+            "min_window_rms": min_rms,
+            "speech_spans": speech_spans,
             "audio_sha256": hashlib.sha256(memoryview(np.ascontiguousarray(audio16k))).hexdigest(),
         }
         signature = json.dumps(metadata, sort_keys=True)
@@ -86,26 +92,40 @@ class EcapaSpeechbrainDiarizer(Diarizer):
             try:
                 with np.load(cache_path, allow_pickle=False) as cached:
                     candidate = cached["embeddings"]
-                    if (str(cached["metadata"].item()) == signature
-                            and np.array_equal(cached["starts"], starts)
-                            and candidate.ndim == 2 and candidate.shape[0] == len(starts)
-                            and np.isfinite(candidate).all()):
+                    if (
+                        str(cached["metadata"].item()) == signature
+                        and np.array_equal(cached["starts"], starts)
+                        and candidate.ndim == 2
+                        and candidate.shape[0] == len(starts)
+                        and np.isfinite(candidate).all()
+                    ):
                         emb = candidate.copy()
             except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
                 pass  # 损坏或不匹配的缓存重新生成
         if emb is None:
-            emb = (np.concatenate([self._embed(np.stack(wavs[i:i + 32]).astype(np.float32))
-                                   for i in range(0, len(wavs), 32)])
-                   if starts else np.empty((0, 0), dtype=np.float32))
+            emb = (
+                np.concatenate(
+                    [
+                        self._embed(np.stack(wavs[i : i + 32]).astype(np.float32))
+                        for i in range(0, len(wavs), 32)
+                    ]
+                )
+                if starts
+                else np.empty((0, 0), dtype=np.float32)
+            )
             if cache_path is not None:
                 path = Path(cache_path)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = path.with_name("." + path.name + "." + secrets.token_hex(8) + ".tmp")
                 try:
                     with temporary.open("xb") as f:
-                        np.savez_compressed(f, embeddings=emb, starts=np.asarray(starts, dtype=np.int64),
-                                            ends=np.asarray(starts, dtype=np.int64) + win,
-                                            metadata=np.asarray(signature))
+                        np.savez_compressed(
+                            f,
+                            embeddings=emb,
+                            starts=np.asarray(starts, dtype=np.int64),
+                            ends=np.asarray(starts, dtype=np.int64) + win,
+                            metadata=np.asarray(signature),
+                        )
                         f.flush()
                         os.fsync(f.fileno())
                     temporary.replace(path)
@@ -135,7 +155,7 @@ class EcapaSpeechbrainDiarizer(Diarizer):
         torch = self._torch
         with torch.no_grad():
             w = torch.from_numpy(windows).unsqueeze(1)  # [B, 1, T]
-            emb = self.encoder.encode_batch(w)          # [B, 1, D]
+            emb = self.encoder.encode_batch(w)  # [B, 1, D]
         E = emb.squeeze(1).cpu().numpy().astype(np.float32)
         norms = np.linalg.norm(E, axis=1, keepdims=True)
         return E / np.clip(norms, 1e-9, None)
@@ -159,6 +179,7 @@ class EcapaSpeechbrainDiarizer(Diarizer):
             import logging
 
             logging.getLogger("meetmin").warning(
-                "分离出 %d 个说话人簇，疑似阈值过低；可调大 diarization.cluster_threshold 或填 num_speakers", n
+                "分离出 %d 个说话人簇，疑似阈值过低；可调大 diarization.cluster_threshold 或填 num_speakers",
+                n,
             )
         return labels

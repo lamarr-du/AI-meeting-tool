@@ -6,3 +6,11 @@ data/
 *.wav
 *.mp3
 .venv/
+
+# 开发工具与构建产物
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/

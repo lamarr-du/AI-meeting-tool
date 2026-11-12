@@ -9,6 +9,7 @@
   * 默认去掉时间戳与词级数据，只喂 "说话人: 文本"
   * 相邻同一说话人的句子合并为一条
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -35,7 +36,7 @@ def render_transcript(
 ) -> str:
     """把 utterances 渲染成喂给 LLM 的紧凑文本："说话人A: 文本" 每行一条。"""
     lines: list[str] = []
-    cur_spk: str | None = None
+    cur_spk: str | int | None = None
     cur_parts: list[str] = []
     cur_start = 0.0
 
@@ -129,11 +130,20 @@ def generate_minutes(
 
     # ---------------- direct：一次调用 ----------------
     if strategy == "direct":
-        md, u = llm.chat([
-            sys_msg,
-            {"role": "user", "content": prompts.DIRECT_USER.format(
-                meta=meta_line, role_hint=role_hint, transcript=text, spec=prompts.MINUTES_SPEC)},
-        ])
+        md, u = llm.chat(
+            [
+                sys_msg,
+                {
+                    "role": "user",
+                    "content": prompts.DIRECT_USER.format(
+                        meta=meta_line,
+                        role_hint=role_hint,
+                        transcript=text,
+                        spec=prompts.MINUTES_SPEC,
+                    ),
+                },
+            ]
+        )
         usage.add(u)
         return md.strip(), usage
     if strategy != "map_reduce":
@@ -147,8 +157,17 @@ def generate_minutes(
     for i, ch in enumerate(chunks, 1):
         if progress_cb:
             progress_cb(f"  map {i}/{len(chunks)}：压缩 {len(ch)} 字符…")
-        pt, u = llm.chat([map_sys, {"role": "user", "content": prompts.MAP_USER.format(
-            i=i, n=len(chunks), max_points=max(6, len(ch) // 120), chunk=ch)}])
+        pt, u = llm.chat(
+            [
+                map_sys,
+                {
+                    "role": "user",
+                    "content": prompts.MAP_USER.format(
+                        i=i, n=len(chunks), max_points=max(6, len(ch) // 120), chunk=ch
+                    ),
+                },
+            ]
+        )
         usage.add(u)
         if pt.strip():
             points.append(pt.strip())
@@ -165,8 +184,17 @@ def generate_minutes(
             progress_cb(f"  二次压缩 {len(sub)} 组要点…")
         new_points: list[str] = []
         for ch in sub:
-            pt, u = llm.chat([map_sys, {"role": "user", "content": COMPACT_POINTS_USER.format(
-                max_points=max(8, len(ch) // 150), points=ch)}])
+            pt, u = llm.chat(
+                [
+                    map_sys,
+                    {
+                        "role": "user",
+                        "content": COMPACT_POINTS_USER.format(
+                            max_points=max(8, len(ch) // 150), points=ch
+                        ),
+                    },
+                ]
+            )
             usage.add(u)
             if pt.strip():
                 new_points.append(pt.strip())
@@ -175,11 +203,21 @@ def generate_minutes(
     # ---------------- reduce：合成最终纪要 ----------------
     if progress_cb:
         progress_cb("  reduce：合并生成最终纪要…")
-    md, u = llm.chat([
-        sys_msg,
-        {"role": "user", "content": prompts.REDUCE_USER.format(
-            n=len(chunks), meta=meta_line, role_hint=role_hint, summaries=merged, spec=prompts.MINUTES_SPEC)},
-    ])
+    md, u = llm.chat(
+        [
+            sys_msg,
+            {
+                "role": "user",
+                "content": prompts.REDUCE_USER.format(
+                    n=len(chunks),
+                    meta=meta_line,
+                    role_hint=role_hint,
+                    summaries=merged,
+                    spec=prompts.MINUTES_SPEC,
+                ),
+            },
+        ]
+    )
     usage.add(u)
     return md.strip(), usage
 

@@ -1,4 +1,5 @@
 """Diarizer 抽象：输入 16k 单声道音频，输出带簇标签的时间段。"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod

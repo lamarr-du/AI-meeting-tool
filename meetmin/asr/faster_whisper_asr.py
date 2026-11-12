@@ -2,10 +2,11 @@
 
 首次运行会自动从 HuggingFace 下载模型权重到本地缓存。
 """
+
 from __future__ import annotations
 
-import os
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -39,10 +40,17 @@ class FasterWhisperASR(ASRProvider):
         self._compute = acfg.get("compute_type", "int8")
         if self._device == "auto":
             from ..doctor import gpu_status
+
             gpu = gpu_status()
             # 保守预算；未知模型一律走 CPU。保留显式 compute_type。
-            budget = {"tiny": 2048, "base": 2048, "small": 3072, "medium": 5120,
-                      "large-v3-turbo": 6144, "large-v3": 8192}.get(str(size))
+            budget = {
+                "tiny": 2048,
+                "base": 2048,
+                "small": 3072,
+                "medium": 5120,
+                "large-v3-turbo": 6144,
+                "large-v3": 8192,
+            }.get(str(size))
             self._device = "cuda" if gpu and not gpu[3] and budget and gpu[1] >= budget else "cpu"
             if self._device == "cuda" and self._compute == "int8":
                 self._compute = "int8_float16"
@@ -124,5 +132,9 @@ class FasterWhisperASR(ASRProvider):
             utterances=utterances,
             language=getattr(info, "language", None),
             audio_16k=audio,
-            extra={"asr_model": self.acfg.get("model_size", "small"), "effective_device": self._device, "effective_compute_type": self._compute},
+            extra={
+                "asr_model": self.acfg.get("model_size", "small"),
+                "effective_device": self._device,
+                "effective_compute_type": self._compute,
+            },
         )
