@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from meetmin.asr.base import ASRResult, Utterance
 from meetmin.asr.faster_whisper_asr import _configure_huggingface_download
@@ -555,6 +556,56 @@ def test_generate_minutes_map_reduce():
     assert "mock 纪要" in md
     assert usage.calls >= 2  # map 多次 + reduce 一次
     assert usage.prompt_tokens > 0
+
+
+@pytest.mark.parametrize("compact_size, expected_rounds", [(200, 1), (150, 3), (0, 1)])
+def test_compaction_stops_and_preserves_points(compact_size, expected_rounds, caplog):
+    from meetmin.summarizer.llm_client import Usage
+
+    class LongLLM:
+        def __init__(self):
+            self.rounds = 0
+            self.final_prompt = ""
+
+        def chat(self, messages, **kwargs):
+            prompt = messages[-1]["content"]
+            if "【片段】" in prompt:
+                result = "原" * 10000
+            elif "【要点】" in prompt:
+                # Each round starts with the first chunk of the preceding result.
+                if "原" in prompt or "压" in prompt:
+                    self.rounds += 1
+                size = (
+                    int(len(prompt.split("【要点】\n", 1)[1]) * 0.6)
+                    if compact_size == 150
+                    else compact_size
+                )
+                result = "压" * size
+            else:
+                self.final_prompt = prompt
+                result = "纪要"
+            return result, Usage(calls=1)
+
+    llm = LongLLM()
+    tr = {"utterances": [u.to_dict() for u in _utts(1)]}
+    cfg = {
+        "summarizer": {
+            "strategy": "map_reduce",
+            "max_chunk_chars": 200,
+            "direct_threshold_chars": 200,
+        }
+    }
+    md, usage = generate_minutes(tr, llm, config=cfg)
+    assert md == "纪要"
+    assert "原" in llm.final_prompt or "压" in llm.final_prompt
+    assert usage.calls == llm.rounds + 2
+    # Round count is measured by warnings; compact calls span multiple chunks.
+    warning = (
+        "3 轮上限"
+        if expected_rounds == 3
+        else ("未产生要点" if compact_size == 0 else "未至少缩短")
+    )
+    assert warning in caplog.text
 
 
 def test_generate_minutes_empty_raises():
