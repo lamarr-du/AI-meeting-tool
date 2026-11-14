@@ -199,14 +199,20 @@ def test_doctor_checks_recording_before_start():
 
 
 def test_session_names_and_lookup():
+    from unittest.mock import patch
+
     import meetmin.cli as main
     from meetmin.pipeline import Pipeline
     from meetmin.session import clean_session_name
 
     with _TmpDir() as td:
         pipe = Pipeline({"output_dir": td})
-        one = pipe.new_session("weekly")
-        two = pipe.new_session("weekly")
+        with patch(
+            "meetmin.pipeline.new_session_id",
+            side_effect=["weekly-20990101-000000000001-aaaa", "weekly-20990101-000000000002-bbbb"],
+        ):
+            one = pipe.new_session("weekly")
+            two = pipe.new_session("weekly")
         assert one.root != two.root and one.root.is_dir() and two.root.is_dir()
         bad = pipe.new_session("../other\\evil:*?")
         assert bad.root.parent == Path(td) / "sessions"
@@ -230,6 +236,21 @@ def test_session_names_and_lookup():
         (root / "weekly").mkdir()
         assert main._find_session(td, "weekly").session_id == "weekly"
         assert clean_session_name("../../") == "session"
+
+
+def test_session_lookup_rejects_equal_latest_timestamps():
+    import meetmin.cli as main
+
+    with _TmpDir() as td:
+        root = Path(td) / "sessions"
+        first = "weekly-20261114-173326099747-ffff"
+        second = "weekly-20261114-173326099747-0000"
+        for name in (first, second, "weekly-20200101-000000-0001"):
+            (root / name).mkdir(parents=True)
+        with pytest.raises(SystemExit, match="请使用完整会话 ID") as exc:
+            main._find_session(td, "weekly")
+        assert first in str(exc.value) and second in str(exc.value)
+        assert main._find_session(td, second).session_id == second
 
 
 def test_record_protects_existing_audio():

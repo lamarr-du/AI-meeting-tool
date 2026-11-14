@@ -54,12 +54,18 @@ def _find_session(out_dir: str, name_or_id: str | None) -> Session | None:
                 return datetime.datetime.strptime(
                     match.group(1),
                     "%Y%m%d-%H%M%S%f" if len(match.group(1)) == 21 else "%Y%m%d-%H%M%S",
-                ).timestamp(), p.name
+                ).timestamp()
             except ValueError:
                 pass
-        return p.stat().st_mtime, p.name
+        return p.stat().st_mtime
 
-    chosen = max(hits, key=created)
+    ranked = [(created(p), p) for p in hits]
+    latest = max(stamp for stamp, _ in ranked)
+    newest = [p for stamp, p in ranked if stamp == latest]
+    if len(newest) > 1:
+        ids = "、".join(sorted(p.name for p in newest))
+        sys.exit(f"会话创建时间相同，无法确定最新会话：{ids}；请使用完整会话 ID。")
+    chosen = newest[0]
     print(f"选中会话：{chosen.name}")
     return Session(out_dir, chosen.name)
 
