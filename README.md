@@ -202,7 +202,7 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `llm.extra_request` | `{}`，透传请求字段，例如 `{"enable_thinking": false}`，是否支持由服务决定 |
 | `summarizer.strategy` | `auto`，按长度选择 `direct` 或 `map_reduce` |
 
-缺少 SpeechBrain 等初始化阶段的可选导入依赖时，工厂会提示并降级为单说话人；模型下载、编码或聚类阶段的错误仍可能中止分离，可利用原始转写恢复。
+分离阶段遇到音频读取、依赖、模型或聚类等错误时，会提示原因并降级为单说话人，继续生成转写和纪要。`transcript.json` 的 `diarization_status` 和 `transcript.md` 会记录降级原因；原始转写不受影响，修复问题后可重跑 `diarize` 和纪要。
 
 ## 纪要与云端 ASR
 

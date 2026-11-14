@@ -345,7 +345,12 @@ def test_raw_asr_survives_failed_diarization():
     )
     with _TmpDir() as td:
         pipe = Pipeline(
-            {"output_dir": td, "asr": {"model_size": "fake"}, "diarization": {"min_group_sec": 0.1}}
+            {
+                "output_dir": td,
+                "asr": {"model_size": "fake"},
+                "diarization": {"min_group_sec": 0.1},
+                "llm": {},
+            }
         )
         session = pipe.new_session("retry")
         dsp.save_wav_mono(session.audio_path, np.ones(32000, dtype=np.float32) * 0.1, 16000)
@@ -356,13 +361,23 @@ def test_raw_asr_survives_failed_diarization():
         assert raw["utterances"][0]["words"] == words
         assert raw["asr"]["parameters"]["model_size"] == "fake"
         with patch("meetmin.diarization.get_diarizer", side_effect=RuntimeError("分离崩溃")):
-            try:
-                pipe.diarize(session)
-                assert False
-            except RuntimeError:
-                pass
+            fallback = pipe.diarize(session)
         assert path.read_bytes() == original
-        assert not (session.root / "transcript.json").exists()
+        assert fallback["speakers"] == ["说话人A"]
+        assert fallback["utterances"][0]["text"] == "甲乙"
+        assert fallback["diarization_status"] == {
+            "status": "fallback",
+            "error": "RuntimeError: 分离崩溃",
+        }
+        assert "分离崩溃" in (session.root / "transcript.md").read_text(encoding="utf-8")
+        assert (
+            json.loads((session.root / "transcript.json").read_text(encoding="utf-8"))[
+                "diarization_status"
+            ]
+            == fallback["diarization_status"]
+        )
+        minutes_path, _ = pipe.summarize(session, llm=MockLLM())
+        assert minutes_path.exists()
         fake = SimpleNamespace(
             name="fake",
             diarize=lambda *a, **k: [
@@ -376,9 +391,59 @@ def test_raw_asr_survives_failed_diarization():
         ):
             transcript = pipe.diarize(session)
         assert len(transcript["utterances"]) == 2
+        assert "diarization_status" not in transcript
         assert all("words" not in u for u in transcript["utterances"])
         assert json.loads(original)["utterances"][0]["words"] == words
         assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("failure", ["audio", "model", "alignment"])
+def test_diarization_fallback_recovers_raw_utterances(failure):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from meetmin.pipeline import Pipeline
+
+    with _TmpDir() as td:
+        messages = []
+        pipe = Pipeline({"output_dir": td, "diarization": {}}, progress=messages.append)
+        session = pipe.new_session("failure")
+        session.audio_path.touch()
+        raw = {
+            "session_id": session.session_id,
+            "audio_path": str(session.audio_path),
+            "utterances": [{"start": 0, "end": 1, "text": "原始内容"}],
+        }
+        session.save_json("asr_raw.json", raw)
+        original = (session.root / "asr_raw.json").read_bytes()
+        model = SimpleNamespace(name="fake", diarize=lambda *args, **kwargs: [])
+
+        def fail_alignment(utterances, *args, **kwargs):
+            utterances[0].text = "损坏"
+            raise ValueError("对齐失败")
+
+        with (
+            patch(
+                "meetmin.pipeline.to_mono_16k",
+                side_effect=OSError("音频失败") if failure == "audio" else None,
+                return_value=np.ones(10),
+            ),
+            patch(
+                "meetmin.diarization.get_diarizer",
+                side_effect=RuntimeError("模型失败") if failure == "model" else None,
+                return_value=model,
+            ),
+            patch(
+                "meetmin.pipeline.assign_speakers",
+                side_effect=fail_alignment if failure == "alignment" else None,
+            ),
+        ):
+            transcript = pipe.diarize(session)
+        assert transcript["utterances"][0]["text"] == "原始内容"
+        assert transcript["utterances"][0]["speaker"] == "说话人A"
+        assert transcript["diarization_status"]["status"] == "fallback"
+        assert any("已降级为单说话人" in message for message in messages)
+        assert (session.root / "asr_raw.json").read_bytes() == original
 
 
 def test_embeddings_saved_before_clustering_and_reused():

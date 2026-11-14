@@ -145,18 +145,28 @@ class Pipeline:
             and not any(u.speaker is not None for u in utterances)
             and bool(utterances)
         )
-        audio16k = None
-        if needs_audio:
-            source = Path(raw["audio_path"])
-            if not source.is_file():
-                raise FileNotFoundError(
-                    f"分离需要原始本地音频：{source}；原始转写仍在 asr_raw.json"
-                )
-            audio16k = to_mono_16k(source)
-        speakers = self._diarize(result, utterances, audio16k, session=session)
+        error = None
+        try:
+            audio16k = None
+            if needs_audio:
+                source = Path(raw["audio_path"])
+                if not source.is_file():
+                    raise FileNotFoundError(f"分离需要原始本地音频：{source}")
+                audio16k = to_mono_16k(source)
+            speakers = self._diarize(result, utterances, audio16k, session=session)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.progress(f"  ! 说话人分离失败（{error}），已降级为单说话人；可稍后重跑 diarize。")
+            # 对齐可能已修改句子，必须从原始数据恢复后再降级。
+            utterances = [Utterance.from_dict(u) for u in raw["utterances"] if u["text"].strip()]
+            for u in utterances:
+                u.speaker = "说话人A"
+            speakers = ["说话人A"] if utterances else []
         transcript = {k: v for k, v in raw.items() if k != "schema_version"}
         transcript["speakers"] = speakers
         transcript["diarization"] = dict(dcfg)
+        if error is not None:
+            transcript["diarization_status"] = {"status": "fallback", "error": error}
         transcript["utterances"] = [u.to_dict() for u in utterances]
         for u in transcript["utterances"]:
             u.pop("words", None)
@@ -213,6 +223,9 @@ class Pipeline:
             f"- ASR：{transcript.get('asr', {}).get('provider')}　说话人：{'、'.join(transcript.get('speakers') or [])}",
             "",
         ]
+        status = transcript.get("diarization_status") or {}
+        if status.get("status") == "fallback":
+            lines.extend([f"> 说话人分离失败，已降级为单说话人：{status.get('error')}", ""])
         for u in transcript["utterances"]:
             t0, t1 = float(u.get("start", 0)), float(u.get("end", 0))
             lines.append(f"**{u.get('speaker', '?')}** `[{ts(t0)}-{ts(t1)}]`")
