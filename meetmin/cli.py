@@ -112,15 +112,23 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
     old = signal.signal(signal.SIGINT, _sigint)
     t0 = time.monotonic()
     warned = False
+    no_data_warned = False
     interactive = sys.stdout.isatty()
     try:
         while not stop["flag"]:
             time.sleep(1)
             status = rec.status()
+            elapsed = time.monotonic() - t0
             level = status["level"]
             # 以平方根扩展低电平，便于观察；不是校准过的声压计。
             bars = min(20, int((min(level, 1.0) ** 0.5) * 40))
-            line = f"已录 {ts(status['duration_sec'])}  电平 [{'#' * bars}{'-' * (20 - bars)}] RMS {level:.4f}"
+            no_data_sec = status["no_data_sec"]
+            level_display = (
+                "电平 无新数据"
+                if no_data_sec >= 2
+                else f"电平 [{'#' * bars}{'-' * (20 - bars)}] RMS {level:.4f}"
+            )
+            line = f"经过 {ts(elapsed)}  已录 {ts(status['duration_sec'])}  {level_display}"
             print(("\r" if interactive else "") + line, end="" if interactive else "\n", flush=True)
             if status["silent_sec"] >= 30 and not warned:
                 print(
@@ -129,10 +137,20 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
                 warned = True
             elif status["silent_sec"] == 0:
                 warned = False
+            if no_data_sec >= 10 and not no_data_warned:
+                print(
+                    "\n!!! 连续 10 秒未收到音频数据：输出静音时可能正常；"
+                    "若正在播放会议声音，请检查输出设备和录音状态，录音时长可能不足。",
+                    flush=True,
+                )
+                no_data_warned = True
+            elif no_data_sec < 10 and no_data_warned:
+                print("\n已恢复接收音频数据，请核对录音时长。", flush=True)
+                no_data_warned = False
             if status["failed"]:
                 print("\n录音线程发生错误，正在停止。")
                 break
-            if args.max_seconds and time.monotonic() - t0 >= args.max_seconds:
+            if args.max_seconds and elapsed >= args.max_seconds:
                 print("\n达到 --max-seconds，自动停止。")
                 break
     finally:

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import wave
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -66,6 +67,7 @@ class LoopbackRecorder:
         self._silent_frames = 0
         self._active_frames = 0
         self._level = 0.0
+        self._last_data_time: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
@@ -144,6 +146,8 @@ class LoopbackRecorder:
             self._chunks = 0
             self._error = None
             self._stop.clear()
+            with self._level_lock:
+                self._last_data_time = time.monotonic()
             self._thread = threading.Thread(target=self._run, daemon=True, name="loopback-rec")
             self._thread.start()
         except Exception:
@@ -174,6 +178,7 @@ class LoopbackRecorder:
             return
         level = float(np.sqrt(np.mean((samples / 32768.0) ** 2)))
         with self._level_lock:
+            self._last_data_time = time.monotonic()
             self._level = level
             self._frames += frames
             if level < self.silence_threshold:
@@ -188,6 +193,9 @@ class LoopbackRecorder:
             return {
                 "duration_sec": self._frames / sr,
                 "level": self._level,
+                "no_data_sec": max(0.0, time.monotonic() - self._last_data_time)
+                if self._last_data_time is not None
+                else 0.0,
                 "silent_sec": self._silent_frames / sr,
                 "active_fraction": self._active_frames / self._frames if self._frames else 0.0,
                 "failed": self._error is not None,

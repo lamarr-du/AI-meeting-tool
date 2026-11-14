@@ -324,6 +324,7 @@ def test_recording_silence_alert_rearms():
                 "level": 0.0,
                 "duration_sec": 1,
                 "silent_sec": next(self.states),
+                "no_data_sec": 0,
                 "failed": False,
             }
 
@@ -346,6 +347,72 @@ def test_recording_silence_alert_rearms():
             )
         assert output.getvalue().count("连续 30 秒低电平") == 2
         assert "已录" in output.getvalue()
+
+
+def test_recorder_tracks_missing_data_and_recovery():
+    from unittest.mock import patch
+
+    from meetmin.audio.loopback_recorder import LoopbackRecorder
+
+    rec = LoopbackRecorder()
+    rec.sample_rate_actual = 16000
+    rec.channels_actual = 1
+    rec._last_data_time = 100.0
+    with patch("meetmin.audio.loopback_recorder.time.monotonic", return_value=111.0):
+        assert rec.status()["no_data_sec"] == 11
+        rec._update_level(b"")
+        assert rec.status()["no_data_sec"] == 11
+        rec._update_level(np.zeros(16000, dtype="<i2").tobytes())
+        assert rec.status()["no_data_sec"] == 0
+        assert rec.status()["duration_sec"] == 1
+    with patch("meetmin.audio.loopback_recorder.time.monotonic", return_value=122.0):
+        assert rec.status()["no_data_sec"] == 11
+
+
+def test_recording_no_data_alert_rearms():
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import meetmin.cli as main
+
+    class Recorder:
+        def __init__(self):
+            self.states = iter([10, 11, 0.2, 10])
+
+        def start(self, *args, **kwargs):
+            pass
+
+        def status(self):
+            return {
+                "level": 0.5,
+                "duration_sec": 1,
+                "silent_sec": 0,
+                "no_data_sec": next(self.states),
+                "failed": False,
+            }
+
+        def stop(self):
+            return {"duration_sec": 0, "device": "test", "sample_rate": 16000, "channels": 1}
+
+    with _TmpDir() as td:
+        session = Session(td, "test").ensure()
+        output = io.StringIO()
+        with (
+            patch("meetmin.cli.time.sleep"),
+            patch("meetmin.cli.time.monotonic", side_effect=[0, 1, 2, 3, 4, 5]),
+            patch("meetmin.cli.signal.signal"),
+            patch("sys.stdout", output),
+        ):
+            main._do_record(
+                SimpleNamespace(recorder=Recorder),
+                session,
+                SimpleNamespace(overwrite=False, max_seconds=4),
+            )
+        text = output.getvalue()
+        assert text.count("连续 10 秒未收到音频数据") == 2
+        assert text.count("已恢复接收音频数据") == 1
+        assert "经过 00:01  已录 00:01  电平 无新数据" in text
 
 
 def test_recording_vad_silence():
