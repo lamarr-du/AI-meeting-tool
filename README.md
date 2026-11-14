@@ -190,6 +190,7 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `asr.model_size` / `language` | `small` / `zh`；语言填 `null` 自动检测 |
 | `asr.device` / `compute_type` | `auto` / `int8`，选择和回退行为见上文 |
 | `asr.beam_size` / `word_timestamps` | `1` / `true` |
+| `asr.condition_on_previous_text` | `false`；关闭前文条件以减少重复和幻觉，设为 `true` 可恢复原行为，实际值记录在 `asr_raw.json` |
 | `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
 | `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
 | `diarization.window_sec` / `hop_sec` | `1.5` / `0.75`，声纹窗口和步长 |

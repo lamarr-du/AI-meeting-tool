@@ -150,6 +150,33 @@ def test_whisper_gpu_oom_retries_cpu():
     assert calls == [("cuda", "int8_float16"), ("cpu", "int8")]
 
 
+@pytest.mark.parametrize("configured, expected", [(None, False), (False, False), (True, True)])
+def test_whisper_condition_on_previous_text(configured, expected):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from meetmin.asr.faster_whisper_asr import FasterWhisperASR
+
+    asr = object.__new__(FasterWhisperASR)
+    asr.acfg = {} if configured is None else {"condition_on_previous_text": configured}
+    asr._device, asr._compute = "cpu", "int8"
+    asr.model = Mock()
+    asr.model.transcribe.return_value = (iter([]), SimpleNamespace(duration=1, language="zh"))
+    result = asr.transcribe(np.zeros(16000, dtype=np.float32))
+    assert asr.model.transcribe.call_args.kwargs["condition_on_previous_text"] is expected
+    assert result.extra["parameters"]["condition_on_previous_text"] is expected
+
+
+def test_whisper_condition_on_previous_text_rejects_non_boolean():
+    from meetmin.asr.faster_whisper_asr import FasterWhisperASR
+
+    asr = object.__new__(FasterWhisperASR)
+    asr.acfg = {"condition_on_previous_text": "false"}
+    asr._device = "cpu"
+    with pytest.raises(ValueError, match="condition_on_previous_text"):
+        asr.transcribe(np.zeros(16000, dtype=np.float32))
+
+
 def test_doctor_checks_recording_before_start():
     from unittest.mock import patch
 
@@ -340,7 +367,7 @@ def test_raw_asr_survives_failed_diarization():
         transcribe=lambda *a, **k: ASRResult(
             utterances=[Utterance(0, 2, "甲乙", words=words)],
             language="zh",
-            extra={"asr_model": "fake"},
+            extra={"asr_model": "fake", "parameters": {"condition_on_previous_text": False}},
         ),
     )
     with _TmpDir() as td:
@@ -360,6 +387,7 @@ def test_raw_asr_survives_failed_diarization():
         original = path.read_bytes()
         assert raw["utterances"][0]["words"] == words
         assert raw["asr"]["parameters"]["model_size"] == "fake"
+        assert raw["asr"]["parameters"]["condition_on_previous_text"] is False
         with patch("meetmin.diarization.get_diarizer", side_effect=RuntimeError("分离崩溃")):
             fallback = pipe.diarize(session)
         assert path.read_bytes() == original

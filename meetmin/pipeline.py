@@ -122,6 +122,8 @@ class Pipeline:
         acfg = self.cfg.get("asr", {})
         keys = ("model_size", "language", "device", "compute_type", "beam_size", "word_timestamps")
         raw["asr"]["parameters"] = {k: acfg[k] for k in keys if k in acfg}
+        if provider_name == "faster_whisper":
+            raw["asr"]["parameters"].update(result.extra.get("parameters", {}))
         if provider_name == "dashscope":
             dc = self.cfg.get("dashscope_asr", {})
             raw["asr"]["parameters"] = {
