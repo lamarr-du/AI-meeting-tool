@@ -13,12 +13,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from typing import Any
 
 from ..asr.base import Utterance
 from ..textutil import smart_join, ts
 from . import prompts
 from .llm_client import BaseLLM, Usage
+
+logger = logging.getLogger("meetmin")
 
 # 二级合并（中间要点仍过长时，只合并"压缩后的要点"，绝不回喂原文）
 COMPACT_POINTS_USER = """以下是会议多个片段提炼出的要点，内容有重复或琐碎。
@@ -176,7 +179,11 @@ def generate_minutes(
 
     merged = "\n\n".join(points)
     # 中间要点仍过长 → 再做一级"要点的要点"（每级只处理压缩产物，成本线性且远小于原文）
+    rounds = 0
     while len(merged) > threshold * 2 and len(merged) > max_chunk * 2:
+        if rounds >= 3:
+            logger.warning("二次压缩已达 3 轮上限，将使用当前要点生成纪要。")
+            break
         sub = split_chunks(merged, max_chunk)
         if len(sub) < 2:
             break
@@ -198,7 +205,17 @@ def generate_minutes(
             usage.add(u)
             if pt.strip():
                 new_points.append(pt.strip())
-        merged = "\n\n".join(new_points)
+        candidate = "\n\n".join(new_points)
+        rounds += 1
+        if not candidate:
+            logger.warning("二次压缩未产生要点，将使用上一轮要点生成纪要。")
+            break
+        previous_length = len(merged)
+        if len(candidate) < previous_length:
+            merged = candidate
+        if len(candidate) > previous_length * 0.8:
+            logger.warning("二次压缩未至少缩短 20%，停止压缩并使用当前要点生成纪要。")
+            break
 
     # ---------------- reduce：合成最终纪要 ----------------
     if progress_cb:

@@ -103,11 +103,15 @@ class FasterWhisperASR(ASRProvider):
 
             audio = to_mono_16k(file_path)
 
+        condition_on_previous_text = self.acfg.get("condition_on_previous_text", False)
+        if not isinstance(condition_on_previous_text, bool):
+            raise ValueError("asr.condition_on_previous_text 必须为 true 或 false")
         segments, info = self.model.transcribe(
             audio,
             language=self.acfg.get("language") or None,
             beam_size=int(self.acfg.get("beam_size", 1)),
             word_timestamps=bool(self.acfg.get("word_timestamps", True)),
+            condition_on_previous_text=condition_on_previous_text,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 400},
         )
@@ -136,5 +140,6 @@ class FasterWhisperASR(ASRProvider):
                 "asr_model": self.acfg.get("model_size", "small"),
                 "effective_device": self._device,
                 "effective_compute_type": self._compute,
+                "parameters": {"condition_on_previous_text": condition_on_previous_text},
             },
         )

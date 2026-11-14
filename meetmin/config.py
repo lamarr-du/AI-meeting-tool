@@ -23,6 +23,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "device": "auto",  # auto/cpu/cuda
         "compute_type": "int8",  # int8 最省资源；有 GPU 可用 float16
         "beam_size": 1,  # 1=贪心解码，速度优先
+        "condition_on_previous_text": False,  # 关闭前文条件，减少重复和幻觉
         "word_timestamps": True,  # 词级时间戳（供说话人分离对齐，建议保留）
         "hf_endpoint": None,  # 国内可设 https://hf-mirror.com 下载模型
         "hf_disable_xet": True,  # 避免部分网络环境访问 Xet 重建服务时出现 401

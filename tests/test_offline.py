@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from meetmin.asr.base import ASRResult, Utterance
 from meetmin.asr.faster_whisper_asr import _configure_huggingface_download
@@ -149,6 +150,33 @@ def test_whisper_gpu_oom_retries_cpu():
     assert calls == [("cuda", "int8_float16"), ("cpu", "int8")]
 
 
+@pytest.mark.parametrize("configured, expected", [(None, False), (False, False), (True, True)])
+def test_whisper_condition_on_previous_text(configured, expected):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from meetmin.asr.faster_whisper_asr import FasterWhisperASR
+
+    asr = object.__new__(FasterWhisperASR)
+    asr.acfg = {} if configured is None else {"condition_on_previous_text": configured}
+    asr._device, asr._compute = "cpu", "int8"
+    asr.model = Mock()
+    asr.model.transcribe.return_value = (iter([]), SimpleNamespace(duration=1, language="zh"))
+    result = asr.transcribe(np.zeros(16000, dtype=np.float32))
+    assert asr.model.transcribe.call_args.kwargs["condition_on_previous_text"] is expected
+    assert result.extra["parameters"]["condition_on_previous_text"] is expected
+
+
+def test_whisper_condition_on_previous_text_rejects_non_boolean():
+    from meetmin.asr.faster_whisper_asr import FasterWhisperASR
+
+    asr = object.__new__(FasterWhisperASR)
+    asr.acfg = {"condition_on_previous_text": "false"}
+    asr._device = "cpu"
+    with pytest.raises(ValueError, match="condition_on_previous_text"):
+        asr.transcribe(np.zeros(16000, dtype=np.float32))
+
+
 def test_doctor_checks_recording_before_start():
     from unittest.mock import patch
 
@@ -171,14 +199,20 @@ def test_doctor_checks_recording_before_start():
 
 
 def test_session_names_and_lookup():
+    from unittest.mock import patch
+
     import meetmin.cli as main
     from meetmin.pipeline import Pipeline
     from meetmin.session import clean_session_name
 
     with _TmpDir() as td:
         pipe = Pipeline({"output_dir": td})
-        one = pipe.new_session("weekly")
-        two = pipe.new_session("weekly")
+        with patch(
+            "meetmin.pipeline.new_session_id",
+            side_effect=["weekly-20990101-000000000001-aaaa", "weekly-20990101-000000000002-bbbb"],
+        ):
+            one = pipe.new_session("weekly")
+            two = pipe.new_session("weekly")
         assert one.root != two.root and one.root.is_dir() and two.root.is_dir()
         bad = pipe.new_session("../other\\evil:*?")
         assert bad.root.parent == Path(td) / "sessions"
@@ -202,6 +236,21 @@ def test_session_names_and_lookup():
         (root / "weekly").mkdir()
         assert main._find_session(td, "weekly").session_id == "weekly"
         assert clean_session_name("../../") == "session"
+
+
+def test_session_lookup_rejects_equal_latest_timestamps():
+    import meetmin.cli as main
+
+    with _TmpDir() as td:
+        root = Path(td) / "sessions"
+        first = "weekly-20261114-173326099747-ffff"
+        second = "weekly-20261114-173326099747-0000"
+        for name in (first, second, "weekly-20200101-000000-0001"):
+            (root / name).mkdir(parents=True)
+        with pytest.raises(SystemExit, match="请使用完整会话 ID") as exc:
+            main._find_session(td, "weekly")
+        assert first in str(exc.value) and second in str(exc.value)
+        assert main._find_session(td, second).session_id == second
 
 
 def test_record_protects_existing_audio():
@@ -296,6 +345,7 @@ def test_recording_silence_alert_rearms():
                 "level": 0.0,
                 "duration_sec": 1,
                 "silent_sec": next(self.states),
+                "no_data_sec": 0,
                 "failed": False,
             }
 
@@ -320,6 +370,72 @@ def test_recording_silence_alert_rearms():
         assert "已录" in output.getvalue()
 
 
+def test_recorder_tracks_missing_data_and_recovery():
+    from unittest.mock import patch
+
+    from meetmin.audio.loopback_recorder import LoopbackRecorder
+
+    rec = LoopbackRecorder()
+    rec.sample_rate_actual = 16000
+    rec.channels_actual = 1
+    rec._last_data_time = 100.0
+    with patch("meetmin.audio.loopback_recorder.time.monotonic", return_value=111.0):
+        assert rec.status()["no_data_sec"] == 11
+        rec._update_level(b"")
+        assert rec.status()["no_data_sec"] == 11
+        rec._update_level(np.zeros(16000, dtype="<i2").tobytes())
+        assert rec.status()["no_data_sec"] == 0
+        assert rec.status()["duration_sec"] == 1
+    with patch("meetmin.audio.loopback_recorder.time.monotonic", return_value=122.0):
+        assert rec.status()["no_data_sec"] == 11
+
+
+def test_recording_no_data_alert_rearms():
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import meetmin.cli as main
+
+    class Recorder:
+        def __init__(self):
+            self.states = iter([10, 11, 0.2, 10])
+
+        def start(self, *args, **kwargs):
+            pass
+
+        def status(self):
+            return {
+                "level": 0.5,
+                "duration_sec": 1,
+                "silent_sec": 0,
+                "no_data_sec": next(self.states),
+                "failed": False,
+            }
+
+        def stop(self):
+            return {"duration_sec": 0, "device": "test", "sample_rate": 16000, "channels": 1}
+
+    with _TmpDir() as td:
+        session = Session(td, "test").ensure()
+        output = io.StringIO()
+        with (
+            patch("meetmin.cli.time.sleep"),
+            patch("meetmin.cli.time.monotonic", side_effect=[0, 1, 2, 3, 4, 5]),
+            patch("meetmin.cli.signal.signal"),
+            patch("sys.stdout", output),
+        ):
+            main._do_record(
+                SimpleNamespace(recorder=Recorder),
+                session,
+                SimpleNamespace(overwrite=False, max_seconds=4),
+            )
+        text = output.getvalue()
+        assert text.count("连续 10 秒未收到音频数据") == 2
+        assert text.count("已恢复接收音频数据") == 1
+        assert "经过 00:01  已录 00:01  电平 无新数据" in text
+
+
 def test_recording_vad_silence():
     from faster_whisper.vad import get_speech_timestamps
 
@@ -339,12 +455,17 @@ def test_raw_asr_survives_failed_diarization():
         transcribe=lambda *a, **k: ASRResult(
             utterances=[Utterance(0, 2, "甲乙", words=words)],
             language="zh",
-            extra={"asr_model": "fake"},
+            extra={"asr_model": "fake", "parameters": {"condition_on_previous_text": False}},
         ),
     )
     with _TmpDir() as td:
         pipe = Pipeline(
-            {"output_dir": td, "asr": {"model_size": "fake"}, "diarization": {"min_group_sec": 0.1}}
+            {
+                "output_dir": td,
+                "asr": {"model_size": "fake"},
+                "diarization": {"min_group_sec": 0.1},
+                "llm": {},
+            }
         )
         session = pipe.new_session("retry")
         dsp.save_wav_mono(session.audio_path, np.ones(32000, dtype=np.float32) * 0.1, 16000)
@@ -354,14 +475,25 @@ def test_raw_asr_survives_failed_diarization():
         original = path.read_bytes()
         assert raw["utterances"][0]["words"] == words
         assert raw["asr"]["parameters"]["model_size"] == "fake"
+        assert raw["asr"]["parameters"]["condition_on_previous_text"] is False
         with patch("meetmin.diarization.get_diarizer", side_effect=RuntimeError("分离崩溃")):
-            try:
-                pipe.diarize(session)
-                assert False
-            except RuntimeError:
-                pass
+            fallback = pipe.diarize(session)
         assert path.read_bytes() == original
-        assert not (session.root / "transcript.json").exists()
+        assert fallback["speakers"] == ["说话人A"]
+        assert fallback["utterances"][0]["text"] == "甲乙"
+        assert fallback["diarization_status"] == {
+            "status": "fallback",
+            "error": "RuntimeError: 分离崩溃",
+        }
+        assert "分离崩溃" in (session.root / "transcript.md").read_text(encoding="utf-8")
+        assert (
+            json.loads((session.root / "transcript.json").read_text(encoding="utf-8"))[
+                "diarization_status"
+            ]
+            == fallback["diarization_status"]
+        )
+        minutes_path, _ = pipe.summarize(session, llm=MockLLM())
+        assert minutes_path.exists()
         fake = SimpleNamespace(
             name="fake",
             diarize=lambda *a, **k: [
@@ -375,9 +507,59 @@ def test_raw_asr_survives_failed_diarization():
         ):
             transcript = pipe.diarize(session)
         assert len(transcript["utterances"]) == 2
+        assert "diarization_status" not in transcript
         assert all("words" not in u for u in transcript["utterances"])
         assert json.loads(original)["utterances"][0]["words"] == words
         assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("failure", ["audio", "model", "alignment"])
+def test_diarization_fallback_recovers_raw_utterances(failure):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from meetmin.pipeline import Pipeline
+
+    with _TmpDir() as td:
+        messages = []
+        pipe = Pipeline({"output_dir": td, "diarization": {}}, progress=messages.append)
+        session = pipe.new_session("failure")
+        session.audio_path.touch()
+        raw = {
+            "session_id": session.session_id,
+            "audio_path": str(session.audio_path),
+            "utterances": [{"start": 0, "end": 1, "text": "原始内容"}],
+        }
+        session.save_json("asr_raw.json", raw)
+        original = (session.root / "asr_raw.json").read_bytes()
+        model = SimpleNamespace(name="fake", diarize=lambda *args, **kwargs: [])
+
+        def fail_alignment(utterances, *args, **kwargs):
+            utterances[0].text = "损坏"
+            raise ValueError("对齐失败")
+
+        with (
+            patch(
+                "meetmin.pipeline.to_mono_16k",
+                side_effect=OSError("音频失败") if failure == "audio" else None,
+                return_value=np.ones(10),
+            ),
+            patch(
+                "meetmin.diarization.get_diarizer",
+                side_effect=RuntimeError("模型失败") if failure == "model" else None,
+                return_value=model,
+            ),
+            patch(
+                "meetmin.pipeline.assign_speakers",
+                side_effect=fail_alignment if failure == "alignment" else None,
+            ),
+        ):
+            transcript = pipe.diarize(session)
+        assert transcript["utterances"][0]["text"] == "原始内容"
+        assert transcript["utterances"][0]["speaker"] == "说话人A"
+        assert transcript["diarization_status"]["status"] == "fallback"
+        assert any("已降级为单说话人" in message for message in messages)
+        assert (session.root / "asr_raw.json").read_bytes() == original
 
 
 def test_embeddings_saved_before_clustering_and_reused():
@@ -555,6 +737,56 @@ def test_generate_minutes_map_reduce():
     assert "mock 纪要" in md
     assert usage.calls >= 2  # map 多次 + reduce 一次
     assert usage.prompt_tokens > 0
+
+
+@pytest.mark.parametrize("compact_size, expected_rounds", [(200, 1), (150, 3), (0, 1)])
+def test_compaction_stops_and_preserves_points(compact_size, expected_rounds, caplog):
+    from meetmin.summarizer.llm_client import Usage
+
+    class LongLLM:
+        def __init__(self):
+            self.rounds = 0
+            self.final_prompt = ""
+
+        def chat(self, messages, **kwargs):
+            prompt = messages[-1]["content"]
+            if "【片段】" in prompt:
+                result = "原" * 10000
+            elif "【要点】" in prompt:
+                # Each round starts with the first chunk of the preceding result.
+                if "原" in prompt or "压" in prompt:
+                    self.rounds += 1
+                size = (
+                    int(len(prompt.split("【要点】\n", 1)[1]) * 0.6)
+                    if compact_size == 150
+                    else compact_size
+                )
+                result = "压" * size
+            else:
+                self.final_prompt = prompt
+                result = "纪要"
+            return result, Usage(calls=1)
+
+    llm = LongLLM()
+    tr = {"utterances": [u.to_dict() for u in _utts(1)]}
+    cfg = {
+        "summarizer": {
+            "strategy": "map_reduce",
+            "max_chunk_chars": 200,
+            "direct_threshold_chars": 200,
+        }
+    }
+    md, usage = generate_minutes(tr, llm, config=cfg)
+    assert md == "纪要"
+    assert "原" in llm.final_prompt or "压" in llm.final_prompt
+    assert usage.calls == llm.rounds + 2
+    # Round count is measured by warnings; compact calls span multiple chunks.
+    warning = (
+        "3 轮上限"
+        if expected_rounds == 3
+        else ("未产生要点" if compact_size == 0 else "未至少缩短")
+    )
+    assert warning in caplog.text
 
 
 def test_generate_minutes_empty_raises():

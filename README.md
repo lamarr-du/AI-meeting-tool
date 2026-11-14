@@ -97,7 +97,7 @@ meetmin run --audio "recordings/meeting.m4a" -n review
 
 每次普通 `record -n weekly` 或 `run -n weekly` 都新建目录，形如 `data/sessions/weekly-20261113-090000123456-ab12/`。名称作为前缀，非法字符和连续的点会被替换，前缀最长 100 个字符；日期时间由运行机器的本地时钟生成。未提供名称时使用时间戳和随机后缀。
 
-`transcribe`、`diarize`、`summarize` 按名称查找时，优先匹配完整目录名，否则选择 `名称-` 前缀下最新的一个，并打印所选 ID。新格式按目录名中的创建时间排序，旧格式回退到目录修改时间；旧的精确目录名（例如 `weekly`）仍优先。需要处理某次会议时，建议复制程序打印的完整 ID。
+`transcribe`、`diarize`、`summarize` 按名称查找时，优先匹配完整目录名，否则选择 `名称-` 前缀下最新的一个，并打印所选 ID。新格式按目录名中的创建时间排序，旧格式回退到目录修改时间；旧的精确目录名（例如 `weekly`）仍优先。若最新的多个会话时间相同，程序会列出候选并要求指定完整 ID，避免选错会话。需要处理某次会议时，建议复制程序打印的完整 ID。
 
 - `transcribe` 未找到会话时，只有提供 `--audio` 才会新建；仅传 `--file-url` 不会创建会话。
 - `diarize` 不会新建会话，且必须已有 `asr_raw.json`。
@@ -114,7 +114,9 @@ meetmin record -n weekly-20261113-090000123456-ab12 --overwrite
 
 ## 录音反馈和预检
 
-录音时每秒显示按已接收音频帧计算的时长、RMS 电平和电平条；交互终端刷新同一行，重定向输出时逐行记录。连续低于 `recorder.silence_threshold`（默认 0.003）的音频达到 30 秒时告警，同一段静音只提示一次，声音恢复后重新计时。阈值为归一化 RMS，电平条用于观察声音活动。
+录音时每秒显示经过的墙钟时间、按已接收音频帧计算的录音时长、RMS 电平和电平条；交互终端刷新同一行，重定向输出时逐行记录。连续低于 `recorder.silence_threshold`（默认 0.003）的音频达到 30 秒时告警，同一段静音只提示一次，声音恢复后重新计时。阈值为归一化 RMS，电平条用于观察声音活动。
+
+两秒未收到新数据时不再显示旧电平；连续 10 秒未收到数据时提示检查，恢复接收后会提示并重新计时。某些 WASAPI 设备在输出静音时本来就不发送数据，因此告警本身不一定代表故障；如果会议声音正在播放，应检查输出设备并对照两种时长。此提示不会补齐缺失的音频，也不会自动切换设备。
 
 录音结束后，本地 Silero VAD 估算有效语音占比；检测失败时报告基于 RMS 阈值的有声占比。两者均为估算，音乐和噪声可能影响结果。VAD 在录音结束后执行，需要额外解码和处理时间。
 
@@ -190,6 +192,7 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `asr.model_size` / `language` | `small` / `zh`；语言填 `null` 自动检测 |
 | `asr.device` / `compute_type` | `auto` / `int8`，选择和回退行为见上文 |
 | `asr.beam_size` / `word_timestamps` | `1` / `true` |
+| `asr.condition_on_previous_text` | `false`；关闭前文条件以减少重复和幻觉，设为 `true` 可恢复原行为，实际值记录在 `asr_raw.json` |
 | `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
 | `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
 | `diarization.window_sec` / `hop_sec` | `1.5` / `0.75`，声纹窗口和步长 |
@@ -202,7 +205,7 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `llm.extra_request` | `{}`，透传请求字段，例如 `{"enable_thinking": false}`，是否支持由服务决定 |
 | `summarizer.strategy` | `auto`，按长度选择 `direct` 或 `map_reduce` |
 
-缺少 SpeechBrain 等初始化阶段的可选导入依赖时，工厂会提示并降级为单说话人；模型下载、编码或聚类阶段的错误仍可能中止分离，可利用原始转写恢复。
+分离阶段遇到音频读取、依赖、模型或聚类等错误时，会提示原因并降级为单说话人，继续生成转写和纪要。`transcript.json` 的 `diarization_status` 和 `transcript.md` 会记录降级原因；原始转写不受影响，修复问题后可重跑 `diarize` 和纪要。
 
 ## 纪要与云端 ASR
 

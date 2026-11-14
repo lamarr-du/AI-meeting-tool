@@ -6,6 +6,7 @@ data/
 *.wav
 *.mp3
 .venv/
+.conda/
 
 # 开发工具与构建产物
 .pytest_cache/

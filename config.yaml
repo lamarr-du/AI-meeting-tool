@@ -15,6 +15,7 @@ asr:
   device: auto               # auto / cpu / cuda
   compute_type: int8
   beam_size: 1
+  condition_on_previous_text: false  # 关闭前文条件；设为 true 恢复以前的行为
   word_timestamps: true      # 说话人分离对齐需要
   hf_endpoint: null          # 国内下不动模型时改: https://hf-mirror.com
   hf_disable_xet: true       # 规避 Xet 重建服务 401；需要 Xet 时设 false
@@ -25,7 +26,7 @@ diarization:
   num_speakers: null            # 已知参会人数时填写，分离效果更好
   window_sec: 1.5
   hop_sec: 0.75
-  cluster_threshold: 0.55       # 分不清谁是谁时调大；把一人拆成多人时调小
+  cluster_threshold: 0.55       # 多人被合并时调小；一人被拆成多人时调大
   min_window_rms: 0.003
   min_group_sec: 0.4
 
