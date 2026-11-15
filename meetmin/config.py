@@ -23,13 +23,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "asr": {
         "provider": "faster_whisper",  # faster_whisper（本地，零 token）| dashscope（云端 Paraformer）
         "language": "zh",  # null=自动检测
-        "model_size": "small",  # tiny/base/small/medium/large-v3/large-v3-turbo
+        "profile": "auto",
+        "model_size": None,  # null 由档位选择；也可指定本地模型目录
+        "cuda_peak_mib": None,  # 当前模型和计算类型在目标 GPU 上的实测峰值
         "device": "auto",  # auto/cpu/cuda
-        "compute_type": "int8",  # int8 最省资源；有 GPU 可用 float16
+        "compute_type": None,  # 跟随设备，CPU int8、CUDA int8_float16
         "beam_size": 1,  # 1=贪心解码，速度优先
         "condition_on_previous_text": False,  # 关闭前文条件，减少重复和幻觉
+        "no_repeat_ngram_size": 0,
+        "repetition_penalty": 1.0,
+        "hallucination_silence_threshold": None,
+        "quality": {},  # 默认值由本地 Whisper 的 QualityOptions 提供
         "punctuation_prompt": None,
         "hotwords": None,
+        "glossary": {"path": None, "terms": None, "max_terms": 20, "correction_path": None},
         "word_timestamps": True,  # 词级时间戳（供说话人分离对齐，建议保留）
         "hf_endpoint": None,  # 国内可设 https://hf-mirror.com 下载模型
         "hf_disable_xet": True,  # 避免部分网络环境访问 Xet 重建服务时出现 401
@@ -97,4 +104,11 @@ def load_config(path: str | Path | None = None) -> dict:
         if not isinstance(user, dict):
             raise ValueError(f"配置文件格式错误（应为 YAML 映射）: {p}")
         cfg = deep_merge(cfg, user)
+    asr = cfg.get("asr")
+    glossary = asr.get("glossary") if isinstance(asr, dict) else None
+    if isinstance(glossary, dict):
+        for key in ("path", "correction_path"):
+            value = glossary.get(key)
+            if isinstance(value, str) and value.strip():
+                glossary[key] = str(p.resolve().parent / Path(value).expanduser())
     return cfg

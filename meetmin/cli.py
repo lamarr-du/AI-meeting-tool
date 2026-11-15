@@ -354,7 +354,10 @@ def cmd_diarize(args, cfg) -> None:
     session = _find_session(cfg["output_dir"], args.session)
     if session is None:
         sys.exit("未找到会话，请用 --session 指定已完成转写的会话。")
-    Pipeline(cfg).diarize(session)
+    try:
+        Pipeline(cfg).diarize(session)
+    except (OSError, ValueError) as error:
+        sys.exit(f"转写整理失败：{error}")
     print(f"\n下一步：meetmin summarize --session {session.session_id}")
 
 

@@ -15,6 +15,7 @@ from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
 from .audio.session_recorder import SessionRecorder
 from .diarization.align import assign_speakers, relabel
+from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
 from .summarizer.llm_client import BaseLLM, Usage, get_llm
 from .summarizer.minutes import build_web_prompt, estimate_cost, generate_minutes
@@ -112,6 +113,14 @@ class Pipeline:
                 file_url=url,
                 progress_cb=on_seg if local_like else None,
             )
+            if local_like and (quality := result.extra.get("quality")):
+                if issues := quality.get("issues"):
+                    self.progress(
+                        f"  转写体检标记 {len(issues)} 处，局部重试 {quality['attempted']} 次，"
+                        f"采纳 {quality['accepted']} 处。"
+                    )
+                if error := quality.get("vad_error"):
+                    self.progress(f"  ! 有声缺口检查失败：{error}")
             if result.audio_16k is not None:
                 samples, result.audio_16k = result.audio_16k, None
             if samples is not None and len(samples):
@@ -122,11 +131,20 @@ class Pipeline:
                 duration = audio_duration(path) if path.exists() else 0.0
             return result, duration
 
-        result, duration = transcribe_track(audio, file_url)
-        utterances = [u for u in result.utterances if u.text.strip()]
-        self.progress(f"  {provider.name} 完成：{len(utterances)} 句，耗时 {time.time() - t0:.0f}s")
-
         provider_name = provider.name
+        try:
+            result, duration = transcribe_track(audio, file_url)
+            utterances = [u for u in result.utterances if u.text.strip()]
+            self.progress(
+                f"  {provider_name} 完成：{len(utterances)} 句，耗时 {time.time() - t0:.0f}s"
+            )
+            if microphone is not None:
+                self.progress(f"[2a] 转写麦克风：{microphone}")
+                mic_result, mic_duration = transcribe_track(microphone)
+        finally:
+            close = getattr(provider, "close", None)
+            if close is not None:
+                close()
 
         raw: dict[str, Any] = {
             "session_id": session.session_id,
@@ -149,7 +167,16 @@ class Pipeline:
             "utterances": [u.to_dict() for u in utterances],
         }
         acfg = self.cfg.get("asr", {})
-        keys = ("model_size", "language", "device", "compute_type", "beam_size", "word_timestamps")
+        keys = (
+            "profile",
+            "model_size",
+            "language",
+            "device",
+            "compute_type",
+            "cuda_peak_mib",
+            "beam_size",
+            "word_timestamps",
+        )
         raw["asr"]["parameters"] = {k: acfg[k] for k in keys if k in acfg}
         if provider_name == "faster_whisper":
             raw["asr"]["parameters"].update(result.extra.get("parameters", {}))
@@ -159,8 +186,6 @@ class Pipeline:
                 k: dc[k] for k in ("model", "speaker_count", "language_hints") if k in dc
             }
         if microphone is not None:
-            self.progress(f"[2a] 转写麦克风：{microphone}")
-            mic_result, mic_duration = transcribe_track(microphone)
             mic_utterances = [u for u in mic_result.utterances if u.text.strip()]
             for u in mic_utterances:
                 u.speaker = "我"
@@ -236,6 +261,7 @@ class Pipeline:
             u.pop("words", None)
         session.save_json("transcript.json", transcript)
         session.save_text("transcript.md", self._render_md(transcript))
+        self._correct_glossary(session, transcript)
         self.progress(f"  ✓ 分离结果已保存：{session.root}")
         return transcript
 
@@ -288,6 +314,14 @@ class Pipeline:
             "",
         ]
         status = transcript.get("diarization_status") or {}
+        if correction := transcript.get("glossary_correction"):
+            lines.extend(
+                [
+                    f"> 术语纠错 {len(correction['changes'])} 处，待核对 {len(correction['context_review'])} 处。"
+                    " 原文数据见 `transcript.json`，替换记录见 `transcript_corrected.json`。",
+                    "",
+                ]
+            )
         if microphone := transcript.get("microphone"):
             lines.insert(3, f"- 麦克风：`{microphone['audio_path']}`")
         if status.get("status") == "fallback":
@@ -301,9 +335,26 @@ class Pipeline:
             lines.append("")
         return "\n".join(lines)
 
+    def _correct_glossary(self, session: Session, transcript: dict) -> dict:
+        glossary = (self.cfg.get("asr") or {}).get("glossary") or {}
+        if not isinstance(glossary, dict):
+            raise ValueError("asr.glossary 必须是映射")
+        path = glossary.get("correction_path")
+        if path is None:
+            return transcript
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("asr.glossary.correction_path 必须是非空路径或 null")
+        corrected = correct_transcript(transcript, Path(path).expanduser())
+        session.save_json("transcript_corrected.json", corrected)
+        session.save_text_safely(
+            "transcript_corrected.md", self._render_md(corrected), overwrite=True
+        )
+        return corrected
+
     # ---------------- (3) AI 纪要 ----------------
     def export_web_prompt(self, session: Session, *, overwrite: bool = False) -> Path:
-        prompt = build_web_prompt(session.load_transcript(), config=self.cfg)
+        transcript = self._correct_glossary(session, session.load_transcript())
+        prompt = build_web_prompt(transcript, config=self.cfg)
         return session.save_text_safely("minutes_web_prompt.txt", prompt, overwrite=overwrite)
 
     def import_web_minutes(
@@ -318,7 +369,7 @@ class Pipeline:
         return session.save_text_safely("minutes.md", content, overwrite=overwrite)
 
     def summarize(self, session: Session, *, llm: BaseLLM | None = None) -> tuple[Path, Usage]:
-        transcript = session.load_transcript()
+        transcript = self._correct_glossary(session, session.load_transcript())
         try:
             lcfg = self.cfg.get("llm", {}) or {}
             if (

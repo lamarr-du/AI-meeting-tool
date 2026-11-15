@@ -145,7 +145,7 @@ def test_whisper_gpu_oom_retries_cpu():
         patch.dict(sys.modules, {"faster_whisper": module}),
         patch("meetmin.doctor.gpu_status", return_value=("GPU", 8192, 8192, [])),
     ):
-        asr = FasterWhisperASR({"device": "auto", "model_size": "small"})
+        asr = FasterWhisperASR({"device": "auto", "model_size": "small", "cuda_peak_mib": 2400})
         assert asr.transcribe(np.zeros(16000, dtype=np.float32)).utterances == []
     assert calls == [("cuda", "int8_float16"), ("cpu", "int8")]
 
@@ -700,6 +700,25 @@ def test_diarization_fallback_recovers_raw_utterances(failure):
         assert transcript["diarization_status"]["status"] == "fallback"
         assert any("已降级为单说话人" in message for message in messages)
         assert (session.root / "asr_raw.json").read_bytes() == original
+
+
+def test_ecapa_passes_mono_batch_as_two_dimensional_audio(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
+
+    diarizer = object.__new__(EcapaSpeechbrainDiarizer)
+    diarizer._torch = SimpleNamespace(no_grad=nullcontext, from_numpy=lambda array: array)
+    diarizer.encoder = Mock()
+    encoded = diarizer.encoder.encode_batch.return_value
+    encoded.squeeze.return_value.cpu.return_value.numpy.return_value = np.ones((2, 3))
+    monkeypatch.setattr(diarizer, "_load_encoder", lambda: diarizer.encoder)
+    windows = np.ones((2, 24000), dtype=np.float32)
+    embeddings = diarizer._embed(windows)
+    assert diarizer.encoder.encode_batch.call_args.args[0].shape == (2, 24000)
+    assert np.allclose(np.linalg.norm(embeddings, axis=1), 1)
 
 
 def test_embeddings_saved_before_clustering_and_reused():

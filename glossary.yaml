@@ -1,0 +1,39 @@
+terms:
+  - term: demosaic
+    mishearings:
+      - 迪马斯克
+      - 迪马森克
+      - 迪马赛克
+      - 迪马塞克
+  - term: bypass
+    mishearings:
+      - 拍片上
+      - 拍不上
+      - 单拍不
+      - 拍摄上
+      - type 上
+  - term: white level
+    mishearings:
+      - 外他 level
+      - 外特来往
+      - Wet Level
+      - wattlevel
+  - term: constrain
+    mishearings:
+      - 坑寸
+      - 坑村
+      - kontrains
+  - term: workaround
+    mishearings:
+      - walk around
+  - term: DRC Stat
+    aliases:
+      - DRCST
+    mishearings:
+      - drcstd
+      - DRC STD
+      - drcstata
+      - DRCState
+  - term: "@"
+    mishearings:
+      - 爱他
