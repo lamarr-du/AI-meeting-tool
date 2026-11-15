@@ -93,7 +93,7 @@ meetmin run --audio "recordings/meeting.m4a" -n review
 | `recover` | 从录音分段恢复；`-n` 必须是完整会话 ID，可用 `--take` 选择某次录音、`--output` 指定新文件 |
 | `transcribe` | 保存原始转写；`-n` 会话 ID/前缀、`--audio` 本地音频、`--file-url` 云端音频 URL |
 | `diarize` | 从 `asr_raw.json` 重跑分离/对齐；必须提供 `-n` 会话 ID/前缀 |
-| `summarize` | 从 `transcript.json` 生成纪要；可用 `-n` 指定会话 |
+| `summarize` | 从 `transcript.json` 生成纪要；`--export-web` 导出网页版提示词，`--import-web` 导入网页版结果 |
 | `run` | 自动完成全部流程；支持 `-n`、`--audio`、`--file-url`、`--device`、`--max-seconds` |
 
 每次普通 `record -n weekly` 或 `run -n weekly` 都新建目录，形如 `data/sessions/weekly-20261113-090000123456-ab12/`。名称作为前缀，非法字符和连续的点会被替换，前缀最长 100 个字符；日期时间由运行机器的本地时钟生成。未提供名称时使用时间戳和随机后缀。
@@ -111,7 +111,24 @@ meetmin run --audio "recordings/meeting.m4a" -n review
 meetmin record -n weekly-20261113-090000123456-ab12 --overwrite
 ```
 
-`run` 也支持相同用法；`--overwrite` 不能与 `--audio` 同用。覆盖录音不会删除旧转写、嵌入缓存或纪要，后续应重新执行转写、分离和纪要。`transcribe`、`diarize`、`summarize` 在同一会话重跑时会替换各自的输出，不需要 `--overwrite`。
+`run` 也支持相同用法；`--overwrite` 不能与 `--audio` 同用。覆盖录音不会删除旧转写、嵌入缓存或纪要，后续应重新执行转写、分离和纪要。`transcribe`、`diarize`、普通 API 模式的 `summarize` 在同一会话重跑时会替换各自的输出，不需要 `--overwrite`；网页版导出和导入默认不覆盖。
+
+## 使用 AI 网页生成纪要
+
+完成转写和说话人分离后，也可不配置 LLM API Key，手动使用自己选择的 AI 网页：
+
+```powershell
+meetmin summarize -n weekly --export-web
+# 将生成的 minutes_web_prompt.txt 内容复制或上传到 AI 网页，
+# 把网页回复保存为 UTF-8 文本，例如 web-answer.md，然后导入：
+meetmin summarize -n weekly --import-web web-answer.md
+```
+
+导出文件包含完整转写、会议元信息和输出要求；它可能包含敏感会议内容，发送给第三方前请确认允许上传。工具不会自动打开网页、登录、上传或读取账号。导入文件为空或编码不是 UTF-8 时会报错，不改变已有纪要。导出和导入分别在目标文件已存在时拒绝覆盖；确需替换，可在相应命令末尾加 `--overwrite`。导入后保存为会话中的 `minutes.md`，并标记来源；需人工核对行动项、数字和遗漏。
+
+完整转写可能超过所选网页的输入或文件限制，上传成功也不保证全文被模型准确处理；需要时请手动分段、汇总并核对原文。各服务的免费额度和数据处理方式不同，请按所选服务的规则使用。
+
+也可在开始时选择 `meetmin run -n weekly --export-web`，转写和分离完成后直接导出提示词，不调用纪要 API；如使用云端转写，仍需按其要求配置服务。`run` 或普通 `summarize` 未检测到 LLM Key 时会提示网页版入口，但仍尝试已配置的接口（例如无需 Key 的本地服务）。接口调用失败时，已有转写会保留，命令会提示导出步骤；网页版操作需要用户手动完成。`mock` 只用于离线联调，不生成真实纪要。
 
 ## 录音反馈和预检
 
@@ -184,7 +201,8 @@ ECAPA 模型按需加载到用户目录 `~/.cache/meetmin/speechbrain`，使用 
 | `embeddings.npz` | 本地 ECAPA 窗口嵌入，提取完成后、聚类前原子写入；单说话人和云端自带分离不生成新嵌入，短音频也可能不生成 |
 | `transcript.json` | 分离/对齐后的句级时间戳、文本和说话人，不含词级数据 |
 | `transcript.md` | 供人工查看的转写文本 |
-| `minutes.md` | 基于 `transcript.json` 生成的纪要、token 用量及可选费用估算 |
+| `minutes_web_prompt.txt` | 可手动提交给 AI 网页的完整提示词和转写（仅执行导出时生成） |
+| `minutes.md` | 由 API 生成或由用户从 AI 网页导入的纪要；API 模式附用量及可选费用估算 |
 
 分离失败时，已完成的原始转写仍在，可直接重跑：
 
