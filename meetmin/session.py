@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 from pathlib import Path
 
 
@@ -76,6 +77,30 @@ class Session:
         p = self.root / name
         p.write_text(text, encoding="utf-8")
         return p
+
+    def save_text_safely(self, name: str, text: str, *, overwrite: bool = False) -> Path:
+        """先写临时文件，完成后发布；默认不替换已有文件。"""
+        self.ensure()
+        target = self.root / name
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.root, prefix=".meetmin-", delete=False
+            ) as f:
+                temporary = Path(f.name)
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            if overwrite:
+                os.replace(temporary, target)
+            else:
+                os.link(temporary, target)
+                temporary.unlink()
+            temporary = None
+            return target
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     # ---- JSON ----
     def save_json(self, name: str, obj) -> Path:

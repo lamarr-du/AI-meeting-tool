@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from .audio.dsp import audio_duration, to_mono_16k
 from .diarization.align import assign_speakers, relabel
 from .session import Session, new_session_id
 from .summarizer.llm_client import BaseLLM, Usage, get_llm
-from .summarizer.minutes import estimate_cost, generate_minutes
+from .summarizer.minutes import build_web_prompt, estimate_cost, generate_minutes
 from .textutil import ts
 
 
@@ -239,17 +240,49 @@ class Pipeline:
         return "\n".join(lines)
 
     # ---------------- (3) AI 纪要 ----------------
+    def export_web_prompt(self, session: Session, *, overwrite: bool = False) -> Path:
+        prompt = build_web_prompt(session.load_transcript(), config=self.cfg)
+        return session.save_text_safely("minutes_web_prompt.txt", prompt, overwrite=overwrite)
+
+    def import_web_minutes(
+        self, session: Session, source: str | Path, *, overwrite: bool = False
+    ) -> Path:
+        # Validate the session before accepting a result associated with it.
+        session.load_transcript()
+        text = Path(source).read_text(encoding="utf-8-sig").strip()
+        if not text:
+            raise ValueError("导入文件为空，未写入纪要。")
+        content = "> 由用户从 AI 网页导入；请对照转写核对行动项和数字。\n\n" + text + "\n"
+        return session.save_text_safely("minutes.md", content, overwrite=overwrite)
+
     def summarize(self, session: Session, *, llm: BaseLLM | None = None) -> tuple[Path, Usage]:
         transcript = session.load_transcript()
-        llm = llm or get_llm(self.cfg)
-        self.progress(f"[3/3] 生成纪要（LLM：{llm.name}/{self.cfg['llm'].get('model')}）…")
-        t0 = time.time()
-        md, usage = generate_minutes(
-            transcript,
-            llm,
-            config=self.cfg,
-            progress_cb=lambda m: self.progress(m, throttle_sec=1.0),
-        )
+        try:
+            lcfg = self.cfg.get("llm", {}) or {}
+            if (
+                llm is None
+                and lcfg.get("provider", "openai_compatible")
+                in ("openai_compatible", "openai", "dashscope", "qwen")
+                and not os.environ.get(lcfg.get("api_key_env", "LLM_API_KEY"))
+            ):
+                self.progress(
+                    "未检测到 LLM API Key；无鉴权的本地接口仍可使用。"
+                    f'如需使用 AI 网页：meetmin summarize -n "{session.session_id}" --export-web'
+                )
+            llm = llm or get_llm(self.cfg)
+            self.progress(f"[3/3] 生成纪要（LLM：{llm.name}/{self.cfg['llm'].get('model')}）…")
+            t0 = time.time()
+            md, usage = generate_minutes(
+                transcript,
+                llm,
+                config=self.cfg,
+                progress_cb=lambda m: self.progress(m, throttle_sec=1.0),
+            )
+        except Exception:
+            self.progress(
+                f'可导出提示词手动使用 AI 网页：meetmin summarize -n "{session.session_id}" --export-web'
+            )
+            raise
         scfg = self.cfg.get("summarizer", {})
         lines = [
             f"# {transcript['session_id']} 会议纪要",
@@ -267,6 +300,12 @@ class Pipeline:
         cost = estimate_cost(usage, scfg)
         if cost is not None:
             lines.append(f"估算成本：¥{cost:.4f}（按配置单价）")
+        if usage.finish_status == "truncated":
+            lines.append("完整性：不完整（至少一阶段输出被截断，请调整输出上限后重新生成）。")
+        elif usage.finish_status == "complete":
+            lines.append("完整性：接口未报告截断（内容仍需人工核对）。")
+        else:
+            lines.append("完整性：无法确认（接口未提供可识别的结束原因）。")
         path = session.save_text("minutes.md", "\n".join(lines))
         self.progress(f"  ✓ 纪要已写入：{path}")
         return path, usage

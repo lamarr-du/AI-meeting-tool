@@ -12,10 +12,50 @@ import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
 logger = logging.getLogger("meetmin")
+
+# Do not retry earlier than requested by the service; ask the user to retry later instead.
+MAX_RETRY_AFTER_SECONDS = 300
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse HTTP Retry-After delta-seconds or HTTP-date; invalid values use backoff."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdecimal():
+        # Avoid integer conversion limits and unnecessarily large sleeps.
+        digits = value.lstrip("0") or "0"
+        if len(digits) > 6:
+            return float(MAX_RETRY_AFTER_SECONDS + 1)
+        return float(int(digits))
+    try:
+        date = parsedate_to_datetime(value)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _http_error(response: requests.Response) -> RuntimeError:
+    status = response.status_code
+    if status in (401, 403):
+        hint = "鉴权失败，请检查 API Key、访问权限及接口地址"
+    elif status in (400, 404, 422):
+        hint = "请求无效，请检查模型名、接口地址和请求参数"
+    elif status == 429:
+        hint = "请求过于频繁或额度受限"
+    elif 500 <= status < 600:
+        hint = "服务端暂时出错"
+    else:
+        hint = "接口请求失败"
+    return RuntimeError(f"LLM 接口返回 HTTP {status}：{hint}。{response.text[:200]}")
 
 
 @dataclass
@@ -25,12 +65,20 @@ class Usage:
     completion_tokens: int = 0
     # 本地估算值（服务端未返回 usage 时使用）
     estimated: bool = False
+    # complete: 接口明确返回 stop；truncated: 至少一段最终输出被截断；unknown: 未知。
+    finish_status: str = "unknown"
 
     def add(self, other: "Usage") -> "Usage":
         self.calls += other.calls
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens
         self.estimated = self.estimated or other.estimated
+        if "truncated" in (self.finish_status, other.finish_status):
+            self.finish_status = "truncated"
+        elif "unknown" in (self.finish_status, other.finish_status):
+            self.finish_status = "unknown"
+        else:
+            self.finish_status = "complete"
         return self
 
     @property
@@ -85,6 +133,35 @@ class OpenAICompatibleLLM(BaseLLM):
             "stream": False,
         }
         payload.update(self.lcfg.get("extra_request") or {})
+        text, usage, reason = self._request(payload)
+        if reason == "length":
+            current_limit = int(payload["max_tokens"])
+            if current_limit <= 0:
+                raise RuntimeError("LLM 输出上限必须为正数，无法重试截断结果。")
+            payload = {**payload, "max_tokens": current_limit * 2}
+            logger.warning(
+                "LLM 输出因长度限制截断，将上限从 %d 提高到 %d 后重试一次。",
+                current_limit,
+                current_limit * 2,
+            )
+            text, retry_usage, reason = self._request(payload)
+            # The discarded first response still consumed tokens, but its truncation
+            # does not describe the replacement response.
+            usage.calls += retry_usage.calls
+            usage.prompt_tokens += retry_usage.prompt_tokens
+            usage.completion_tokens += retry_usage.completion_tokens
+            usage.estimated = usage.estimated or retry_usage.estimated
+            if reason == "length":
+                logger.warning("LLM 提高输出上限后仍被截断，结果将标记为不完整。")
+        if not text.strip():
+            raise RuntimeError("LLM 返回空结果，请检查模型和输出额度；未生成纪要。")
+        usage.finish_status = (
+            "complete" if reason == "stop" else "truncated" if reason == "length" else "unknown"
+        )
+        return text, usage
+
+    def _request(self, payload: dict) -> tuple[str, Usage, str | None]:
+        """一次模型调用，可按 F1 策略重试 HTTP 请求。"""
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -94,31 +171,60 @@ class OpenAICompatibleLLM(BaseLLM):
         retries = max(1, int(self.lcfg.get("retries", 3)))
         last_err: Exception | None = None
         for attempt in range(retries):
+            retry_after: float | None = None
             try:
                 r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-                if r.status_code == 429 or r.status_code >= 500:
-                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-                if r.status_code != 200:
-                    raise RuntimeError(f"LLM 接口返回 HTTP {r.status_code}: {r.text[:400]}")
-                j = r.json()
-                text = j["choices"][0]["message"]["content"] or ""
-                u = j.get("usage") or {}
-                cpl = int(u.get("completion_tokens", 0) or 0)
-                ppl = int(u.get("prompt_tokens", 0) or 0)
-                if not (ppl or cpl):  # 部分服务不返回 usage，按字符估算
-                    cpl = max(1, int(len(text) / 1.5))
-                    return text, Usage(
-                        calls=1, prompt_tokens=ppl, completion_tokens=cpl, estimated=True
-                    )
-                return text, Usage(calls=1, prompt_tokens=ppl, completion_tokens=cpl)
-            except Exception as e:
-                last_err = e
-                wait = min(30.0, 2.0**attempt)
-                logger.warning(
-                    "LLM 调用失败（%d/%d）：%s；%.0fs 后重试", attempt + 1, retries, e, wait
-                )
-                time.sleep(wait)
-        raise RuntimeError(f"LLM 调用连续失败：{last_err}")
+            except requests.exceptions.SSLError as error:
+                raise RuntimeError(f"LLM 连接证书错误，请检查证书配置：{error}") from error
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+                last_err = error
+            except requests.exceptions.RequestException as error:
+                raise RuntimeError(f"LLM 请求失败，请检查接口配置：{error}") from error
+            else:
+                if r.status_code == 429 or 500 <= r.status_code < 600:
+                    last_err = _http_error(r)
+                    if r.status_code == 429:
+                        retry_after = _retry_after_seconds(r.headers.get("Retry-After"))
+                elif r.status_code != 200:
+                    raise _http_error(r)
+                else:
+                    try:
+                        j = r.json()
+                        choice = j["choices"][0]
+                        text = choice["message"]["content"] or ""
+                        reason = choice.get("finish_reason")
+                        if not isinstance(text, str):
+                            raise TypeError("content 必须是字符串")
+                        u = j.get("usage") or {}
+                        cpl = int(u.get("completion_tokens", 0) or 0)
+                        ppl = int(u.get("prompt_tokens", 0) or 0)
+                    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as error:
+                        raise RuntimeError(
+                            "LLM 接口返回的数据格式无效，请检查接口和模型配置。"
+                        ) from error
+                    if not (ppl or cpl):  # 部分服务不返回 usage，按字符估算
+                        cpl = max(1, int(len(text) / 1.5))
+                        return (
+                            text,
+                            Usage(
+                                calls=1, prompt_tokens=ppl, completion_tokens=cpl, estimated=True
+                            ),
+                            reason,
+                        )
+                    return text, Usage(calls=1, prompt_tokens=ppl, completion_tokens=cpl), reason
+            if attempt + 1 == retries:
+                break
+            if retry_after is not None and retry_after > MAX_RETRY_AFTER_SECONDS:
+                raise RuntimeError(
+                    f"{last_err} 服务要求等待的时间超过自动重试上限 "
+                    f"{MAX_RETRY_AFTER_SECONDS} 秒，请稍后重试。"
+                ) from last_err
+            wait = retry_after if retry_after is not None else min(30.0, 2.0**attempt)
+            logger.warning(
+                "LLM 调用失败（%d/%d）：%s；%.1f 秒后重试", attempt + 1, retries, last_err, wait
+            )
+            time.sleep(wait)
+        raise RuntimeError(f"LLM 调用连续失败（共 {retries} 次）：{last_err}") from last_err
 
 
 class MockLLM(BaseLLM):

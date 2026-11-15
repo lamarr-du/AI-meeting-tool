@@ -312,6 +312,15 @@ def cmd_diarize(args, cfg) -> None:
     print(f"\n下一步：meetmin summarize --session {session.session_id}")
 
 
+def _export_web_prompt(pipe, session, *, overwrite=False) -> Path:
+    path = pipe.export_web_prompt(session, overwrite=overwrite)
+    print(f"已导出完整提示词和转写：{path}（{path.stat().st_size} 字节）")
+    print("文件包含会议内容；请确认允许发送给所选 AI 服务，再手动复制或上传。")
+    print("若网页无法处理全文，请手动分段并核对遗漏；导入时请保存网页回复为 UTF-8 文本。")
+    print(f'导入：meetmin summarize -n "{session.session_id}" --import-web <回复文件>')
+    return path
+
+
 def cmd_summarize(args, cfg) -> None:
     pipe = Pipeline(cfg)
     session = (
@@ -322,7 +331,20 @@ def cmd_summarize(args, cfg) -> None:
     if session is None or not (session.root / "transcript.json").exists():
         print("没有可用的转写结果，请先 transcribe。")
         sys.exit(1)
-    path, _ = pipe.summarize(session)
+    try:
+        if args.export_web:
+            _export_web_prompt(pipe, session, overwrite=args.overwrite)
+            return
+        if args.import_web:
+            path = pipe.import_web_minutes(session, args.import_web, overwrite=args.overwrite)
+        else:
+            if args.overwrite:
+                sys.exit("--overwrite 仅用于 --export-web 或 --import-web")
+            path, _ = pipe.summarize(session)
+    except FileExistsError:
+        sys.exit("目标文件已存在；确认需要替换时，请添加 --overwrite。")
+    except (OSError, UnicodeError, ValueError, RuntimeError) as error:
+        sys.exit(f"纪要处理失败：{error}")
     print(f"\n完成：{path}")
 
 
@@ -349,6 +371,17 @@ def cmd_run(args, cfg) -> None:
         _do_record(pipe, session, args)
     pipe.transcribe(session, audio_path=args.audio, file_url=args.file_url)
     pipe.diarize(session)
+    if getattr(args, "export_web", False):
+        try:
+            _export_web_prompt(pipe, session)
+        except FileExistsError:
+            sys.exit(
+                f'提示词已存在；需要替换时可执行 meetmin summarize -n "{session.session_id}" '
+                "--export-web --overwrite"
+            )
+        except (OSError, UnicodeError, ValueError, RuntimeError) as error:
+            sys.exit(f"导出网页版提示词失败：{error}")
+        return
     pipe.summarize(session)
     print(f"\n全部完成，产物在：{session.root}")
 
@@ -407,6 +440,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("summarize", help="步骤3：生成 AI 纪要")
     sp.add_argument("--session", "-n", default=None, help="缺省用最近一次会话")
+    web = sp.add_mutually_exclusive_group()
+    web.add_argument("--export-web", action="store_true", help="导出供 AI 网页使用的完整提示词")
+    web.add_argument("--import-web", metavar="文件", help="导入从 AI 网页保存的 UTF-8 纪要")
+    sp.add_argument("--overwrite", action="store_true", help="允许覆盖已有的网页版提示词或纪要")
     sp.set_defaults(fn=cmd_summarize)
 
     sp = sub.add_parser("run", help="一条龙：record(或 --audio)→transcribe→diarize→summarize")
@@ -416,6 +453,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--device", type=int, default=None)
     sp.add_argument("--max-seconds", type=float, default=None)
     sp.add_argument("--overwrite", action="store_true", help="覆盖 -n 指定的完整现有会话 ID 的录音")
+    sp.add_argument(
+        "--export-web", action="store_true", help="转写后导出网页版提示词，不调用纪要 API"
+    )
     sp.set_defaults(fn=cmd_run)
     return p
 
