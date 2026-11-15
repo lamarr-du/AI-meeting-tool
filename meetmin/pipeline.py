@@ -6,6 +6,7 @@ import datetime as dt
 import os
 import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, overload
 
@@ -82,7 +83,12 @@ class Pipeline:
 
     # ---------------- (2) 转写 + 说话人分离 ----------------
     def transcribe(
-        self, session: Session, *, audio_path: str | Path | None = None, file_url: str | None = None
+        self,
+        session: Session,
+        *,
+        audio_path: str | Path | None = None,
+        file_url: str | None = None,
+        on_asr_ready: Callable[[], None] | None = None,
     ) -> dict:
         audio, microphone = (Path(audio_path), None) if audio_path else session.recording_paths()
         if microphone is not None and self.cfg.get("asr", {}).get("provider") == "dashscope":
@@ -135,6 +141,8 @@ class Pipeline:
 
         provider_name = provider.name
         try:
+            if on_asr_ready is not None:
+                on_asr_ready()
             result, duration = transcribe_track(audio, file_url)
             utterances = [u for u in result.utterances if u.text.strip()]
             self.progress(
@@ -457,7 +465,7 @@ class Pipeline:
             lines.append("完整性：接口未报告截断（内容仍需人工核对）。")
         else:
             lines.append("完整性：无法确认（接口未提供可识别的结束原因）。")
-        path = session.save_text("minutes.md", "\n".join(lines))
+        path = session.save_text_safely("minutes.md", "\n".join(lines), overwrite=True)
         self.progress(f"  ✓ 纪要已写入：{path}")
         return path, usage
 

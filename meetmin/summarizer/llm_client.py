@@ -103,13 +103,17 @@ class BaseLLM(ABC):
 class OpenAICompatibleLLM(BaseLLM):
     name = "openai_compatible"
 
-    def __init__(self, lcfg: dict):
+    def __init__(self, lcfg: dict, *, api_key: str | None = None):
         self.lcfg = lcfg
         self.base_url = str(lcfg.get("base_url", "")).rstrip("/")
         if not self.base_url:
             raise RuntimeError("llm.base_url 未配置")
         self.model = lcfg.get("model", "")
-        self.api_key = os.environ.get(lcfg.get("api_key_env", "LLM_API_KEY"), "")
+        self.api_key = (
+            os.environ.get(lcfg.get("api_key_env", "LLM_API_KEY"), "")
+            if api_key is None
+            else api_key
+        )
         if not self.api_key:
             logger.warning(
                 "环境变量 %s 未设置，若接口需要鉴权请在生成纪要前配置。",
@@ -252,11 +256,11 @@ class MockLLM(BaseLLM):
         return text, Usage(calls=1, prompt_tokens=ppl, completion_tokens=cpl, estimated=True)
 
 
-def get_llm(cfg: dict) -> BaseLLM:
+def get_llm(cfg: dict, *, api_key: str | None = None) -> BaseLLM:
     lcfg = cfg.get("llm", {}) or {}
     provider = str(lcfg.get("provider", "openai_compatible")).lower()
     if provider in ("mock", "none", "offline", ""):
         return MockLLM(lcfg)
     if provider in ("openai_compatible", "openai", "dashscope", "qwen"):
-        return OpenAICompatibleLLM(lcfg)
+        return OpenAICompatibleLLM(lcfg, api_key=api_key)
     raise ValueError(f"未知 LLM provider: {provider}（可选 openai_compatible | mock）")

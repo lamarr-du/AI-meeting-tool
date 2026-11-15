@@ -25,6 +25,7 @@ def gpu_status():
             text=True,
             timeout=5,
             check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         name, free_text, total_text = [
             x.strip() for x in result.stdout.splitlines()[0].split(",")[:3]

@@ -13,7 +13,11 @@ dynamic = ["dependencies"]
 [project.scripts]
 meetmin = "meetmin.cli:main"
 
+[project.gui-scripts]
+meetmin-gui = "meetmin.gui:main"
+
 [project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.8,<7"]
 diar = ["speechbrain>=1.0.2", "scikit-learn>=1.3"]
 dev = [
     "build>=1.2,<2",
