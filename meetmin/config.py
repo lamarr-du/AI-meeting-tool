@@ -28,6 +28,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "compute_type": "int8",  # int8 最省资源；有 GPU 可用 float16
         "beam_size": 1,  # 1=贪心解码，速度优先
         "condition_on_previous_text": False,  # 关闭前文条件，减少重复和幻觉
+        "no_repeat_ngram_size": 0,
+        "repetition_penalty": 1.0,
+        "hallucination_silence_threshold": None,
+        "quality": {},  # 默认值由本地 Whisper 的 QualityOptions 提供
         "punctuation_prompt": None,
         "hotwords": None,
         "word_timestamps": True,  # 词级时间戳（供说话人分离对齐，建议保留）

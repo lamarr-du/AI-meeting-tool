@@ -6,12 +6,67 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+import time
+from dataclasses import asdict
 from typing import Any
 
 import numpy as np
 
+from ..audio.dsp import TARGET_SR
 from .base import ASRProvider, ASRResult, Utterance
+from .quality import Decoded, QualityOptions, Span, review
+
+_VAD_PARAMETERS = {"min_silence_duration_ms": 400}
+
+
+def _speech_spans(audio: np.ndarray) -> list[Span]:
+    from faster_whisper.vad import get_speech_timestamps
+
+    # 不把 Silero 的边缘补齐样本计成有声缺口。
+    chunks = get_speech_timestamps(audio, **_VAD_PARAMETERS, speech_pad_ms=0)
+    return [(chunk["start"] / TARGET_SR, chunk["end"] / TARGET_SR) for chunk in chunks]
+
+
+def _decoded(segment: Any, offset: float = 0.0) -> Decoded:
+    words = [
+        {"w": w.word, "s": round(float(w.start) + offset, 3), "e": round(float(w.end) + offset, 3)}
+        for w in (segment.words or [])
+    ]
+    return Decoded(
+        Utterance(
+            start=float(segment.start) + offset,
+            end=float(segment.end) + offset,
+            text=segment.text.strip(),
+            words=words or None,
+        ),
+        compression_ratio=float(getattr(segment, "compression_ratio", 0.0)),
+        avg_logprob=float(getattr(segment, "avg_logprob", 0.0)),
+        no_speech_prob=float(getattr(segment, "no_speech_prob", 0.0)),
+    )
+
+
+def _decode_guards(config: dict, word_timestamps: bool) -> dict[str, Any]:
+    ngram = config.get("no_repeat_ngram_size", 0)
+    if type(ngram) is not int or ngram < 0:
+        raise ValueError("asr.no_repeat_ngram_size 必须是非负整数")
+    guards: dict[str, Any] = {"no_repeat_ngram_size": ngram}
+    for key, default in (("repetition_penalty", 1.0), ("hallucination_silence_threshold", None)):
+        value = config.get(key, default)
+        if value is None and default is None:
+            guards[key] = None
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not (math.isfinite(value) and value > 0)
+        ):
+            raise ValueError(f"asr.{key} 必须是有限的正数")
+        guards[key] = value
+    if guards["hallucination_silence_threshold"] is not None and not word_timestamps:
+        raise ValueError("asr.hallucination_silence_threshold 需要 asr.word_timestamps: true")
+    return guards
 
 
 def _configure_huggingface_download(acfg: dict) -> None:
@@ -116,44 +171,74 @@ class FasterWhisperASR(ASRProvider):
         effective_hotwords = (
             " ".join(prompt.strip() for prompt in prompts if prompt and prompt.strip()) or None
         )
-        segments, info = self.model.transcribe(
-            audio,
-            language=language,
-            beam_size=int(self.acfg.get("beam_size", 1)),
-            word_timestamps=bool(self.acfg.get("word_timestamps", True)),
-            condition_on_previous_text=condition_on_previous_text,
-            hotwords=effective_hotwords,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 400},
-        )
-        utterances: list[Utterance] = []
-        total = float(getattr(info, "duration", 0.0) or (len(audio) / 16000.0))
+        words_enabled = bool(self.acfg.get("word_timestamps", True))
+        decode_guards = _decode_guards(self.acfg, words_enabled)
+        quality_options = QualityOptions.from_config(self.acfg.get("quality", {}))
+        options: dict[str, Any] = {
+            "language": language,
+            "beam_size": int(self.acfg.get("beam_size", 1)),
+            "word_timestamps": words_enabled,
+            "condition_on_previous_text": condition_on_previous_text,
+            "hotwords": effective_hotwords,
+            "vad_filter": True,
+            "vad_parameters": _VAD_PARAMETERS,
+            **decode_guards,
+        }
+        segments, info = self.model.transcribe(audio, **options)
+        detected_language = getattr(info, "language", None)
+        decoded = []
+        duration = len(audio) / TARGET_SR
+        total = float(getattr(info, "duration", 0.0) or duration)
         for seg in segments:
-            words = [
-                {"w": w.word, "s": round(float(w.start), 3), "e": round(float(w.end), 3)}
-                for w in (seg.words or [])
-            ]
-            utterances.append(
-                Utterance(
-                    start=float(seg.start),
-                    end=float(seg.end),
-                    text=seg.text.strip(),
-                    words=words or None,
-                )
-            )
+            decoded.append(_decoded(seg))
             if progress_cb:
                 progress_cb(float(seg.end), total)
+
+        retry_options = {
+            **options,
+            "language": detected_language or language,
+            "beam_size": max(options["beam_size"], 3),
+            "condition_on_previous_text": False,
+            "no_repeat_ngram_size": max(decode_guards["no_repeat_ngram_size"], 4),
+            "temperature": 0.0,
+        }
+
+        def retry(start: float, end: float) -> list[Decoded]:
+            first, last = round(start * TARGET_SR), round(end * TARGET_SR)
+            clips, _ = self.model.transcribe(audio[first:last], **retry_options)
+            return [_decoded(seg, first / TARGET_SR) for seg in clips if seg.text.strip()]
+
+        review_started = time.monotonic()
+        utterances, quality_report = review(
+            decoded, duration, quality_options, lambda: _speech_spans(audio), retry
+        )
+        if quality_options.mode != "off":
+            quality_report["elapsed_sec"] = round(time.monotonic() - review_started, 3)
+        if quality_options.mode == "retry":
+            quality_report["retry_parameters"] = {
+                key: retry_options[key]
+                for key in (
+                    "language",
+                    "beam_size",
+                    "condition_on_previous_text",
+                    "no_repeat_ngram_size",
+                    "temperature",
+                )
+            }
         return ASRResult(
             utterances=utterances,
-            language=getattr(info, "language", None),
+            language=detected_language,
             audio_16k=audio,
             extra={
                 "asr_model": self.acfg.get("model_size", "small"),
                 "effective_device": self._device,
                 "effective_compute_type": self._compute,
+                "quality": quality_report,
                 "parameters": {
                     "condition_on_previous_text": condition_on_previous_text,
                     "hotwords": effective_hotwords,
+                    **decode_guards,
+                    "quality": asdict(quality_options),
                 },
             },
         )

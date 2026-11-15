@@ -112,6 +112,14 @@ class Pipeline:
                 file_url=url,
                 progress_cb=on_seg if local_like else None,
             )
+            if local_like and (quality := result.extra.get("quality")):
+                if issues := quality.get("issues"):
+                    self.progress(
+                        f"  转写体检标记 {len(issues)} 处，局部重试 {quality['attempted']} 次，"
+                        f"采纳 {quality['accepted']} 处。"
+                    )
+                if error := quality.get("vad_error"):
+                    self.progress(f"  ! 有声缺口检查失败：{error}")
             if result.audio_16k is not None:
                 samples, result.audio_16k = result.audio_16k, None
             if samples is not None and len(samples):

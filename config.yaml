@@ -20,6 +20,14 @@ asr:
   compute_type: int8
   beam_size: 1
   condition_on_previous_text: false  # 关闭前文条件；设为 true 恢复以前的行为
+  no_repeat_ngram_size: 0    # 全局禁重复 token n-gram，0 关闭
+  repetition_penalty: 1.0   # 全局重复惩罚，1.0 为无惩罚
+  hallucination_silence_threshold: null  # 秒，启用时需要 word_timestamps
+  quality:
+    mode: detect             # "off" 关闭 | detect 仅记录疑点 | retry 有限局部重试
+    min_speech_gap_sec: 1.5
+    compression_ratio_threshold: 2.4
+    max_retries: 6           # 每条音轨的局部重试次数上限
   punctuation_prompt: null   # language 为 zh 时可选填，例如 "好的，我们继续。"
   hotwords: null             # 可填少量已确认的术语，和标点提示合并传给 faster-whisper
   word_timestamps: true      # 说话人分离对齐需要

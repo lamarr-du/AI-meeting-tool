@@ -242,6 +242,10 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 
 如需让模型直接输出更多标点，可在 `asr.language: zh` 时设置 `asr.punctuation_prompt: "好的，我们继续。"`，也可用 `asr.hotwords` 填写少量确认过的术语。两项内容会合并传给 Whisper 的 `hotwords`，实际使用值记录在 `asr_raw.json`。标点提示可能影响识别与词级时间戳，默认关闭。
 
+本地 Whisper 默认体检相邻重复句、异常压缩比和 VAD 检出的连续有声缺口。体检只记录疑点，结果在 `asr_raw.json` 的 `asr.quality` 中，双轨的麦克风报告在 `microphone.asr.quality`。可以按其中的起止时间回听。
+
+设 `asr.quality.mode: retry` 可重跑疑点音频，单片最多 20 秒，每轨默认最多 6 次。只有在置信度、时间边界和邻近重复等检查通过后才更新转写。每次重试都会记录结果，替换已有片段时同时保留原文与词级时间戳。设 `mode: "off"` 可关闭体检。
+
 ## 配置要点
 
 | 配置 | 当前默认值与作用 |
@@ -255,6 +259,8 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `asr.device` / `compute_type` | `auto` / `int8`，选择和回退行为见上文 |
 | `asr.beam_size` / `word_timestamps` | `1` / `true` |
 | `asr.condition_on_previous_text` | `false`；关闭前文条件以减少重复和幻觉，设为 `true` 可恢复原行为，实际值记录在 `asr_raw.json` |
+| `asr.quality` | 默认 `mode: detect`，连续有声缺口至少 1.5 秒，压缩比阈值 2.4，重试模式每轨最多 6 次 |
+| `asr.no_repeat_ngram_size` / `asr.repetition_penalty` / `asr.hallucination_silence_threshold` | `0` / `1.0` / `null`。均为可选的全局解码限制，静音阈值单位为秒且需要词级时间戳 |
 | `asr.punctuation_prompt` / `asr.hotwords` | 均为 `null`，可填带标点的中文示例和术语文本 |
 | `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
 | `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
