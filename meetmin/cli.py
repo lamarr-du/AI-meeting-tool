@@ -26,6 +26,7 @@ from meetmin.audio.session_recorder import recover_recording
 from meetmin.config import load_config
 from meetmin.pipeline import Pipeline
 from meetmin.session import Session, clean_session_name
+from meetmin.speakers import speaker_preview
 from meetmin.textutil import ts
 
 
@@ -356,9 +357,24 @@ def cmd_diarize(args, cfg) -> None:
         sys.exit("未找到会话，请用 --session 指定已完成转写的会话。")
     try:
         Pipeline(cfg).diarize(session)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         sys.exit(f"转写整理失败：{error}")
     print(f"\n下一步：meetmin summarize --session {session.session_id}")
+
+
+def cmd_speakers(args, cfg) -> None:
+    session = _find_session(cfg["output_dir"], args.session)
+    if session is None:
+        sys.exit("未找到会话，请提供已完成说话人分离的会话 ID 或名称。")
+    try:
+        if args.speaker_cmd == "list":
+            for line in speaker_preview(session.load_transcript()):
+                print(line)
+            return
+        Pipeline(cfg).rename_speakers(session, args.assignments)
+    except (OSError, ValueError, RuntimeError) as error:
+        sys.exit(f"说话人处理失败：{error}")
+    print(f"已更新说话人姓名。重新生成纪要：meetmin summarize -n {session.session_id}")
 
 
 def _export_web_prompt(pipe, session, *, overwrite=False) -> Path:
@@ -500,6 +516,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("diarize", help="步骤2b：从 asr_raw.json 重跑分离/对齐")
     sp.add_argument("--session", "-n", required=True)
     sp.set_defaults(fn=cmd_diarize)
+
+    sp = sub.add_parser("speakers", help="查看发言样本或修改说话人姓名")
+    speaker_sub = sp.add_subparsers(dest="speaker_cmd", required=True)
+    listing = speaker_sub.add_parser("list", help="列出说话人，每人显示最多三条发言")
+    listing.add_argument("session", help="会话 ID 或名称前缀")
+    listing.set_defaults(fn=cmd_speakers)
+    rename = speaker_sub.add_parser("rename", help="批量修改说话人姓名")
+    rename.add_argument("session", help="会话 ID 或名称前缀")
+    rename.add_argument("assignments", nargs="+", metavar="标签=姓名", help="例如 A=张三 B=李四")
+    rename.set_defaults(fn=cmd_speakers)
 
     sp = sub.add_parser("summarize", help="步骤3：生成 AI 纪要")
     sp.add_argument("--session", "-n", default=None, help="缺省用最近一次会话")

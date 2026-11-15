@@ -16,8 +16,10 @@ from typing import Any, BinaryIO
 
 
 class SessionLock:
-    def __init__(self, root: Path):
-        self.file = (root / ".audio.lock").open("a+b")
+    def __init__(
+        self, root: Path, *, name: str = ".audio.lock", busy_message: str = "此会话正在录音或恢复"
+    ):
+        self.file = (root / name).open("a+b")
         try:
             self.file.seek(0, 2)
             if not self.file.tell():
@@ -33,7 +35,7 @@ class SessionLock:
                 fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             self.file.close()
-            raise RuntimeError("此会话正在录音或恢复") from exc
+            raise RuntimeError(busy_message) from exc
 
     def close(self):
         if self.file.closed:

@@ -93,6 +93,7 @@ meetmin run --audio "recordings/meeting.m4a" -n review
 | `recover` | 从录音分段恢复；`-n` 必须是完整会话 ID，可用 `--take` 选择某次录音，`--output` 指定新文件（单轨）或新目录（双轨） |
 | `transcribe` | 保存原始转写；`-n` 会话 ID/前缀、`--audio` 本地音频、`--file-url` 云端音频 URL |
 | `diarize` | 从 `asr_raw.json` 重跑分离/对齐；必须提供 `-n` 会话 ID/前缀 |
+| `speakers` | 用 `list <会话>` 核对发言样本，或用 `rename <会话> A=姓名 B=姓名` 批量改名 |
 | `summarize` | 从 `transcript.json` 生成纪要；`--export-web` 导出网页版提示词，`--import-web` 导入网页版结果 |
 | `run` | 自动完成全部流程；支持 `record` 的录音选项，也可用 `--audio` 处理已有音频 |
 
@@ -259,6 +260,16 @@ asr:
 本地 Whisper 默认体检相邻重复句、异常压缩比和 VAD 检出的连续有声缺口。体检只记录疑点，结果在 `asr_raw.json` 的 `asr.quality` 中，双轨的麦克风报告在 `microphone.asr.quality`。可以按其中的起止时间回听。
 
 设 `asr.quality.mode: retry` 可重跑疑点音频，单片最多 20 秒，每轨默认最多 6 次。只有在置信度、时间边界和邻近重复等检查通过后才更新转写。每次重试都会记录结果，替换已有片段时同时保留原文与词级时间戳。设 `mode: "off"` 可关闭体检。
+
+### 核对并修改说话人姓名
+
+```powershell
+meetmin speakers list weekly
+meetmin speakers rename weekly A=张三 B=李四
+meetmin summarize -n weekly
+```
+
+查看和改名前均会显示每人的最多三条最长发言及起始时间。改名会同步更新转写 JSON 和 Markdown，启用术语纠错时也会刷新纠错副本。连续改名可继续使用原标签如 `A`。重跑 `diarize` 会重新生成说话人标签，需根据新的发言样本核对姓名。
 
 ## 配置要点
 

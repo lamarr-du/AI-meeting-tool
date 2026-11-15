@@ -13,10 +13,12 @@ from .asr.base import ASRResult, Utterance
 from .asr.punctuation import punctuate_chinese
 from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
+from .audio.segments import SessionLock
 from .audio.session_recorder import SessionRecorder
 from .diarization.align import UNKNOWN_NAME, assign_speakers, relabel
 from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
+from .speakers import rename_speakers, speaker_preview
 from .summarizer.llm_client import BaseLLM, Usage, get_llm
 from .summarizer.minutes import build_web_prompt, estimate_cost, generate_minutes
 from .textutil import ts
@@ -263,11 +265,32 @@ class Pipeline:
         transcript["utterances"] = [u.to_dict() for u in utterances]
         for u in transcript["utterances"]:
             u.pop("words", None)
-        session.save_json("transcript.json", transcript)
-        session.save_text("transcript.md", self._render_md(transcript))
-        self._correct_glossary(session, transcript)
+        with self._transcript_lock(session):
+            self._save_transcript(session, transcript)
+            self._correct_glossary(session, transcript)
         self.progress(f"  ✓ 分离结果已保存：{session.root}")
         return transcript
+
+    def _save_transcript(self, session: Session, transcript: dict) -> None:
+        session.save_transcript(transcript)
+        session.save_text_safely("transcript.md", self._render_md(transcript), overwrite=True)
+
+    @staticmethod
+    def _transcript_lock(session: Session) -> SessionLock:
+        return SessionLock(
+            session.root, name=".transcript.lock", busy_message="此会话的转写正在由另一个命令更新"
+        )
+
+    def rename_speakers(self, session: Session, assignments: list[str]) -> None:
+        with self._transcript_lock(session):
+            original = session.load_transcript()
+            updated = rename_speakers(original, assignments)
+            corrected = self._glossary_correction(updated)
+            for line in speaker_preview(original):
+                self.progress(line)
+            self._save_transcript(session, updated)
+            if corrected is not updated:
+                self._save_corrected_transcript(session, corrected)
 
     def _diarize(
         self, result: ASRResult, utterances: list[Utterance], audio16k, *, session: Session
@@ -339,7 +362,7 @@ class Pipeline:
             lines.append("")
         return "\n".join(lines)
 
-    def _correct_glossary(self, session: Session, transcript: dict) -> dict:
+    def _glossary_correction(self, transcript: dict) -> dict:
         glossary = (self.cfg.get("asr") or {}).get("glossary") or {}
         if not isinstance(glossary, dict):
             raise ValueError("asr.glossary 必须是映射")
@@ -348,16 +371,27 @@ class Pipeline:
             return transcript
         if not isinstance(path, str) or not path.strip():
             raise ValueError("asr.glossary.correction_path 必须是非空路径或 null")
-        corrected = correct_transcript(transcript, Path(path).expanduser())
+        return correct_transcript(transcript, Path(path).expanduser())
+
+    def _save_corrected_transcript(self, session: Session, corrected: dict) -> None:
         session.save_json("transcript_corrected.json", corrected)
         session.save_text_safely(
             "transcript_corrected.md", self._render_md(corrected), overwrite=True
         )
+
+    def _correct_glossary(self, session: Session, transcript: dict) -> dict:
+        corrected = self._glossary_correction(transcript)
+        if corrected is not transcript:
+            self._save_corrected_transcript(session, corrected)
         return corrected
+
+    def _load_minutes_transcript(self, session: Session) -> dict:
+        with self._transcript_lock(session):
+            return self._correct_glossary(session, session.load_transcript())
 
     # ---------------- (3) AI 纪要 ----------------
     def export_web_prompt(self, session: Session, *, overwrite: bool = False) -> Path:
-        transcript = self._correct_glossary(session, session.load_transcript())
+        transcript = self._load_minutes_transcript(session)
         prompt = build_web_prompt(transcript, config=self.cfg)
         return session.save_text_safely("minutes_web_prompt.txt", prompt, overwrite=overwrite)
 
@@ -373,7 +407,7 @@ class Pipeline:
         return session.save_text_safely("minutes.md", content, overwrite=overwrite)
 
     def summarize(self, session: Session, *, llm: BaseLLM | None = None) -> tuple[Path, Usage]:
-        transcript = self._correct_glossary(session, session.load_transcript())
+        transcript = self._load_minutes_transcript(session)
         try:
             lcfg = self.cfg.get("llm", {}) or {}
             if (
