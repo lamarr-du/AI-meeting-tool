@@ -289,6 +289,18 @@ meetmin run --audio "recordings/meeting.wav" --file-url "https://example.com/mee
 
 ## 开发、检查与 CI
 
+### 用人工标注评估转写
+
+标注文件用 UTF-8 文本，每段依次写说话人、起始时间 `HH:MM:SS` 和正文。正文可跨多行。评分读取已有 JSON，可用 `asr_raw.json` 看识别效果，或用 `transcript.json` 同时核对说话人。
+
+```powershell
+python scripts/evaluate_transcript.py data/sessions/example/label.txt data/d6/sessions/small-cpu/asr_raw.json --term demosaic --term "DRC Stat"
+```
+
+字符错误率按忽略标点、空白和大小写后的编辑距离计算。术语召回按人工标注中的出现次数计分。说话人归属评分使用 SciPy（随 `diar` 额外依赖安装），按时间重合为预测标签匹配参考标签；标注段落的终点取下一段起点，最后一段取录音结束。归属错误率只统计转写覆盖到的时间，同时报告覆盖秒数以便核对漏转。
+
+### 本地检查
+
 开发环境从仓库根目录安装：
 
 ```bash

@@ -154,7 +154,7 @@ class EcapaSpeechbrainDiarizer(Diarizer):
         self._load_encoder()
         torch = self._torch
         with torch.no_grad():
-            w = torch.from_numpy(windows).unsqueeze(1)  # [B, 1, T]
+            w = torch.from_numpy(windows)  # [B, T]，单声道批次
             emb = self.encoder.encode_batch(w)  # [B, 1, D]
         E = emb.squeeze(1).cpu().numpy().astype(np.float32)
         norms = np.linalg.norm(E, axis=1, keepdims=True)
