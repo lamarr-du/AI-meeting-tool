@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from meetmin.audio.loopback_recorder import list_loopback_devices
+from meetmin.audio.loopback_recorder import RecordingError, list_loopback_devices
 from meetmin.config import load_config
 from meetmin.pipeline import Pipeline
 from meetmin.session import Session, clean_session_name
@@ -106,6 +106,11 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
         rec.start(session.audio_path, overwrite=args.overwrite)
     except Exception as e:
         print(f"录音启动失败：{e}")
+        if isinstance(e, RecordingError):
+            if e.info.get("cleanup_pending"):
+                print("启动失败后的资源清理尚未完成，文件可能仍在使用。")
+            for cleanup_error in e.info.get("cleanup_errors", []):
+                print(f"收尾错误：{cleanup_error}")
         sys.exit(2)
     print(f"开始内录 → {session.audio_path}")
     print("（会议进行中… 按 Ctrl+C 结束录音）")
@@ -119,11 +124,15 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
     t0 = time.monotonic()
     warned = False
     no_data_warned = False
+    timing_warned = False
     interactive = sys.stdout.isatty()
     try:
         while not stop["flag"]:
             time.sleep(1)
             status = rec.status()
+            if status.get("timing_mode") == "arrival" and not timing_warned:
+                print("\n! 设备未提供有效采集时间戳，使用回调到达时间估算，时间轴精度可能降低。")
+                timing_warned = True
             elapsed = time.monotonic() - t0
             level = status["level"]
             # 以平方根扩展低电平，便于观察；不是校准过的声压计。
@@ -146,12 +155,12 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
             if no_data_sec >= 10 and not no_data_warned:
                 print(
                     "\n!!! 连续 10 秒未收到音频数据：输出静音时可能正常；"
-                    "若正在播放会议声音，请检查输出设备和录音状态，录音时长可能不足。",
+                    "若正在播放会议声音，请检查输出设备和录音状态；时间缺口将在恢复或停止时补零。",
                     flush=True,
                 )
                 no_data_warned = True
             elif no_data_sec < 10 and no_data_warned:
-                print("\n已恢复接收音频数据，请核对录音时长。", flush=True)
+                print("\n已恢复接收音频数据，正在按采集时间补齐时间轴。", flush=True)
                 no_data_warned = False
             if status["failed"]:
                 print("\n录音线程发生错误，正在停止。")
@@ -160,13 +169,33 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
                 print("\n达到 --max-seconds，自动停止。")
                 break
     finally:
-        signal.signal(signal.SIGINT, old)
-        info = rec.stop()
+        # Keep our flag-only SIGINT handler during cleanup; a second Ctrl+C must not
+        # interrupt WAV finalization or close a file still owned by the writer.
+        try:
+            try:
+                info = rec.stop()
+            except RecordingError as error:
+                info = error.info
+                print(f"\n录音失败：{error}")
+                print(f"文件：{info.get('path')}；已写时长 {ts(info.get('duration_sec', 0))}")
+                if info.get("cleanup_pending"):
+                    print("资源尚未清理完毕，文件可能仍在写入；不能启动下一次录音。")
+                elif not info.get("finalized"):
+                    print("WAV 文件收尾失败，文件可能不完整。")
+                for cleanup_error in info.get("cleanup_errors", []):
+                    print(f"收尾错误：{cleanup_error}")
+                sys.exit(2)
+        finally:
+            signal.signal(signal.SIGINT, old)
     info["elapsed"] = round(time.monotonic() - t0, 1)
     print(
         f"\n录音结束：时长 {ts(info.get('duration_sec', 0))}，设备 [{info.get('device')}]"
         f"，{info.get('sample_rate')}Hz/{info.get('channels')}ch"
     )
+    if info.get("timing_mode") == "arrival" and not timing_warned:
+        print("! 设备未提供有效采集时间戳，已使用回调到达时间估算，时间轴精度可能降低。")
+    if info.get("padded_sec", 0):
+        print(f"时间轴补零：{info['padded_sec']:.2f} 秒（无数据区间，不代表已确认的静音）。")
     if info.get("duration_sec", 0) < 1:
         print("! 录到的内容极短，请确认选对了 loopback 设备（会议声音是否在默认输出播放）。")
     if info.get("duration_sec", 0) > 0:
