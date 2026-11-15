@@ -15,6 +15,7 @@ from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
 from .audio.session_recorder import SessionRecorder
 from .diarization.align import assign_speakers, relabel
+from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
 from .summarizer.llm_client import BaseLLM, Usage, get_llm
 from .summarizer.minutes import build_web_prompt, estimate_cost, generate_minutes
@@ -260,6 +261,7 @@ class Pipeline:
             u.pop("words", None)
         session.save_json("transcript.json", transcript)
         session.save_text("transcript.md", self._render_md(transcript))
+        self._correct_glossary(session, transcript)
         self.progress(f"  ✓ 分离结果已保存：{session.root}")
         return transcript
 
@@ -312,6 +314,14 @@ class Pipeline:
             "",
         ]
         status = transcript.get("diarization_status") or {}
+        if correction := transcript.get("glossary_correction"):
+            lines.extend(
+                [
+                    f"> 术语纠错 {len(correction['changes'])} 处，待核对 {len(correction['context_review'])} 处。"
+                    " 原文数据见 `transcript.json`，替换记录见 `transcript_corrected.json`。",
+                    "",
+                ]
+            )
         if microphone := transcript.get("microphone"):
             lines.insert(3, f"- 麦克风：`{microphone['audio_path']}`")
         if status.get("status") == "fallback":
@@ -325,9 +335,26 @@ class Pipeline:
             lines.append("")
         return "\n".join(lines)
 
+    def _correct_glossary(self, session: Session, transcript: dict) -> dict:
+        glossary = (self.cfg.get("asr") or {}).get("glossary") or {}
+        if not isinstance(glossary, dict):
+            raise ValueError("asr.glossary 必须是映射")
+        path = glossary.get("correction_path")
+        if path is None:
+            return transcript
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("asr.glossary.correction_path 必须是非空路径或 null")
+        corrected = correct_transcript(transcript, Path(path).expanduser())
+        session.save_json("transcript_corrected.json", corrected)
+        session.save_text_safely(
+            "transcript_corrected.md", self._render_md(corrected), overwrite=True
+        )
+        return corrected
+
     # ---------------- (3) AI 纪要 ----------------
     def export_web_prompt(self, session: Session, *, overwrite: bool = False) -> Path:
-        prompt = build_web_prompt(session.load_transcript(), config=self.cfg)
+        transcript = self._correct_glossary(session, session.load_transcript())
+        prompt = build_web_prompt(transcript, config=self.cfg)
         return session.save_text_safely("minutes_web_prompt.txt", prompt, overwrite=overwrite)
 
     def import_web_minutes(
@@ -342,7 +369,7 @@ class Pipeline:
         return session.save_text_safely("minutes.md", content, overwrite=overwrite)
 
     def summarize(self, session: Session, *, llm: BaseLLM | None = None) -> tuple[Path, Usage]:
-        transcript = session.load_transcript()
+        transcript = self._correct_glossary(session, session.load_transcript())
         try:
             lcfg = self.cfg.get("llm", {}) or {}
             if (

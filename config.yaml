@@ -36,6 +36,7 @@ asr:
     path: null              # 填 glossary.yaml 启用，相对本配置文件
     terms: null             # 可填标准写法列表，按提供的顺序优先发送
     max_terms: 20
+    correction_path: null   # 填 glossary.yaml 启用转写后确定性纠错，可与识别前提示独立使用
   word_timestamps: true      # 说话人分离对齐需要
   hf_endpoint: null          # 国内下不动模型时改: https://hf-mirror.com
   hf_disable_xet: true       # 规避 Xet 重建服务 401；需要 Xet 时设 false

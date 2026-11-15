@@ -220,6 +220,7 @@ ECAPA 模型按需加载到用户目录 `~/.cache/meetmin/speechbrain`，使用 
 | `embeddings.npz` | 本地 ECAPA 窗口嵌入，提取完成后、聚类前原子写入；单说话人和云端自带分离不生成新嵌入，短音频也可能不生成 |
 | `transcript.json` | 分离/对齐后的句级时间戳、文本和说话人，不含词级数据 |
 | `transcript.md` | 供人工查看的转写文本 |
+| `transcript_corrected.json` / `transcript_corrected.md` | 启用术语纠错后生成的独立副本，JSON 包含替换记录和待核对项 |
 | `minutes_web_prompt.txt` | 可手动提交给 AI 网页的完整提示词和转写（仅执行导出时生成） |
 | `minutes.md` | 由 API 生成或由用户从 AI 网页导入的纪要；API 模式附用量及可选费用估算 |
 
@@ -251,6 +252,10 @@ asr:
 
 路径相对于配置文件。术语提示只取 `term`，附在现有标点示例和手工热词之后，再一起传给本地 Whisper 的 `hotwords`。提示按模型的 token 上限和 `max_terms`（默认 20）选入整条术语。实际词条可在 `asr_raw.json` 的 `asr.parameters.glossary` 中核对。默认 `path: null`，适合不同主题的会议按需启用。
 
+设置 `asr.glossary.correction_path: glossary.yaml` 可独立启用转写后纠错。规则优先替换较长的误听，按标准术语和已确认别名规范英文大小写。含汉字且只有三个或更少字母数字字符的误听，以及词条中标记 `needs_context: true` 的误听，仅记入待核对项。
+
+`diarize` 会另存纠错 JSON 和 Markdown。JSON 的 `glossary_correction.changes` 记录每次替换的句子索引、时间、原文、新文和字符范围，`context_review` 列出待核对项。启用时，生成纪要或导出网页版提示词会从当前 `transcript.json` 重新应用纠错。将 `correction_path` 设回 `null` 即可使用原转写。
+
 本地 Whisper 默认体检相邻重复句、异常压缩比和 VAD 检出的连续有声缺口。体检只记录疑点，结果在 `asr_raw.json` 的 `asr.quality` 中，双轨的麦克风报告在 `microphone.asr.quality`。可以按其中的起止时间回听。
 
 设 `asr.quality.mode: retry` 可重跑疑点音频，单片最多 20 秒，每轨默认最多 6 次。只有在置信度、时间边界和邻近重复等检查通过后才更新转写。每次重试都会记录结果，替换已有片段时同时保留原文与词级时间戳。设 `mode: "off"` 可关闭体检。
@@ -272,7 +277,7 @@ asr:
 | `asr.quality` | 默认 `mode: detect`，连续有声缺口至少 1.5 秒，压缩比阈值 2.4，重试模式每轨最多 6 次 |
 | `asr.no_repeat_ngram_size` / `asr.repetition_penalty` / `asr.hallucination_silence_threshold` | `0` / `1.0` / `null`。均为可选的全局解码限制，静音阈值单位为秒且需要词级时间戳 |
 | `asr.punctuation_prompt` / `asr.hotwords` | 均为 `null`，可填带标点的中文示例和术语文本 |
-| `asr.glossary` | `path: null` 默认关闭。配置后可用 `terms` 指定优先词条，`max_terms` 限制数量 |
+| `asr.glossary` | `path` 启用识别前提示，可用 `terms` 指定优先词条。`correction_path` 启用识别后纠错。两个路径默认均为 `null` |
 | `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
 | `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
 | `diarization.window_sec` / `hop_sec` | `1.5` / `0.75`，声纹窗口和步长 |

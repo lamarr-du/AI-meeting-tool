@@ -8,19 +8,26 @@ from pathlib import Path
 import yaml
 
 
-def load_terms(path: Path) -> list[str]:
+def load_glossary(path: Path) -> list[dict]:
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, yaml.YAMLError) as error:
         raise ValueError(f"无法读取术语表 {path}：{error}") from error
     if not isinstance(document, dict) or not isinstance(document.get("terms"), list):
         raise ValueError(f"术语表 {path} 需要提供 terms 列表")
-    terms: dict[str, str] = {}
+    entries = []
     for index, entry in enumerate(document["terms"], 1):
         term = entry.get("term") if isinstance(entry, dict) else None
         if not isinstance(term, str) or not term.strip():
             raise ValueError(f"术语表 {path} 的第 {index} 条需要提供非空 term")
-        term = term.strip()
+        entries.append({**entry, "term": term.strip()})
+    return entries
+
+
+def load_terms(path: Path) -> list[str]:
+    terms: dict[str, str] = {}
+    for entry in load_glossary(path):
+        term = entry["term"]
         terms.setdefault(term.casefold(), term)
     return list(terms.values())
 
