@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, overload
 
 from .asr.base import ASRResult, Utterance
+from .asr.punctuation import punctuate_chinese
 from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
 from .audio.session_recorder import SessionRecorder
@@ -208,6 +209,9 @@ class Pipeline:
             for u in utterances:
                 u.speaker = "说话人A"
             speakers = ["说话人A"] if utterances else []
+        local_whisper = (raw.get("asr") or {}).get("provider") == "faster_whisper"
+        if local_whisper:
+            punctuate_chinese(utterances, raw.get("language"))
         transcript = {k: v for k, v in raw.items() if k != "schema_version"}
         if microphone := raw.get("microphone"):
             transcript["microphone"] = {k: v for k, v in microphone.items() if k != "utterances"}
@@ -216,6 +220,8 @@ class Pipeline:
             ]
             for u in mic_utterances:
                 u.speaker = "我"
+            if local_whisper:
+                punctuate_chinese(mic_utterances, microphone.get("language"))
             utterances.extend(mic_utterances)
             utterances.sort(key=lambda u: (u.start, u.end))
             speakers = list(

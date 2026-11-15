@@ -238,6 +238,10 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 
 本地 ECAPA 重跑仍需要原始音频，外部音频请保留在记录的绝对路径。Whisper 保留 `asr.word_timestamps: true` 才会请求词级数据；当前 DashScope 实现只解析句级数据。旧会话没有 `asr_raw.json` 时，需重新转写一次才能独立分离；已有 `transcript.json` 仍可用于生成纪要。
 
+对于本地 Whisper 的中文转写，`diarize` 会统一中文上下文中的半角逗号，并在至少 0.8 秒的段间停顿或音轨结束处为以文字或数字收尾的片段补句号。双轨会话按各自的时间轴处理。可对已有的 `asr_raw.json` 直接重跑 `diarize` 应用标点整理，原始转写保留模型文本和词级时间戳。
+
+如需让模型直接输出更多标点，可在 `asr.language: zh` 时设置 `asr.punctuation_prompt: "好的，我们继续。"`，也可用 `asr.hotwords` 填写少量确认过的术语。两项内容会合并传给 Whisper 的 `hotwords`，实际使用值记录在 `asr_raw.json`。标点提示可能影响识别与词级时间戳，默认关闭。
+
 ## 配置要点
 
 | 配置 | 当前默认值与作用 |
@@ -251,6 +255,7 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `asr.device` / `compute_type` | `auto` / `int8`，选择和回退行为见上文 |
 | `asr.beam_size` / `word_timestamps` | `1` / `true` |
 | `asr.condition_on_previous_text` | `false`；关闭前文条件以减少重复和幻觉，设为 `true` 可恢复原行为，实际值记录在 `asr_raw.json` |
+| `asr.punctuation_prompt` / `asr.hotwords` | 均为 `null`，可填带标点的中文示例和术语文本 |
 | `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
 | `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
 | `diarization.window_sec` / `hop_sec` | `1.5` / `0.75`，声纹窗口和步长 |
