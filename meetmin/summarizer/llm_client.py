@@ -65,12 +65,20 @@ class Usage:
     completion_tokens: int = 0
     # 本地估算值（服务端未返回 usage 时使用）
     estimated: bool = False
+    # complete: 接口明确返回 stop；truncated: 至少一段最终输出被截断；unknown: 未知。
+    finish_status: str = "unknown"
 
     def add(self, other: "Usage") -> "Usage":
         self.calls += other.calls
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens
         self.estimated = self.estimated or other.estimated
+        if "truncated" in (self.finish_status, other.finish_status):
+            self.finish_status = "truncated"
+        elif "unknown" in (self.finish_status, other.finish_status):
+            self.finish_status = "unknown"
+        else:
+            self.finish_status = "complete"
         return self
 
     @property
@@ -125,6 +133,35 @@ class OpenAICompatibleLLM(BaseLLM):
             "stream": False,
         }
         payload.update(self.lcfg.get("extra_request") or {})
+        text, usage, reason = self._request(payload)
+        if reason == "length":
+            current_limit = int(payload["max_tokens"])
+            if current_limit <= 0:
+                raise RuntimeError("LLM 输出上限必须为正数，无法重试截断结果。")
+            payload = {**payload, "max_tokens": current_limit * 2}
+            logger.warning(
+                "LLM 输出因长度限制截断，将上限从 %d 提高到 %d 后重试一次。",
+                current_limit,
+                current_limit * 2,
+            )
+            text, retry_usage, reason = self._request(payload)
+            # The discarded first response still consumed tokens, but its truncation
+            # does not describe the replacement response.
+            usage.calls += retry_usage.calls
+            usage.prompt_tokens += retry_usage.prompt_tokens
+            usage.completion_tokens += retry_usage.completion_tokens
+            usage.estimated = usage.estimated or retry_usage.estimated
+            if reason == "length":
+                logger.warning("LLM 提高输出上限后仍被截断，结果将标记为不完整。")
+        if not text.strip():
+            raise RuntimeError("LLM 返回空结果，请检查模型和输出额度；未生成纪要。")
+        usage.finish_status = (
+            "complete" if reason == "stop" else "truncated" if reason == "length" else "unknown"
+        )
+        return text, usage
+
+    def _request(self, payload: dict) -> tuple[str, Usage, str | None]:
+        """一次模型调用，可按 F1 策略重试 HTTP 请求。"""
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -153,7 +190,9 @@ class OpenAICompatibleLLM(BaseLLM):
                 else:
                     try:
                         j = r.json()
-                        text = j["choices"][0]["message"]["content"] or ""
+                        choice = j["choices"][0]
+                        text = choice["message"]["content"] or ""
+                        reason = choice.get("finish_reason")
                         if not isinstance(text, str):
                             raise TypeError("content 必须是字符串")
                         u = j.get("usage") or {}
@@ -165,10 +204,14 @@ class OpenAICompatibleLLM(BaseLLM):
                         ) from error
                     if not (ppl or cpl):  # 部分服务不返回 usage，按字符估算
                         cpl = max(1, int(len(text) / 1.5))
-                        return text, Usage(
-                            calls=1, prompt_tokens=ppl, completion_tokens=cpl, estimated=True
+                        return (
+                            text,
+                            Usage(
+                                calls=1, prompt_tokens=ppl, completion_tokens=cpl, estimated=True
+                            ),
+                            reason,
                         )
-                    return text, Usage(calls=1, prompt_tokens=ppl, completion_tokens=cpl)
+                    return text, Usage(calls=1, prompt_tokens=ppl, completion_tokens=cpl), reason
             if attempt + 1 == retries:
                 break
             if retry_after is not None and retry_after > MAX_RETRY_AFTER_SECONDS:

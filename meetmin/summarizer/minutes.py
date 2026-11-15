@@ -151,7 +151,8 @@ def generate_minutes(
     if progress_cb:
         progress_cb(f"转写文本 {len(text)} 字符 → 采用 {strategy} 策略")
 
-    usage = Usage()
+    # Neutral aggregation value: every actual call must report a known stop.
+    usage = Usage(finish_status="complete")
     sys_msg = {"role": "system", "content": prompts.SYSTEM}
 
     # ---------------- direct：一次调用 ----------------
@@ -171,6 +172,8 @@ def generate_minutes(
             ]
         )
         usage.add(u)
+        if not md.strip():
+            raise RuntimeError("LLM 返回空纪要，未写入文件。")
         return md.strip(), usage
     if strategy != "map_reduce":
         raise ValueError(f"未知 summarizer.strategy: {strategy}（可选 auto|direct|map_reduce）")
@@ -195,8 +198,9 @@ def generate_minutes(
             ]
         )
         usage.add(u)
-        if pt.strip():
-            points.append(pt.strip())
+        if not pt.strip():
+            raise RuntimeError(f"第 {i}/{len(chunks)} 段摘要为空，未生成纪要。")
+        points.append(pt.strip())
     if not points:
         raise RuntimeError("map 阶段未产出任何要点。")
 
@@ -259,6 +263,8 @@ def generate_minutes(
         ]
     )
     usage.add(u)
+    if not md.strip():
+        raise RuntimeError("LLM 返回空纪要，未写入文件。")
     return md.strip(), usage
 
 

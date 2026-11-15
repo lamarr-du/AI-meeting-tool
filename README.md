@@ -248,7 +248,9 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 
 纪要默认合并相邻同说话人的文本，不向 prompt 传词级数据；`summarizer.with_timestamps: false` 时不传逐句时间戳。`auto` 根据渲染后的文本长度选择策略：不超过 `direct_threshold_chars`（默认 9000）时直接生成，超过时按 `max_chunk_chars`（默认 4000）分段提炼要点，再合并生成；要点过长时继续压缩要点。
 
-`llm.max_output_tokens` 默认 2000，`temperature` 默认 0.3。输出记录调用次数和 token 用量，服务端未提供用量时使用估算。配置 `summarizer.price_per_1k_input` / `price_per_1k_output` 后估算费用；实际 token 和费用取决于文本、服务和模型，没有固定节省比例。
+`llm.max_output_tokens` 默认 2000，`temperature` 默认 0.3。接口返回 `finish_reason=length` 时，将该次输出上限加倍重试一次，重试可能产生额外费用，也可能超过服务端的模型限制；两次调用的用量都计入统计。若重试后仍被截断，会保留非空结果并在纪要末尾标为不完整；长会议任一中间摘要截断也会使整份纪要标为不完整。空结果会报错，不会写入或覆盖纪要。接口未报告可识别的结束原因时，完整性标记为无法确认；接口未报告截断也不能保证事实和细节准确，仍需人工核对。
+
+输出记录调用次数和 token 用量，服务端未提供用量时使用估算。配置 `summarizer.price_per_1k_input` / `price_per_1k_output` 后估算费用；实际 token 和费用取决于文本、服务和模型，没有固定节省比例。
 
 DashScope ASR 需设置 `asr.provider: dashscope`、有效的 `dashscope_asr.api_key_env` 和 `--file-url`（或配置 `dashscope_asr.file_url`）。工具不上传本地录音，也不会自动把 `audio.wav` 变成 URL。可对已有本地文件和其已上传的 URL 运行：
 

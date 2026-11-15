@@ -300,6 +300,12 @@ class Pipeline:
         cost = estimate_cost(usage, scfg)
         if cost is not None:
             lines.append(f"估算成本：¥{cost:.4f}（按配置单价）")
+        if usage.finish_status == "truncated":
+            lines.append("完整性：不完整（至少一阶段输出被截断，请调整输出上限后重新生成）。")
+        elif usage.finish_status == "complete":
+            lines.append("完整性：接口未报告截断（内容仍需人工核对）。")
+        else:
+            lines.append("完整性：无法确认（接口未提供可识别的结束原因）。")
         path = session.save_text("minutes.md", "\n".join(lines))
         self.progress(f"  ✓ 纪要已写入：{path}")
         return path, usage

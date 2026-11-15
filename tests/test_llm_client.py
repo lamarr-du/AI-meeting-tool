@@ -147,3 +147,73 @@ def test_malformed_json_is_not_retried(fake_http):
     with pytest.raises(RuntimeError, match="格式无效"):
         llm.chat([])
     assert len(calls) == 1 and not waits
+
+
+def completion(text, reason, prompt=10, output=5):
+    return response(
+        200,
+        body={
+            "choices": [{"message": {"content": text}, "finish_reason": reason}],
+            "usage": {"prompt_tokens": prompt, "completion_tokens": output},
+        },
+    )
+
+
+def test_truncated_response_retries_with_double_limit_and_counts_both_calls(fake_http, caplog):
+    llm, results, calls, waits = fake_http
+    results.extend([completion("截断", "length"), completion("完整纪要", "stop", 11, 8)])
+    text, usage = llm.chat([], max_tokens=100)
+    assert text == "完整纪要" and usage.finish_status == "complete"
+    assert [call[1]["json"]["max_tokens"] for call in calls] == [100, 200]
+    assert (usage.calls, usage.prompt_tokens, usage.completion_tokens) == (2, 21, 13)
+    assert not waits and "截断" in caplog.text
+
+
+def test_twice_truncated_returns_partial_with_warning(fake_http, caplog):
+    llm, results, calls, _ = fake_http
+    results.extend([completion("短", "length"), completion("仍不完整", "length")])
+    text, usage = llm.chat([])
+    assert text == "仍不完整" and usage.finish_status == "truncated"
+    assert len(calls) == 2 and "仍被截断" in caplog.text
+
+
+def test_retry_uses_effective_override_limit(fake_http):
+    llm, results, calls, _ = fake_http
+    llm.lcfg["extra_request"] = {"max_tokens": 150}
+    results.extend([completion("短", "length"), completion("完整", "stop")])
+    llm.chat([], max_tokens=100)
+    assert [call[1]["json"]["max_tokens"] for call in calls] == [150, 300]
+
+
+@pytest.mark.parametrize("reason", [None, "content_filter", "other"])
+def test_unrecognized_finish_reason_is_unknown(fake_http, reason):
+    llm, results, calls, _ = fake_http
+    results.append(completion("纪要", reason))
+    _, usage = llm.chat([])
+    assert usage.finish_status == "unknown" and len(calls) == 1
+
+
+@pytest.mark.parametrize("text", ["", "  \n", None])
+def test_empty_output_fails_without_retry(fake_http, text):
+    llm, results, calls, _ = fake_http
+    results.append(completion(text, "stop"))
+    with pytest.raises(RuntimeError, match="空结果"):
+        llm.chat([])
+    assert len(calls) == 1
+
+
+def test_empty_truncated_output_retries_then_fails_if_still_empty(fake_http):
+    llm, results, calls, _ = fake_http
+    results.extend([completion("", "length"), completion(" ", "stop")])
+    with pytest.raises(RuntimeError, match="空结果"):
+        llm.chat([])
+    assert len(calls) == 2
+
+
+def test_truncated_retry_preserves_http_retry_policy(fake_http):
+    llm, results, calls, waits = fake_http
+    results.extend([completion("短", "length"), response(503), completion("成功", "stop")])
+    text, usage = llm.chat([], max_tokens=100)
+    assert text == "成功" and usage.calls == 2
+    assert [call[1]["json"]["max_tokens"] for call in calls] == [100, 200, 200]
+    assert waits == [1.0]
