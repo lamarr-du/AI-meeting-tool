@@ -25,7 +25,7 @@ class SessionLock:
                 self.file.flush()
             self.file.seek(0)
             if os.name == "nt":
-                import msvcrt
+                msvcrt: Any = importlib.import_module("msvcrt")
 
                 msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
             else:
@@ -40,7 +40,7 @@ class SessionLock:
             return
         self.file.seek(0)
         if os.name == "nt":
-            import msvcrt
+            msvcrt: Any = importlib.import_module("msvcrt")
 
             msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
         else:
