@@ -1,7 +1,7 @@
 """Windows WASAPI loopback 内录。
 
 录的是"电脑正在播放的声音"（会议远端发言、以及会议软件混入输出的任何声音）。
-注意：本地麦克风说话默认不会出现在电脑输出里，因此不会进内录（README 有解决办法）。
+麦克风设备可使用同一套时间轴与分段写盘逻辑单独采集。
 """
 
 from __future__ import annotations
@@ -47,6 +47,24 @@ def list_loopback_devices() -> list[dict]:
     finally:
         pa.terminate()
     return out
+
+
+def list_microphone_devices() -> list[dict]:
+    pyaudio = _import_pyaudio()
+    pa = pyaudio.PyAudio()
+    try:
+        return [
+            {
+                "index": int(d["index"]),
+                "name": str(d["name"]),
+                "sample_rate": int(d["defaultSampleRate"]),
+                "max_channels": int(d["maxInputChannels"]),
+            }
+            for d in pa.get_device_info_generator_by_host_api(host_api_type=pyaudio.paWASAPI)
+            if d["maxInputChannels"] > 0 and not d.get("isLoopbackDevice")
+        ]
+    finally:
+        pa.terminate()
 
 
 class RecordingError(RuntimeError):
@@ -223,6 +241,29 @@ class LoopbackRecorder:
 
     # ---------------- 生命周期 ----------------
     def start(self, wav_path: str | Path, *, overwrite: bool = False) -> None:
+        try:
+            self._prepare(wav_path, overwrite=overwrite)
+            self._begin(self._now())
+        except Exception as error:
+            if self._state != "STARTING":
+                raise
+            self._fail(error)
+            self._state = "FAILED"
+            self._stop_at = self._now()
+            complete = self._shutdown()
+            self._collect_errors()
+            if not complete or self._secondary_errors:
+                raise RecordingError(str(self._error), self._info()) from error
+            raise
+
+    def _prepare(
+        self,
+        wav_path: str | Path,
+        *,
+        overwrite: bool,
+        directory: Path | None = None,
+        session_locked: bool = False,
+    ) -> None:
         if self._thread is not None or self._stream is not None or self._pa is not None:
             raise RuntimeError("录音正在进行或上次清理尚未完成")
         self._state = "STARTING"
@@ -244,72 +285,66 @@ class LoopbackRecorder:
         self.path = Path(wav_path)
         self.device_name = ""
         self.sample_rate_actual = self.channels_actual = 0
+        pyaudio = _import_pyaudio()
+        self._pa = pyaudio.PyAudio()
+        info = self._resolve_device(self._pa)
+        sr = int(self.sample_rate or info["defaultSampleRate"])
+        ch = int(self.channels or max(1, min(2, int(info["maxInputChannels"]))))
+        path = self.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._wf = SegmentedWriter(
+            path,
+            sr,
+            ch,
+            overwrite=overwrite,
+            segment_seconds=self._segment_seconds,
+            sync_seconds=self._sync_seconds,
+            directory=directory,
+            session_locked=session_locked,
+        )
+        self._audio_file = self._wf
+
+        self._chunk_frames = max(16, int(sr * self.chunk_ms / 1000))
+        self.device_name = str(info["name"])
+        self.sample_rate_actual = sr
+        self.channels_actual = ch
+        self._pa_continue = pyaudio.paContinue
+        self._pa_abort = pyaudio.paAbort
+        self._stream = self._pa.open(
+            format=pyaudio.paInt16,
+            channels=ch,
+            rate=sr,
+            input=True,
+            input_device_index=int(info["index"]),
+            frames_per_buffer=self._chunk_frames,
+            stream_callback=self._callback,
+            start=False,
+        )
+
+    def _begin(self, started_at: float) -> None:
+        # Pa_GetStreamTime and monotonic have different epochs on Windows.
+        before = self._now()
+        offset: float | None
         try:
-            pyaudio = _import_pyaudio()
-            self._pa = pyaudio.PyAudio()
-            info = self._resolve_device(self._pa)
-            sr = int(self.sample_rate or info["defaultSampleRate"])
-            ch = int(self.channels or max(1, min(2, int(info["maxInputChannels"]))))
-            path = self.path
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-            self._wf = SegmentedWriter(
-                path,
-                sr,
-                ch,
-                overwrite=overwrite,
-                segment_seconds=self._segment_seconds,
-                sync_seconds=self._sync_seconds,
-            )
-            self._audio_file = self._wf
-
-            self._chunk_frames = max(16, int(sr * self.chunk_ms / 1000))
-            self.device_name = str(info["name"])
-            self.sample_rate_actual = sr
-            self.channels_actual = ch
-            self._pa_continue = pyaudio.paContinue
-            self._pa_abort = pyaudio.paAbort
-            self._stream = self._pa.open(
-                format=pyaudio.paInt16,
-                channels=ch,
-                rate=sr,
-                input=True,
-                input_device_index=int(info["index"]),
-                frames_per_buffer=self._chunk_frames,
-                stream_callback=self._callback,
-                start=False,
-            )
-            # Pa_GetStreamTime and monotonic have different epochs on Windows.
-            before = self._now()
-            offset: float | None
-            try:
-                stream_time = float(self._stream.get_time())
-                offset = stream_time - (before + self._now()) / 2
-                if not math.isfinite(stream_time) or stream_time <= 0:
-                    offset = None
-            except (OSError, ValueError):
+            stream_time = float(self._stream.get_time())
+            offset = stream_time - (before + self._now()) / 2
+            if not math.isfinite(stream_time) or stream_time <= 0:
                 offset = None
-            self._started_at = self._now()
-            self._last_data_time = self._started_at
-            self._timeline = _Timeline(
-                sr,
-                self._chunk_frames,
-                self._started_at,
-                self._started_at + offset if offset is not None else None,
-            )
-            self._thread = threading.Thread(target=self._run, daemon=True, name="loopback-writer")
-            self._thread.start()
-            self._stream.start_stream()
-            self._state = "RECORDING"
-        except Exception as error:
-            self._fail(error)
-            self._state = "FAILED"
-            self._stop_at = self._now()
-            complete = self._shutdown()
-            self._collect_errors()
-            if not complete or self._secondary_errors:
-                raise RecordingError(str(self._error), self._info()) from error
-            raise
+        except (OSError, ValueError):
+            offset = None
+        self._started_at = started_at
+        self._last_data_time = self._now()
+        self._timeline = _Timeline(
+            self.sample_rate_actual,
+            self._chunk_frames,
+            started_at,
+            started_at + offset if offset is not None else None,
+        )
+        self._thread = threading.Thread(target=self._run, daemon=True, name="audio-writer")
+        self._thread.start()
+        self._stream.start_stream()
+        self._state = "RECORDING"
 
     def _callback(self, data, frame_count, time_info, status_flags):
         if self._failed.is_set():
@@ -459,15 +494,18 @@ class LoopbackRecorder:
             self.status()
         if self._stop_at is None:
             self._stop_at = self._now()
+        return self._finish()
+
+    def _finish(self, *, stream_already_closed: bool = False) -> dict:
         self._state = "STOPPING"
-        complete = self._shutdown()
+        complete = self._shutdown(stream_already_closed=stream_already_closed)
         self._state = "STOPPED" if complete and not self._failed.is_set() else "FAILED"
         info = self._info()
         if self._error is not None:
             raise RecordingError(str(self._error), info) from self._error
         return info
 
-    def _shutdown(self) -> bool:
+    def _close_stream(self) -> bool:
         if self._stream is not None:
             try:
                 self._stream.stop_stream()
@@ -482,6 +520,11 @@ class LoopbackRecorder:
                 return False
             self._stream = None
         self._producer_done.set()
+        return True
+
+    def _shutdown(self, *, stream_already_closed: bool = False) -> bool:
+        if not stream_already_closed and not self._close_stream():
+            return False
         if self._thread is not None and self._thread.ident is not None:
             self._thread.join(timeout=self._stop_timeout)
             if self._thread.is_alive():
@@ -525,3 +568,22 @@ class LoopbackRecorder:
     @property
     def is_recording(self) -> bool:
         return self._state == "RECORDING" and not self.status()["failed"]
+
+
+class MicrophoneRecorder(LoopbackRecorder):
+    def _resolve_device(self, pa):
+        pyaudio = _import_pyaudio()
+        wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        index = self.device if self.device is not None else wasapi["defaultInputDevice"]
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise ValueError("麦克风设备索引必须是整数，请运行 meetmin devices")
+        if index < 0:
+            raise RuntimeError("未找到默认 WASAPI 麦克风，请检查 Windows 输入设置")
+        info = pa.get_device_info_by_index(index)
+        if (
+            info["hostApi"] != wasapi["index"]
+            or info["maxInputChannels"] < 1
+            or info.get("isLoopbackDevice")
+        ):
+            raise ValueError(f"设备 [{index}] 不是 WASAPI 麦克风，请运行 meetmin devices")
+        return info

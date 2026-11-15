@@ -2,6 +2,7 @@
 
 产物：
   audio.wav        内录原始存档（设备原生采样率）
+  recording.json  双轨录音指向包含 audio.wav 与 microphone.wav 的同一批次
   asr_raw.json     原始转写（含词级时间戳与模型参数）
   embeddings.npz   ECAPA 窗口声纹嵌入及时间信息
   transcript.json  转写+分离结果（结构化，供纪要/增量处理）
@@ -50,6 +51,27 @@ class Session:
     @property
     def audio_path(self) -> Path:
         return self.root / "audio.wav"
+
+    @property
+    def recording_manifest(self) -> Path:
+        return self.root / "recording.json"
+
+    def recording_paths(self) -> tuple[Path, Path | None]:
+        try:
+            data = json.loads(self.recording_manifest.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return self.audio_path, None
+        take = data.get("take") if isinstance(data, dict) else None
+        if not isinstance(take, str) or not re.fullmatch(r"audio_parts-[0-9a-f]{32}", take):
+            raise ValueError("双轨录音的分段目录名无效")
+        folder = self.root / take
+        audio, microphone = folder / "audio.wav", folder / "microphone.wav"
+        if not audio.is_file() or not microphone.is_file():
+            raise FileNotFoundError(f"双轨录音缺少 WAV 文件：{folder}")
+        return audio, microphone
+
+    def publish_dual_recording(self, take: Path) -> None:
+        self.save_json("recording.json", {"take": take.name})
 
     def _require(self, name: str) -> Path:
         p = self.root / name

@@ -7,8 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from meetmin.audio.loopback_recorder import LoopbackRecorder, RecordingError
-from meetmin.audio.segments import merge_segments
+from meetmin.audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder, RecordingError
+from meetmin.audio.segments import SessionLock, merge_segments
+from meetmin.audio.session_recorder import SessionRecorder
+from meetmin.cli import cmd_recover
+from meetmin.session import Session
 
 
 class Clock:
@@ -23,6 +26,8 @@ class Stream:
         assert kwargs["start"] is False
         self.callback = kwargs["stream_callback"]
         self.clock = clock
+        self.rate = kwargs["rate"]
+        self.epoch = 1000 if kwargs["input_device_index"] == 0 else 2000
         self.active = False
         self.closed = False
         self.start_error = None
@@ -30,7 +35,7 @@ class Stream:
         self.stop_error = None
 
     def get_time(self):
-        return self.clock() + 1000  # Deliberately different from the Python clock epoch.
+        return self.clock() + self.epoch  # Each stream has a different clock epoch.
 
     def start_stream(self):
         if self.start_error:
@@ -52,12 +57,12 @@ class Stream:
         return self.active
 
     def emit(self, position, *, value=1000, frames=100, timing=True, received=None, flags=0):
-        self.clock.value = received if received is not None else 10 + position + frames / 1000
+        self.clock.value = received if received is not None else 10 + position + frames / self.rate
         data = np.full(frames, value, dtype="<i2").tobytes()
         times = (
             {
-                "input_buffer_adc_time": 1010 + position,
-                "current_time": 1010 + position + frames / 1000,
+                "input_buffer_adc_time": self.epoch + 10 + position,
+                "current_time": self.epoch + 10 + position + frames / self.rate,
             }
             if timing
             else {}
@@ -81,11 +86,16 @@ def recording(monkeypatch, tmp_path):
 
         def get_device_info_by_index(self, index):
             return {
-                "defaultSampleRate": 1000,
+                "defaultSampleRate": 1000 if index == 0 else 2000,
                 "maxInputChannels": 1,
                 "index": index,
                 "name": "fake",
+                "hostApi": 2,
+                "isLoopbackDevice": index == 0,
             }
+
+        def get_host_api_info_by_type(self, _):
+            return {"index": 2, "defaultInputDevice": 1}
 
         def open(self, **kwargs):
             stream = Stream(clock, **kwargs)
@@ -102,6 +112,7 @@ def recording(monkeypatch, tmp_path):
             paInt16=8,
             paContinue=0,
             paAbort=2,
+            paWASAPI=13,
         ),
     )
     rec = LoopbackRecorder(device=0, clock=clock)
@@ -116,9 +127,9 @@ def recording(monkeypatch, tmp_path):
             pass
 
 
-def read_audio(path):
+def read_audio(path, rate=1000):
     with wave.open(str(path), "rb") as wav:
-        assert wav.getframerate() == 1000
+        assert wav.getframerate() == rate
         return np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
 
 
@@ -422,12 +433,11 @@ def test_failed_stream_close_does_not_release_writer(recording):
 
 def test_cli_failure_does_not_continue_pipeline(recording, monkeypatch, capsys):
     import meetmin.cli as cli
-    from meetmin.session import Session
 
     r = recording
     session = Session(str(r.path.parent), "test").ensure()
     pipe = SimpleNamespace(
-        recorder=lambda: r.rec,
+        recorder=lambda **_: SessionRecorder(r.rec),
         new_session=lambda _: session,
         transcribe=lambda *a, **k: pytest.fail("must not transcribe"),
     )
@@ -446,3 +456,112 @@ def test_cli_failure_does_not_continue_pipeline(recording, monkeypatch, capsys):
     assert error.value.code == 2
     output = capsys.readouterr().out
     assert "录音失败" in output and "已写时长" in output
+
+
+def test_dual_recording_shares_boundaries_across_device_clocks(recording, monkeypatch, tmp_path):
+    r = recording
+    start_stream = Stream.start_stream
+
+    def stagger_start(stream):
+        start_stream(stream)
+        if stream.rate == 1000:
+            # The microphone starts later but uses the same timeline.
+            r.clock.value += 0.15
+
+    monkeypatch.setattr(Stream, "start_stream", stagger_start)
+    session = Session(tmp_path, "dual")
+    rec = SessionRecorder(r.rec, MicrophoneRecorder(channels=1, clock=r.clock))
+    rec.start(session)
+    with pytest.raises(RuntimeError, match="正在录音或恢复"):
+        SessionLock(session.root)
+    r.streams[0].emit(0.20, value=1000)
+    r.streams[1].emit(0.20, value=2000, frames=200)
+    r.clock.value = 10.60
+    info = rec.stop()
+
+    loopback, microphone = session.recording_paths()
+    assert microphone is not None and microphone.parent == loopback.parent
+    assert info["duration_sec"] == info["microphone"]["duration_sec"] == 0.6
+    assert info["timing_mode"] == info["microphone"]["timing_mode"] == "device"
+    assert np.flatnonzero(read_audio(loopback)).tolist() == list(range(200, 300))
+    assert np.flatnonzero(read_audio(microphone, 2000)).tolist() == list(range(400, 600))
+    assert all(stream.closed for stream in r.streams)
+
+    rec = SessionRecorder(r.rec)
+    rec.start(session, overwrite=True)
+    r.clock.value = 11
+    rec.stop()
+    assert session.recording_paths() == (session.audio_path, None)
+    assert microphone.is_file()
+
+
+def test_failed_dual_overwrite_preserves_active_take_and_can_export(recording, tmp_path):
+    r = recording
+    session = Session(tmp_path, "dual")
+    rec = SessionRecorder(r.rec, MicrophoneRecorder(device=1, channels=1, clock=r.clock))
+    rec.start(session)
+    r.clock.value = 10.4
+    rec.stop()
+    original = session.recording_paths()
+
+    r.clock.value = 10
+    rec.start(session, overwrite=True)
+    r.streams[-2].emit(0.05, value=111)
+    r.streams[-1].emit(0.05, value=222, frames=200)
+    r.streams[-1].active = False
+    assert rec.status()["failed"]
+    with pytest.raises(RecordingError, match="microphone"):
+        rec.stop()
+    assert session.recording_paths() == original
+    assert not session.audio_path.exists()
+
+    failed_take = next(p for p in session.root.glob("audio_parts-*") if p != original[0].parent)
+    output = tmp_path / "recovered"
+    args = SimpleNamespace(session="dual", take=failed_take.name, output=str(output))
+    cmd_recover(args, {"output_dir": str(tmp_path)})
+    assert 111 in read_audio(output / "audio.wav")
+    assert 222 in read_audio(output / "microphone.wav", 2000)
+    assert session.recording_paths() == original
+
+
+def test_microphone_start_failure_never_publishes_single_track(recording, monkeypatch, tmp_path):
+    r = recording
+    start_stream = Stream.start_stream
+
+    def fail_microphone(stream):
+        if stream.rate == 2000:
+            raise OSError("麦克风无法启动")
+        start_stream(stream)
+
+    monkeypatch.setattr(Stream, "start_stream", fail_microphone)
+    session = Session(tmp_path, "dual")
+    rec = SessionRecorder(r.rec, MicrophoneRecorder(device=1, channels=1, clock=r.clock))
+    with pytest.raises(RecordingError, match="麦克风无法启动"):
+        rec.start(session)
+    assert not session.recording_manifest.exists()
+    assert not session.audio_path.exists()
+    assert all(stream.closed for stream in r.streams)
+    with SessionLock(session.root):
+        pass
+
+
+def test_recover_interrupted_dual_recording_publishes_both_tracks(recording, tmp_path):
+    r = recording
+    session = Session(tmp_path, "interrupted")
+    rec = SessionRecorder(r.rec, MicrophoneRecorder(channels=1, clock=r.clock))
+    rec.start(session)
+    r.streams[0].emit(0.1, value=111)
+    r.streams[1].emit(0.2, value=222, frames=200)
+    r.streams[0].active = r.streams[1].active = False
+    with pytest.raises(RecordingError):
+        rec.stop()
+    assert session.recording_paths() == (session.audio_path, None)
+
+    cmd_recover(
+        SimpleNamespace(session=session.session_id, take=None, output=None),
+        {"output_dir": str(tmp_path)},
+    )
+    loopback, microphone = session.recording_paths()
+    assert microphone is not None
+    assert np.flatnonzero(read_audio(loopback)).tolist() == list(range(100, 200))
+    assert np.flatnonzero(read_audio(microphone, 2000)).tolist() == list(range(400, 600))

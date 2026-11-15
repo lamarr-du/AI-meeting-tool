@@ -14,6 +14,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "device": None,  # 内录设备索引或名称片段；null=默认输出设备的 loopback
         "channels": None,  # null=跟随设备（最多取 2）
         "sample_rate": None,  # null=跟随设备默认采样率
+        "microphone": False,
+        "microphone_device": None,  # null=默认 WASAPI 输入
         "chunk_ms": 100,  # 每次读取的块长（毫秒）
         "segment_seconds": 300,  # 单个录音分段时长
         "sync_seconds": 10,  # 活动分段的磁盘同步间隔

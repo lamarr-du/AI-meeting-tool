@@ -362,7 +362,7 @@ def test_recording_silence_alert_rearms():
             patch("sys.stdout", output),
         ):
             main._do_record(
-                SimpleNamespace(recorder=Recorder),
+                SimpleNamespace(recorder=lambda **_: Recorder()),
                 session,
                 SimpleNamespace(overwrite=False, max_seconds=4),
             )
@@ -426,7 +426,7 @@ def test_recording_no_data_alert_rearms():
             patch("sys.stdout", output),
         ):
             main._do_record(
-                SimpleNamespace(recorder=Recorder),
+                SimpleNamespace(recorder=lambda **_: Recorder()),
                 session,
                 SimpleNamespace(overwrite=False, max_seconds=4),
             )
@@ -511,6 +511,74 @@ def test_raw_asr_survives_failed_diarization():
         assert all("words" not in u for u in transcript["utterances"])
         assert json.loads(original)["utterances"][0]["words"] == words
         assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_dual_transcribe_diarizes_only_loopback_and_preserves_overlap(
+    tmp_path, monkeypatch, fallback
+):
+    from types import SimpleNamespace
+
+    from meetmin.pipeline import Pipeline
+
+    pipe = Pipeline({"output_dir": tmp_path, "llm": {"provider": "mock"}})
+    session = pipe.new_session("dual")
+    take = session.root / ("audio_parts-" + "a" * 32)
+    loopback, mic = take / "audio.wav", take / "microphone.wav"
+    dsp.save_wav_mono(loopback, np.full(48000, 0.1, dtype=np.float32), 16000)
+    dsp.save_wav_mono(mic, np.full(48000, 0.3, dtype=np.float32), 16000)
+    session.publish_dual_recording(take)
+    calls = []
+
+    def transcribe(audio, *, file_path, **kwargs):
+        calls.append(file_path)
+        if file_path == str(loopback):
+            return ASRResult(
+                utterances=[Utterance(0.5, 2, "远端发言"), Utterance(2.1, 2.7, "另一位发言")],
+                language="zh",
+            )
+        assert np.mean(audio) > 0.2
+        return ASRResult(
+            utterances=[Utterance(1, 1.5, "本地发言", words=[{"w": "本地发言", "s": 1, "e": 1.5}])]
+        )
+
+    def diarize(audio, **kwargs):
+        assert np.mean(audio) < 0.2
+        assert kwargs["speech_spans"] == [(0.5, 2), (2.1, 2.7)]
+        if fallback:
+            raise RuntimeError("分离失败")
+        return [{"start": 0.5, "end": 2, "label": 1}, {"start": 2.1, "end": 2.7, "label": 2}]
+
+    monkeypatch.setattr(
+        "meetmin.asr.get_asr",
+        lambda _: SimpleNamespace(name="faster_whisper", transcribe=transcribe),
+    )
+    monkeypatch.setattr(
+        "meetmin.diarization.get_diarizer",
+        lambda _: SimpleNamespace(name="fake", diarize=diarize),
+    )
+    raw = pipe.transcribe(session)
+    assert calls == [str(loopback), str(mic)]
+    assert raw["microphone"]["utterances"][0]["speaker"] == "我"
+    assert raw["microphone"]["utterances"][0]["words"][0]["s"] == 1
+    original = (session.root / "asr_raw.json").read_bytes()
+    transcript = pipe.diarize(session)
+    assert (session.root / "asr_raw.json").read_bytes() == original
+    assert [u["text"] for u in transcript["utterances"]] == ["远端发言", "本地发言", "另一位发言"]
+    assert [u["start"] for u in transcript["utterances"]] == [0.5, 1, 2.1]
+    assert [u["speaker"] for u in transcript["utterances"]] == [
+        "说话人A",
+        "我",
+        "说话人A" if fallback else "说话人B",
+    ]
+    assert "utterances" not in transcript["microphone"]
+    assert "**我**" in session.transcript_md.read_text(encoding="utf-8")
+    minutes, _ = pipe.summarize(session, llm=MockLLM())
+    assert minutes.is_file()
+
+    pipe.cfg["asr"] = {"provider": "dashscope"}
+    with pytest.raises(ValueError, match="双轨会话需要本地"):
+        pipe.transcribe(session)
 
 
 @pytest.mark.parametrize("failure", ["audio", "model", "alignment"])

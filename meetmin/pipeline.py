@@ -5,11 +5,14 @@ from __future__ import annotations
 import datetime as dt
 import os
 import time
+import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 from .asr.base import ASRResult, Utterance
 from .audio.dsp import audio_duration, to_mono_16k
+from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
+from .audio.session_recorder import SessionRecorder
 from .diarization.align import assign_speakers, relabel
 from .session import Session, new_session_id
 from .summarizer.llm_client import BaseLLM, Usage, get_llm
@@ -46,26 +49,41 @@ class Pipeline:
         raise RuntimeError("无法生成唯一会话目录")
 
     # ---------------- (1) 录音 ----------------
-    def recorder(self) -> "LoopbackRecorderLike":
-        from .audio.loopback_recorder import LoopbackRecorder
+    @overload
+    def recorder(self, *, for_session: Literal[False] = False) -> LoopbackRecorder: ...
 
+    @overload
+    def recorder(self, *, for_session: Literal[True]) -> SessionRecorder: ...
+
+    def recorder(self, *, for_session: bool = False) -> LoopbackRecorder | SessionRecorder:
         rcfg = self.cfg.get("recorder", {})
-        return LoopbackRecorder(
+        options: dict[str, Any] = {
+            "chunk_ms": int(rcfg.get("chunk_ms", 100)),
+            "silence_threshold": float(rcfg.get("silence_threshold", 0.003)),
+            "segment_seconds": float(rcfg.get("segment_seconds", 300)),
+            "sync_seconds": float(rcfg.get("sync_seconds", 10)),
+        }
+        loopback = LoopbackRecorder(
             device=rcfg.get("device"),
             channels=rcfg.get("channels"),
             sample_rate=rcfg.get("sample_rate"),
-            chunk_ms=int(rcfg.get("chunk_ms", 100)),
-            silence_threshold=float(rcfg.get("silence_threshold", 0.003)),
-            segment_seconds=float(rcfg.get("segment_seconds", 300)),
-            sync_seconds=float(rcfg.get("sync_seconds", 10)),
+            **options,
         )
+        if not for_session:
+            return loopback
+        mic = None
+        if rcfg.get("microphone", False):
+            mic = MicrophoneRecorder(device=rcfg.get("microphone_device"), **options)
+        return SessionRecorder(loopback, mic)
 
     # ---------------- (2) 转写 + 说话人分离 ----------------
     def transcribe(
         self, session: Session, *, audio_path: str | Path | None = None, file_url: str | None = None
     ) -> dict:
-        audio = Path(audio_path) if audio_path else session.audio_path
-        if not Path(audio).exists() and not file_url:
+        audio, microphone = (Path(audio_path), None) if audio_path else session.recording_paths()
+        if microphone is not None and self.cfg.get("asr", {}).get("provider") == "dashscope":
+            raise ValueError("双轨会话需要本地 faster-whisper 分别转写两轨")
+        if not audio.exists() and not file_url:
             raise FileNotFoundError(f"找不到音频：{audio}（请先 record，或用 --audio 指定文件）")
 
         self.progress(f"[2a] 转写：{audio}")
@@ -75,31 +93,39 @@ class Pipeline:
         provider = get_asr(self.cfg)
         # 本地 ASR 传解码后的 16k 数组；云端（需 URL）传 None 由 provider 处理
         local_like = provider.name == "faster_whisper"
-        audio16k = to_mono_16k(audio) if local_like else None
 
         def on_seg(pos: float, total: float) -> None:
             self.progress(
                 f"  … {ts(pos)}/{ts(total)}（{pos / max(total, 1):.0%}）", throttle_sec=5.0
             )
 
-        result: ASRResult = provider.transcribe(
-            audio16k,
-            file_path=str(audio),
-            file_url=file_url,
-            progress_cb=on_seg if local_like else None,
-        )
+        def transcribe_track(path: Path, url: str | None = None) -> tuple[ASRResult, float]:
+            if microphone is not None:
+                with wave.open(str(path), "rb") as wav:
+                    if not wav.getnframes():
+                        return ASRResult(), 0.0
+            samples = to_mono_16k(path) if local_like else None
+            result = provider.transcribe(
+                samples,
+                file_path=str(path),
+                file_url=url,
+                progress_cb=on_seg if local_like else None,
+            )
+            if result.audio_16k is not None:
+                samples, result.audio_16k = result.audio_16k, None
+            if samples is not None and len(samples):
+                duration = len(samples) / 16000
+            elif utterances := [u for u in result.utterances if u.text.strip()]:
+                duration = utterances[-1].end
+            else:
+                duration = audio_duration(path) if path.exists() else 0.0
+            return result, duration
+
+        result, duration = transcribe_track(audio, file_url)
         utterances = [u for u in result.utterances if u.text.strip()]
         self.progress(f"  {provider.name} 完成：{len(utterances)} 句，耗时 {time.time() - t0:.0f}s")
-        audio16k = result.audio_16k if result.audio_16k is not None else audio16k
 
         provider_name = provider.name
-        del provider  # 在加载声纹模型前释放 Whisper
-        if audio16k is not None and len(audio16k):
-            duration = len(audio16k) / 16000.0
-        elif utterances:
-            duration = utterances[-1].end
-        else:
-            duration = audio_duration(audio) if audio.exists() else 0.0
 
         raw: dict[str, Any] = {
             "session_id": session.session_id,
@@ -121,7 +147,6 @@ class Pipeline:
             },
             "utterances": [u.to_dict() for u in utterances],
         }
-        # 在任何分离/对齐操作前保存原始词级数据。
         acfg = self.cfg.get("asr", {})
         keys = ("model_size", "language", "device", "compute_type", "beam_size", "word_timestamps")
         raw["asr"]["parameters"] = {k: acfg[k] for k in keys if k in acfg}
@@ -132,6 +157,22 @@ class Pipeline:
             raw["asr"]["parameters"] = {
                 k: dc[k] for k in ("model", "speaker_count", "language_hints") if k in dc
             }
+        if microphone is not None:
+            self.progress(f"[2a] 转写麦克风：{microphone}")
+            mic_result, mic_duration = transcribe_track(microphone)
+            mic_utterances = [u for u in mic_result.utterances if u.text.strip()]
+            for u in mic_utterances:
+                u.speaker = "我"
+            raw["microphone"] = {
+                "audio_path": str(microphone.resolve()),
+                "language": mic_result.language,
+                "asr": {k: v for k, v in mic_result.extra.items() if k != "duration"},
+                "utterances": [u.to_dict() for u in mic_utterances],
+            }
+            if not utterances and mic_result.language:
+                raw["language"] = mic_result.language
+            raw["duration"] = round(max(duration, mic_duration), 1)
+        # 在任何分离/对齐操作前保存原始词级数据。
         session.save_json("asr_raw.json", raw)
         self.progress(f"  ✓ 原始转写已保存：{session.root / 'asr_raw.json'}")
         return raw
@@ -168,6 +209,18 @@ class Pipeline:
                 u.speaker = "说话人A"
             speakers = ["说话人A"] if utterances else []
         transcript = {k: v for k, v in raw.items() if k != "schema_version"}
+        if microphone := raw.get("microphone"):
+            transcript["microphone"] = {k: v for k, v in microphone.items() if k != "utterances"}
+            mic_utterances = [
+                Utterance.from_dict(u) for u in microphone["utterances"] if u["text"].strip()
+            ]
+            for u in mic_utterances:
+                u.speaker = "我"
+            utterances.extend(mic_utterances)
+            utterances.sort(key=lambda u: (u.start, u.end))
+            speakers = list(
+                dict.fromkeys(u.speaker for u in utterances if isinstance(u.speaker, str))
+            )
         transcript["speakers"] = speakers
         transcript["diarization"] = dict(dcfg)
         if error is not None:
@@ -229,8 +282,11 @@ class Pipeline:
             "",
         ]
         status = transcript.get("diarization_status") or {}
+        if microphone := transcript.get("microphone"):
+            lines.insert(3, f"- 麦克风：`{microphone['audio_path']}`")
         if status.get("status") == "fallback":
-            lines.extend([f"> 说话人分离失败，已降级为单说话人：{status.get('error')}", ""])
+            track = "内录轨" if microphone else ""
+            lines.extend([f"> {track}说话人分离失败，已降级为单说话人：{status.get('error')}", ""])
         for u in transcript["utterances"]:
             t0, t1 = float(u.get("start", 0)), float(u.get("end", 0))
             lines.append(f"**{u.get('speaker', '?')}** `[{ts(t0)}-{ts(t1)}]`")
@@ -319,6 +375,3 @@ class Pipeline:
         self.diarize(session)
         self.summarize(session)
         return session
-
-
-LoopbackRecorderLike = Any  # 协议占位：start/stop/is_recording
