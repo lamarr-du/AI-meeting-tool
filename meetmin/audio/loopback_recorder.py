@@ -10,13 +10,14 @@ import math
 import queue
 import threading
 import time
-import wave
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any
 
 import numpy as np
+
+from .segments import SegmentedWriter, merge_segments
 
 
 def _import_pyaudio():
@@ -121,6 +122,8 @@ class LoopbackRecorder:
         queue_seconds: float = 5.0,
         stop_timeout: float = 5.0,
         clock: Callable[[], float] | None = None,
+        segment_seconds: float = 300,
+        sync_seconds: float = 10,
     ):
         self.device = device
         self.channels = channels
@@ -134,6 +137,8 @@ class LoopbackRecorder:
         if not math.isfinite(stop_timeout) or stop_timeout <= 0:
             raise ValueError("stop_timeout 必须是正数")
         self._clock = clock
+        self._segment_seconds = segment_seconds
+        self._sync_seconds = sync_seconds
         self._queue_size = max(1, math.ceil(queue_seconds * 1000 / self.chunk_ms))
         self._stop_timeout = stop_timeout
         self._level_lock = threading.Lock()
@@ -158,8 +163,9 @@ class LoopbackRecorder:
         self._error: Exception | None = None
         self._pa: Any = None
         self._stream: Any = None
-        self._wf: wave.Wave_write | None = None
-        self._audio_file: BinaryIO | None = None
+        self._wf: SegmentedWriter | None = None
+        self._audio_file: SegmentedWriter | None = None
+        self._sealed_writer: SegmentedWriter | None = None
         self._chunk_frames = 0
         self.device_name = ""
         self.sample_rate_actual = 0
@@ -247,11 +253,15 @@ class LoopbackRecorder:
             path = self.path
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            self._audio_file = path.open("wb" if overwrite else "xb")
-            self._wf = wave.open(self._audio_file, "wb")
-            self._wf.setnchannels(ch)
-            self._wf.setsampwidth(2)
-            self._wf.setframerate(sr)
+            self._wf = SegmentedWriter(
+                path,
+                sr,
+                ch,
+                overwrite=overwrite,
+                segment_seconds=self._segment_seconds,
+                sync_seconds=self._sync_seconds,
+            )
+            self._audio_file = self._wf
 
             self._chunk_frames = max(16, int(sr * self.chunk_ms / 1000))
             self.device_name = str(info["name"])
@@ -331,6 +341,8 @@ class LoopbackRecorder:
                 try:
                     block = self._queue.get(timeout=0.05)
                 except queue.Empty:
+                    assert self._wf is not None
+                    self._wf.checkpoint()
                     continue
                 # Hold the last block so stop() can trim samples past the stop boundary.
                 if pending is not None:
@@ -375,20 +387,16 @@ class LoopbackRecorder:
     def _close_audio(self) -> None:
         # Called by the writer, or by start() only if no writer was ever started.
         closed = True
-        if self._wf is not None:
+        writer = self._wf
+        if writer is not None:
             try:
-                self._wf.close()
+                writer.close()
             except Exception as error:
                 closed = False
                 self._fail(error)
-            self._wf = None
-        if self._audio_file is not None:
-            try:
-                self._audio_file.close()
-            except Exception as error:
-                closed = False
-                self._fail(error)
-            self._audio_file = None
+            self._sealed_writer = writer
+        self._wf = None
+        self._audio_file = None
         self._finalized = closed
 
     def _update_level(self, data: bytes, *, record_arrival: bool = True) -> None:
@@ -482,6 +490,20 @@ class LoopbackRecorder:
         elif self._wf is not None or self._audio_file is not None:
             self._close_audio()
         self._thread = None
+        if self._sealed_writer is not None:
+            writer = self._sealed_writer
+            try:
+                if not self._failed.is_set():
+                    merge_segments(writer.directory, writer.path, overwrite=writer.overwrite)
+            except Exception as error:
+                self._finalized = False
+                self._fail(error)
+            finally:
+                try:
+                    writer.release()
+                except Exception as error:
+                    self._fail(error)
+                self._sealed_writer = None
         if self._pa is not None:
             try:
                 self._pa.terminate()

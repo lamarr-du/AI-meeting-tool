@@ -55,6 +55,8 @@ class Pipeline:
             sample_rate=rcfg.get("sample_rate"),
             chunk_ms=int(rcfg.get("chunk_ms", 100)),
             silence_threshold=float(rcfg.get("silence_threshold", 0.003)),
+            segment_seconds=float(rcfg.get("segment_seconds", 300)),
+            sync_seconds=float(rcfg.get("sync_seconds", 10)),
         )
 
     # ---------------- (2) 转写 + 说话人分离 ----------------

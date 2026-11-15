@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from meetmin.audio.loopback_recorder import RecordingError, list_loopback_devices
+from meetmin.audio.segments import SessionLock, merge_segments
 from meetmin.config import load_config
 from meetmin.pipeline import Pipeline
 from meetmin.session import Session, clean_session_name
@@ -178,6 +179,7 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
                 info = error.info
                 print(f"\n录音失败：{error}")
                 print(f"文件：{info.get('path')}；已写时长 {ts(info.get('duration_sec', 0))}")
+                print(f"录音分段已保留；清理结束后可运行 meetmin recover -n {session.session_id}")
                 if info.get("cleanup_pending"):
                     print("资源尚未清理完毕，文件可能仍在写入；不能启动下一次录音。")
                 elif not info.get("finalized"):
@@ -239,6 +241,47 @@ def cmd_record(args, cfg) -> None:
     session = _record_session(pipe, cfg, args)
     _do_record(pipe, session, args)
     print(f"\n下一步：meetmin transcribe --session {session.session_id}")
+
+
+def cmd_recover(args, cfg) -> None:
+    name = args.session
+    if clean_session_name(name) != name:
+        sys.exit("请提供完整有效的会话 ID")
+    session = Session(cfg["output_dir"], name)
+    if not session.root.is_dir() or session.root.is_symlink():
+        sys.exit(f"会话不存在：{name}")
+    try:
+        lock = SessionLock(session.root)
+        try:
+            if args.take:
+                if not args.take.startswith("audio_parts-") or Path(args.take).name != args.take:
+                    raise ValueError("无效的分段目录名")
+                directories = [session.root / args.take]
+            else:
+                directories = sorted(
+                    p
+                    for p in session.root.glob("audio_parts-*")
+                    if p.is_dir() and not p.is_symlink()
+                )
+            if len(directories) != 1:
+                raise ValueError(
+                    "需要指定唯一分段目录，请使用 --take；可用目录："
+                    + ", ".join(p.name for p in directories)
+                )
+            directory = directories[0]
+            if directory.is_symlink() or not directory.is_dir():
+                raise ValueError("分段目录不存在或不安全")
+            output = Path(args.output) if args.output else session.audio_path
+            info = merge_segments(directory, output)
+        finally:
+            lock.close()
+    except (OSError, ValueError, RuntimeError) as error:
+        sys.exit(f"恢复失败：{error}；原始分段未删除")
+    print(f"恢复完成：{output}，时长 {ts(info['duration_sec'])}，{info['parts']} 个分段。")
+    if info["partial"]:
+        print("已根据文件长度恢复未完成分段；异常退出前未写入的尾部音频或无数据区间可能缺失。")
+    if info["discarded_bytes"]:
+        print(f"已忽略尾部不足一帧的 {info['discarded_bytes']} 字节。")
 
 
 def cmd_transcribe(args, cfg) -> None:
@@ -345,6 +388,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-seconds", type=float, default=None, help="最长录音秒数（调试用）")
     sp.add_argument("--overwrite", action="store_true", help="覆盖 -n 指定的完整现有会话 ID 的录音")
     sp.set_defaults(fn=cmd_record)
+
+    sp = sub.add_parser("recover", help="从分段恢复异常中断的录音")
+    sp.add_argument("--session", "-n", required=True, help="完整会话 ID")
+    sp.add_argument("--take", default=None, help="存在多次录音时指定 audio_parts-* 目录")
+    sp.add_argument("--output", default=None, help="恢复到指定的新文件（不得覆盖已有文件）")
+    sp.set_defaults(fn=cmd_recover)
 
     sp = sub.add_parser("transcribe", help="步骤2a：转写并保存原始词级时间戳")
     sp.add_argument("--session", "-n", default=None)

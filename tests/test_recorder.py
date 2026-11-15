@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from meetmin.audio.loopback_recorder import LoopbackRecorder, RecordingError
+from meetmin.audio.segments import merge_segments
 
 
 class Clock:
@@ -121,6 +122,13 @@ def read_audio(path):
         return np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
 
 
+def recover_failed(path):
+    directories = list(path.parent.glob("audio_parts-*"))
+    assert len(directories) == 1
+    merge_segments(directories[0], path)
+    return read_audio(path)
+
+
 def test_leading_middle_trailing_silence_and_timestamps(recording):
     r = recording
     r.rec.start(r.path)
@@ -158,6 +166,21 @@ def test_all_silence_stop_is_idempotent_and_instance_reusable(recording):
         assert not np.any(read_audio(path))
         assert not r.rec.is_recording
     assert all(p.terminated for p in r.instances)
+
+
+def test_one_hour_timeline_crosses_segments(recording):
+    r = recording
+    r.rec.start(r.path)
+    r.streams[-1].emit(0, value=1234)
+    r.streams[-1].emit(0.1, value=1234)
+    r.clock.value = 3610
+    info = r.rec.stop()
+    assert info["duration_sec"] == 3600
+    data = read_audio(r.path)
+    assert len(data) == 3600000
+    assert np.all(data[:200] == 1234)
+    assert not np.any(data[200:])
+    assert len(list(next(r.path.parent.glob("audio_parts-*")).glob("*.wav"))) == 12
 
 
 def test_stop_trims_pending_block(recording):
@@ -209,7 +232,7 @@ def test_queue_full_reports_error_and_drains_accepted_audio(recording, monkeypat
     with pytest.raises(RecordingError, match="队列已满") as error:
         r.rec.stop()
     assert error.value.info["finalized"]
-    assert len(read_audio(r.path)) == 200
+    assert len(recover_failed(r.path)) == 200
 
 
 def test_writer_timeout_never_closes_its_file(recording, monkeypatch):
@@ -251,6 +274,26 @@ def test_write_failure_preserves_original_error_and_closes_file(recording, monke
     assert closed.closed
     assert r.streams[-1].closed
     assert r.instances[-1].terminated
+
+
+def test_merge_failure_keeps_previous_recording_and_new_segments(recording, monkeypatch):
+    r = recording
+    r.path.write_bytes(b"old recording")
+    r.rec.start(r.path, overwrite=True)
+    r.streams[-1].emit(0)
+    r.clock.value = 10.2
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full while merging")
+
+    monkeypatch.setattr("meetmin.audio.loopback_recorder.merge_segments", fail)
+    with pytest.raises(RecordingError, match="disk full"):
+        r.rec.stop()
+    assert r.path.read_bytes() == b"old recording"
+    directory = next(r.path.parent.glob("audio_parts-*"))
+    restored = r.path.with_name("recovered.wav")
+    merge_segments(directory, restored)
+    assert len(read_audio(restored)) == 200
 
 
 def test_stream_stopped_unexpectedly(recording):
@@ -327,7 +370,7 @@ def test_broken_timestamps_do_not_silently_drop_or_pad_audio(recording, position
     r.streams[-1].emit(position, received=10.2)
     with pytest.raises(RecordingError, match="时间戳|时钟|重叠"):
         r.rec.stop()
-    assert len(read_audio(r.path)) <= 200
+    assert len(recover_failed(r.path)) <= 200
 
 
 def test_jitter_does_not_add_gaps(recording):

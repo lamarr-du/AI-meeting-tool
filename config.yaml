@@ -7,6 +7,8 @@ recorder:
   channels: null
   sample_rate: null
   silence_threshold: 0.003  # 归一化 RMS；低于此值连续 30 秒告警
+  segment_seconds: 300      # 分段长度（秒）
+  sync_seconds: 10          # 活动分段同步磁盘的间隔（秒）
 
 asr:
   provider: faster_whisper   # faster_whisper（本地离线，零 token）| dashscope（云端 Paraformer，自带分离）
