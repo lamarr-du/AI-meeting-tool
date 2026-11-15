@@ -190,21 +190,19 @@ Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装
 
 ## CPU / GPU 与模型缓存
 
-默认 `asr.model_size: small`、`asr.device: auto`、`asr.compute_type: int8`。CPU 是完整处理路径；ECAPA 始终运行在 CPU，Whisper 在转写完成后释放，云端纪要模型不占本地显存。转写使用普通 `WhisperModel.transcribe`，未启用 Whisper 批量推理。
+默认 `asr.profile: auto`，`model_size` 和 `compute_type` 为 `null` 时由档位决定。`meetmin doctor --no-record` 会用同一套逻辑显示所选档位和模型缓存情况。
 
-`auto` 只选择设备，不会自动更换模型大小。第一张 NVIDIA GPU 的运行库可加载且空闲显存达到以下保守预算时，选择 CUDA；否则选择 CPU：
+| 档位 | 默认模型 / 计算类型 | 何时选择 |
+|---|---|---|
+| `cpu_light` | `small` / int8 | 自动分配时，总内存不足 15 GiB、可用内存不足 6 GiB，或内存探测不可用 |
+| `cpu_standard` | `large-v3-turbo` / int8 | 自动分配时总内存至少 15 GiB 且可用内存至少 6 GiB |
+| `gpu_standard` | `large-v3-turbo` / int8_float16 | CUDA 运行库可加载，已配置目标机器上同一模型和解码配置的 `cuda_peak_mib` 实测峰值，峰值最多 3072 MiB，且当前空闲显存至少比峰值多 256 MiB |
 
-| 模型 | 自动选择 CUDA 的空闲显存下限 |
-|---|---:|
-| `tiny` / `base` | 2048 MiB |
-| `small` | 3072 MiB |
-| `medium` | 5120 MiB |
-| `large-v3-turbo` | 6144 MiB |
-| `large-v3` | 8192 MiB |
+可用 `profile: cpu_light` 固定省内存的 CPU 档，或用 `profile: cpu_standard` 固定精度优先的 CPU 档。显式模型、设备和计算类型覆盖档位默认值。显式 `device: cuda` 直接使用 CUDA，由使用者负责显存预算；自动档使用已测峰值作选档依据，运行时占用仍会随配置、录音和其他进程变化。
 
-这些是源码中的选择阈值，不代表实测占用或显存保证。未知模型名、本地模型目录等不在预算表中，`auto` 会选择 CPU。自动选择 CUDA 时，配置中的 `int8` 会改用 `int8_float16`；其他计算类型保留。想固定使用 CPU，可设置 `device: cpu`、`compute_type: int8`。16 GB 内存机器可尝试 `large-v3-turbo` + CPU int8，处理速度需要按机器实测。
+CUDA 加载或主转写遇到显存不足时释放原模型并回退 CPU int8。显式指定模型时沿用该模型，自动搭配模型时按内存选择 CPU 回退模型。输出记录实际模型、设备、精度和回退状态。单轨或双轨转写结束后释放 Whisper，ECAPA 分离在 CPU 上执行。
 
-CUDA 加载或推理过程中识别到显存不足错误时，会回退 CPU int8，推理失败时从头重试该次转写。其他错误（例如运行库缺失、模型下载失败或不支持的计算类型）仍会报错。显式 `device: cuda` 不经过自动预算选择；Windows CUDA 路径需要可加载的 CUDA 12 cuBLAS 和 cuDNN 9 运行库。
+Windows 的当前 CUDA 路径需要可加载的 CUDA 12 cuBLAS 和 cuDNN 9 库，预检会列出缺失项。[faster-whisper 安装说明](https://github.com/SYSTRAN/faster-whisper#gpu)
 
 Whisper 默认使用 Hugging Face 缓存（通常在 `~/.cache/huggingface/hub`，也受 `HF_HOME` / `HF_HUB_CACHE` 影响）。可把 `asr.model_size` 指向已下载的 CTranslate2 模型目录。`asr.hf_endpoint` 用于配置下载端点，默认设置 `HF_HUB_DISABLE_XET=1`；已有相关环境变量优先，不会被配置强行覆盖。
 
@@ -255,8 +253,9 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `recorder.silence_threshold` | `0.003`，连续低电平告警阈值，允许 0–1 |
 | `recorder.segment_seconds` / `recorder.sync_seconds` | `300` / `10`，分段时长与磁盘同步间隔，单位为秒 |
 | `asr.provider` | `faster_whisper`；也可用 `dashscope` |
-| `asr.model_size` / `language` | `small` / `zh`；语言填 `null` 自动检测 |
-| `asr.device` / `compute_type` | `auto` / `int8`，选择和回退行为见上文 |
+| `asr.profile` / `asr.cuda_peak_mib` | `auto` / `null`，见 CPU / GPU 档位说明 |
+| `asr.model_size` / `language` | `null` 跟随档位 / `zh`，语言填 `null` 自动检测 |
+| `asr.device` / `compute_type` | `auto` / `null`，默认 CPU int8、CUDA int8_float16 |
 | `asr.beam_size` / `word_timestamps` | `1` / `true` |
 | `asr.condition_on_previous_text` | `false`；关闭前文条件以减少重复和幻觉，设为 `true` 可恢复原行为，实际值记录在 `asr_raw.json` |
 | `asr.quality` | 默认 `mode: detect`，连续有声缺口至少 1.5 秒，压缩比阈值 2.4，重试模式每轨最多 6 次 |

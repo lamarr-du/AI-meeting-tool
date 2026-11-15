@@ -10,6 +10,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .asr.profile import memory_status, select_profile
+
 
 def gpu_status():
     try:
@@ -50,11 +52,8 @@ def _model_cached(model):
     if path.is_dir():
         return (path / "model.bin").is_file()
     repo = {
-        "tiny": "tiny",
-        "base": "base",
-        "small": "small",
-        "medium": "medium",
-        "large-v3-turbo": "large-v3-turbo",
+        "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+        "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
     }.get(str(model), str(model))
     repo = repo if "/" in repo else "Systran/faster-whisper-" + repo
     root = Path(
@@ -103,11 +102,27 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
             if importlib.util.find_spec(mod) is None:
                 print(f"  错误：缺少 {mod}；请安装 requirements.txt")
                 ok = False
-        model = asr.get("model_size", "small")
-        print(
-            f"  Whisper {model}：{'缓存中发现模型文件' if _model_cached(model) else '未检测到缓存，请提前下载或配置本地模型目录'}"
-        )
         gpu = gpu_status()
+        memory = memory_status()
+        if memory:
+            print(f"  内存：可用 {memory[1] / 1024:.1f} GiB / 总计 {memory[0] / 1024:.1f} GiB")
+        try:
+            profile = select_profile(asr, memory=memory, gpu=gpu)
+        except ValueError as error:
+            print(f"  错误：{error}")
+            ok = False
+        else:
+            model = profile.model
+            print(
+                f"  转写档位：{profile.selected} · {model} / {profile.device} / {profile.compute_type}（{profile.reason}）"
+            )
+            print(
+                f"  Whisper {model}：{'缓存中发现模型文件' if _model_cached(model) else '未检测到缓存，请提前下载或配置本地模型目录'}"
+            )
+            if profile.device == "cuda" and profile.cpu_fallback_model != model:
+                fallback = profile.cpu_fallback_model
+                if not _model_cached(fallback):
+                    print(f"  CPU 回退模型 {fallback} 未检测到缓存，请提前准备。")
         if gpu:
             name, free, total, missing = gpu
             print(f"  GPU：{name}，空闲 {free} MiB / 总计 {total} MiB")
@@ -123,7 +138,6 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
                 )
         else:
             print("  未检测到 NVIDIA GPU；CPU int8 可用（速度取决于机器和模型）。")
-        print("  建议：16 GB 内存可尝试 large-v3-turbo int8；GPU 显存需求随音频和配置变化。")
     elif asr_provider == "dashscope":
         dc = cfg.get("dashscope_asr", {}) or {}
         if not (file_url or dc.get("file_url")):

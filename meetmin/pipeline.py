@@ -130,11 +130,20 @@ class Pipeline:
                 duration = audio_duration(path) if path.exists() else 0.0
             return result, duration
 
-        result, duration = transcribe_track(audio, file_url)
-        utterances = [u for u in result.utterances if u.text.strip()]
-        self.progress(f"  {provider.name} 完成：{len(utterances)} 句，耗时 {time.time() - t0:.0f}s")
-
         provider_name = provider.name
+        try:
+            result, duration = transcribe_track(audio, file_url)
+            utterances = [u for u in result.utterances if u.text.strip()]
+            self.progress(
+                f"  {provider_name} 完成：{len(utterances)} 句，耗时 {time.time() - t0:.0f}s"
+            )
+            if microphone is not None:
+                self.progress(f"[2a] 转写麦克风：{microphone}")
+                mic_result, mic_duration = transcribe_track(microphone)
+        finally:
+            close = getattr(provider, "close", None)
+            if close is not None:
+                close()
 
         raw: dict[str, Any] = {
             "session_id": session.session_id,
@@ -157,7 +166,16 @@ class Pipeline:
             "utterances": [u.to_dict() for u in utterances],
         }
         acfg = self.cfg.get("asr", {})
-        keys = ("model_size", "language", "device", "compute_type", "beam_size", "word_timestamps")
+        keys = (
+            "profile",
+            "model_size",
+            "language",
+            "device",
+            "compute_type",
+            "cuda_peak_mib",
+            "beam_size",
+            "word_timestamps",
+        )
         raw["asr"]["parameters"] = {k: acfg[k] for k in keys if k in acfg}
         if provider_name == "faster_whisper":
             raw["asr"]["parameters"].update(result.extra.get("parameters", {}))
@@ -167,8 +185,6 @@ class Pipeline:
                 k: dc[k] for k in ("model", "speaker_count", "language_hints") if k in dc
             }
         if microphone is not None:
-            self.progress(f"[2a] 转写麦克风：{microphone}")
-            mic_result, mic_duration = transcribe_track(microphone)
             mic_utterances = [u for u in mic_result.utterances if u.text.strip()]
             for u in mic_utterances:
                 u.speaker = "我"

@@ -145,7 +145,7 @@ def test_whisper_gpu_oom_retries_cpu():
         patch.dict(sys.modules, {"faster_whisper": module}),
         patch("meetmin.doctor.gpu_status", return_value=("GPU", 8192, 8192, [])),
     ):
-        asr = FasterWhisperASR({"device": "auto", "model_size": "small"})
+        asr = FasterWhisperASR({"device": "auto", "model_size": "small", "cuda_peak_mib": 2400})
         assert asr.transcribe(np.zeros(16000, dtype=np.float32)).utterances == []
     assert calls == [("cuda", "int8_float16"), ("cpu", "int8")]
 

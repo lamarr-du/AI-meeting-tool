@@ -15,9 +15,11 @@ recorder:
 asr:
   provider: faster_whisper   # faster_whisper（本地离线，零 token）| dashscope（云端 Paraformer，自带分离）
   language: zh               # null = 自动检测语种
-  model_size: small          # 电脑弱用 tiny/base；追求精度用 medium / large-v3-turbo（首次运行自动下载）
+  profile: auto              # auto / cpu_light / cpu_standard / gpu_standard
+  model_size: null           # null 由档位选择，也可指定模型名或本地模型目录
   device: auto               # auto / cpu / cuda
-  compute_type: int8
+  compute_type: null         # null 跟随设备，CPU int8 / CUDA int8_float16
+  cuda_peak_mib: null        # 当前模型、计算类型及配置在目标 GPU 上的实测峰值
   beam_size: 1
   condition_on_previous_text: false  # 关闭前文条件；设为 true 恢复以前的行为
   no_repeat_ngram_size: 0    # 全局禁重复 token n-gram，0 关闭

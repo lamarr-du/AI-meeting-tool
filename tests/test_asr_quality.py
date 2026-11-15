@@ -48,8 +48,8 @@ def test_local_retry_uses_audio_slice_and_records_original_words(tmp_path, monke
     asr = object.__new__(FasterWhisperASR)
     asr.acfg = {"quality": {"mode": "retry"}, "condition_on_previous_text": True}
     asr._device, asr._compute = "cpu", "int8"
-    asr.model = Mock()
-    asr.model.transcribe.side_effect = [
+    model = asr.model = Mock()
+    model.transcribe.side_effect = [
         (
             [
                 _segment(0, 1, "今天开始测试"),
@@ -70,7 +70,8 @@ def test_local_retry_uses_audio_slice_and_records_original_words(tmp_path, monke
     waveform = np.repeat(np.arange(6, dtype=np.float32) / 8, TARGET_SR)
     save_wav_mono(session.audio_path, waveform, TARGET_SR)
     raw = pipeline.transcribe(session)
-    calls = asr.model.transcribe.call_args_list
+    calls = model.transcribe.call_args_list
+    assert not hasattr(asr, "model")
     assert [len(call.args[0]) for call in calls] == [6 * TARGET_SR, TARGET_SR, 2 * TARGET_SR]
     assert calls[0].kwargs["condition_on_previous_text"] is True
     assert calls[1].kwargs["condition_on_previous_text"] is False

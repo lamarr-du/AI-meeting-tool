@@ -23,9 +23,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "asr": {
         "provider": "faster_whisper",  # faster_whisper（本地，零 token）| dashscope（云端 Paraformer）
         "language": "zh",  # null=自动检测
-        "model_size": "small",  # tiny/base/small/medium/large-v3/large-v3-turbo
+        "profile": "auto",
+        "model_size": None,  # null 由档位选择；也可指定本地模型目录
+        "cuda_peak_mib": None,  # 当前模型和计算类型在目标 GPU 上的实测峰值
         "device": "auto",  # auto/cpu/cuda
-        "compute_type": "int8",  # int8 最省资源；有 GPU 可用 float16
+        "compute_type": None,  # 跟随设备，CPU int8、CUDA int8_float16
         "beam_size": 1,  # 1=贪心解码，速度优先
         "condition_on_previous_text": False,  # 关闭前文条件，减少重复和幻觉
         "no_repeat_ngram_size": 0,

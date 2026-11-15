@@ -16,6 +16,7 @@ import numpy as np
 
 from ..audio.dsp import TARGET_SR
 from .base import ASRProvider, ASRResult, Utterance
+from .profile import memory_status, select_profile
 from .quality import Decoded, QualityOptions, Span, review
 
 _VAD_PARAMETERS = {"min_silence_duration_ms": 400}
@@ -88,39 +89,33 @@ class FasterWhisperASR(ASRProvider):
         except ImportError as e:  # pragma: no cover
             raise RuntimeError("缺少依赖 faster-whisper，请先: pip install faster-whisper") from e
         self.acfg = acfg
-        size = acfg.get("model_size", "small")
         self._model_class = WhisperModel
-        self._size = size
-        self._device = acfg.get("device", "auto")
-        self._compute = acfg.get("compute_type", "int8")
-        if self._device == "auto":
-            from ..doctor import gpu_status
+        from ..doctor import gpu_status
 
-            gpu = gpu_status()
-            # 保守预算；未知模型一律走 CPU。保留显式 compute_type。
-            budget = {
-                "tiny": 2048,
-                "base": 2048,
-                "small": 3072,
-                "medium": 5120,
-                "large-v3-turbo": 6144,
-                "large-v3": 8192,
-            }.get(str(size))
-            self._device = "cuda" if gpu and not gpu[3] and budget and gpu[1] >= budget else "cpu"
-            if self._device == "cuda" and self._compute == "int8":
-                self._compute = "int8_float16"
+        self._profile = select_profile(
+            acfg,
+            memory=memory_status(),
+            gpu=gpu_status() if acfg.get("device", "auto") == "auto" else None,
+        )
+        self._size = self._profile.model
+        self._device = self._profile.device
+        self._compute = self._profile.compute_type
+        self._used_fallback = False
         try:
             try:
-                self.model = WhisperModel(size, device=self._device, compute_type=self._compute)
+                self.model = WhisperModel(
+                    self._size, device=self._device, compute_type=self._compute
+                )
             except Exception as e:
                 if self._device != "cuda" or not self._is_oom(e):
                     raise
-                logging.getLogger("meetmin").warning("GPU 显存不足，回退 CPU int8：%s", e)
-                self._device, self._compute = "cpu", "int8"
-                self.model = WhisperModel(size, device="cpu", compute_type="int8")
+                reason = str(e)
+            else:
+                return
+            self._fallback_to_cpu(reason)
         except Exception as e:
             raise RuntimeError(
-                f"加载/下载 whisper 模型失败（{size}）：{e}\n"
+                f"加载/下载 whisper 模型失败（{self._size}）：{e}\n"
                 "  · 首次运行需联网下载权重；国内网络可在 config.yaml 设 asr.hf_endpoint: https://hf-mirror.com\n"
                 "  · 已默认关闭 Hugging Face Xet 下载；如需启用可设 asr.hf_disable_xet: false\n"
                 "  · 或先手动下载模型，把 asr.model_size 指向本地模型目录"
@@ -131,17 +126,27 @@ class FasterWhisperASR(ASRProvider):
         message = str(error).lower()
         return "out of memory" in message or "cuda_error_out_of_memory" in message
 
+    def close(self) -> None:
+        if hasattr(self, "model"):
+            del self.model
+
+    def _fallback_to_cpu(self, reason: str) -> None:
+        logging.getLogger("meetmin").warning("GPU 显存不足，回退 CPU int8：%s", reason)
+        self.close()
+        self._size = self._profile.cpu_fallback_model
+        self._device, self._compute = "cpu", "int8"
+        self._used_fallback = True
+        self.model = self._model_class(self._size, device="cpu", compute_type="int8")
+
     def transcribe(self, audio, *, file_path=None, progress_cb=None, **kwargs):
         try:
             return self._transcribe(audio, file_path=file_path, progress_cb=progress_cb, **kwargs)
         except Exception as e:
             if self._device != "cuda" or not self._is_oom(e):
                 raise
-            logging.getLogger("meetmin").warning("GPU 显存不足，回退 CPU int8 重试：%s", e)
-            del self.model
-            self._device, self._compute = "cpu", "int8"
-            self.model = self._model_class(self._size, device="cpu", compute_type="int8")
-            return self._transcribe(audio, file_path=file_path, progress_cb=progress_cb, **kwargs)
+            reason = str(e)
+        self._fallback_to_cpu(reason)
+        return self._transcribe(audio, file_path=file_path, progress_cb=progress_cb, **kwargs)
 
     def _transcribe(
         self,
@@ -230,7 +235,12 @@ class FasterWhisperASR(ASRProvider):
             language=detected_language,
             audio_16k=audio,
             extra={
-                "asr_model": self.acfg.get("model_size", "small"),
+                "asr_model": getattr(self, "_size", None) or self.acfg.get("model_size") or "small",
+                **(
+                    {"profile": asdict(self._profile), "cuda_oom_fallback": self._used_fallback}
+                    if hasattr(self, "_profile")
+                    else {}
+                ),
                 "effective_device": self._device,
                 "effective_compute_type": self._compute,
                 "quality": quality_report,
