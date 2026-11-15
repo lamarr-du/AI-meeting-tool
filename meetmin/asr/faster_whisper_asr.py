@@ -10,11 +10,13 @@ import math
 import os
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from ..audio.dsp import TARGET_SR
+from ..glossary import glossary_hotwords, load_terms, select_terms
 from .base import ASRProvider, ASRResult, Utterance
 from .profile import memory_status, select_profile
 from .quality import Decoded, QualityOptions, Span, review
@@ -138,6 +140,38 @@ class FasterWhisperASR(ASRProvider):
         self._used_fallback = True
         self.model = self._model_class(self._size, device="cpu", compute_type="int8")
 
+    def _apply_glossary(
+        self, hotwords: str | None, language: str | None
+    ) -> tuple[str | None, dict]:
+        config = self.acfg.get("glossary", {})
+        if not isinstance(config, dict):
+            raise ValueError("asr.glossary 必须是映射")
+        path = config.get("path")
+        if path is None:
+            return hotwords, {}
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("asr.glossary.path 必须是非空路径或 null")
+        priority = config.get("terms")
+        if priority is not None and (
+            not isinstance(priority, list) or any(not isinstance(name, str) for name in priority)
+        ):
+            raise ValueError("asr.glossary.terms 必须是字符串列表或 null")
+        max_terms = config.get("max_terms", 20)
+        if type(max_terms) is not int or max_terms <= 0:
+            raise ValueError("asr.glossary.max_terms 必须是正整数")
+        source = Path(path).expanduser()
+        terms = select_terms(load_terms(source), priority)
+        tokenizer = self.model.hf_tokenizer
+        hotwords, selected = glossary_hotwords(
+            terms,
+            existing=hotwords,
+            language=language,
+            token_count=lambda text: len(tokenizer.encode(text, add_special_tokens=False).ids),
+            token_limit=self.model.max_length // 2 - 1,
+            max_terms=max_terms,
+        )
+        return hotwords, {"path": str(source.resolve()), "terms": selected}
+
     def transcribe(self, audio, *, file_path=None, progress_cb=None, **kwargs):
         try:
             return self._transcribe(audio, file_path=file_path, progress_cb=progress_cb, **kwargs)
@@ -176,6 +210,7 @@ class FasterWhisperASR(ASRProvider):
         effective_hotwords = (
             " ".join(prompt.strip() for prompt in prompts if prompt and prompt.strip()) or None
         )
+        effective_hotwords, glossary = self._apply_glossary(effective_hotwords, language)
         words_enabled = bool(self.acfg.get("word_timestamps", True))
         decode_guards = _decode_guards(self.acfg, words_enabled)
         quality_options = QualityOptions.from_config(self.acfg.get("quality", {}))
@@ -247,6 +282,7 @@ class FasterWhisperASR(ASRProvider):
                 "parameters": {
                     "condition_on_previous_text": condition_on_previous_text,
                     "hotwords": effective_hotwords,
+                    **({"glossary": glossary} if glossary else {}),
                     **decode_guards,
                     "quality": asdict(quality_options),
                 },

@@ -32,6 +32,10 @@ asr:
     max_retries: 6           # 每条音轨的局部重试次数上限
   punctuation_prompt: null   # language 为 zh 时可选填，例如 "好的，我们继续。"
   hotwords: null             # 可填少量已确认的术语，和标点提示合并传给 faster-whisper
+  glossary:
+    path: null              # 填 glossary.yaml 启用，相对本配置文件
+    terms: null             # 可填标准写法列表，按提供的顺序优先发送
+    max_terms: 20
   word_timestamps: true      # 说话人分离对齐需要
   hf_endpoint: null          # 国内下不动模型时改: https://hf-mirror.com
   hf_disable_xet: true       # 规避 Xet 重建服务 401；需要 Xet 时设 false

@@ -36,6 +36,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "quality": {},  # 默认值由本地 Whisper 的 QualityOptions 提供
         "punctuation_prompt": None,
         "hotwords": None,
+        "glossary": {"path": None, "terms": None, "max_terms": 20},
         "word_timestamps": True,  # 词级时间戳（供说话人分离对齐，建议保留）
         "hf_endpoint": None,  # 国内可设 https://hf-mirror.com 下载模型
         "hf_disable_xet": True,  # 避免部分网络环境访问 Xet 重建服务时出现 401
@@ -103,4 +104,12 @@ def load_config(path: str | Path | None = None) -> dict:
         if not isinstance(user, dict):
             raise ValueError(f"配置文件格式错误（应为 YAML 映射）: {p}")
         cfg = deep_merge(cfg, user)
+    asr = cfg.get("asr")
+    glossary = asr.get("glossary") if isinstance(asr, dict) else None
+    if (
+        isinstance(glossary, dict)
+        and isinstance(glossary.get("path"), str)
+        and glossary["path"].strip()
+    ):
+        glossary["path"] = str(p.resolve().parent / Path(glossary["path"]).expanduser())
     return cfg
