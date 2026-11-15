@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from math import isclose
 
 from ..asr.base import Utterance
 from ..textutil import smart_join
 
 UNKNOWN = -999
+UNKNOWN_NAME = "未知"
+_MAX_NEAREST_GAP_SEC = 0.75
 
 
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
@@ -32,6 +35,22 @@ def majority_label(start: float, end: float, segments: list[dict]):
     return max(score.items(), key=lambda kv: kv[1])[0]
 
 
+def _nearest_label(start: float, end: float, segments: list[dict]) -> str | int:
+    distance = _MAX_NEAREST_GAP_SEC
+    nearest: set[str | int] = set()
+    for segment in segments:
+        label = segment["label"]
+        if label in (None, UNKNOWN, UNKNOWN_NAME, "说话人?"):
+            continue
+        gap = max(segment["start"] - end, start - segment["end"], 0.0)
+        if isclose(gap, distance, rel_tol=0, abs_tol=1e-6):
+            nearest.add(label)
+        elif gap < distance:
+            distance = gap
+            nearest = {label}
+    return next(iter(nearest)) if len(nearest) == 1 else UNKNOWN
+
+
 def _word_span(w: dict, u: Utterance) -> tuple[float, float]:
     s = float(w.get("s", u.start))
     e = float(w.get("e", w.get("s", u.end)))
@@ -54,9 +73,11 @@ def assign_speakers(
             out.append(replace(u, speaker=UNKNOWN))
             continue
         base = majority_label(u.start, u.end, segments)
+        if base is None:
+            base = _nearest_label(u.start, u.end, segments)
 
         if not u.words or len(u.words) < 2:
-            out.append(replace(u, speaker=base if base is not None else UNKNOWN))
+            out.append(replace(u, speaker=base))
             continue
 
         # 逐词取说话人，落在两段之间的空隙词沿用句级多数
@@ -126,7 +147,10 @@ def relabel(utterances: list[Utterance]) -> list[str]:
         return "说话人" + (chr(ord("A") + i) if i < 26 else str(i + 1))
 
     for u in utterances:
-        key = u.speaker if u.speaker is not None else UNKNOWN
+        key = u.speaker
+        if key in (None, UNKNOWN, UNKNOWN_NAME, "说话人?"):
+            u.speaker = UNKNOWN_NAME
+            continue
         if key not in mapping:
             mapping[key] = name_for(len(speakers))
             speakers.append(mapping[key])

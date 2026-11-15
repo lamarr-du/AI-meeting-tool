@@ -14,7 +14,7 @@ from .asr.punctuation import punctuate_chinese
 from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
 from .audio.session_recorder import SessionRecorder
-from .diarization.align import assign_speakers, relabel
+from .diarization.align import UNKNOWN_NAME, assign_speakers, relabel
 from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
 from .summarizer.llm_client import BaseLLM, Usage, get_llm
@@ -250,7 +250,11 @@ class Pipeline:
             utterances.extend(mic_utterances)
             utterances.sort(key=lambda u: (u.start, u.end))
             speakers = list(
-                dict.fromkeys(u.speaker for u in utterances if isinstance(u.speaker, str))
+                dict.fromkeys(
+                    u.speaker
+                    for u in utterances
+                    if isinstance(u.speaker, str) and u.speaker != UNKNOWN_NAME
+                )
             )
         transcript["speakers"] = speakers
         transcript["diarization"] = dict(dcfg)
@@ -286,8 +290,8 @@ class Pipeline:
         if audio16k is None:
             self.progress("  ! 未获得本地音频波形，跳过说话人分离")
             for u in utterances:
-                u.speaker = "说话人?"
-            return ["说话人?"]
+                u.speaker = UNKNOWN_NAME
+            return []
         self.progress("[2b] 说话人分离中…")
         from .diarization import get_diarizer
 

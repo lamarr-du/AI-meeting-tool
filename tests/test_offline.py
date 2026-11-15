@@ -844,6 +844,27 @@ def test_relabel_order_of_appearance():
     assert us[2].speaker == "说话人A" and speakers == ["说话人A", "说话人B"]
 
 
+def test_align_nearby_speaker_and_exclude_tied_or_distant_unknowns():
+    segments = [{"start": 1, "end": 2, "label": 1}, {"start": 3, "end": 4, "label": 2}]
+    original = [
+        Utterance(0, 0.5, "近第一位"),
+        Utterance(2.4, 2.6, "两侧等距"),
+        Utterance(3.05, 3.5, "直接覆盖第二位"),
+        Utterance(8, 9, "距离太远"),
+    ]
+    assigned = assign_speakers(original, segments)
+    assert relabel(assigned) == ["说话人A", "说话人B"]
+    assert [u.speaker for u in assigned] == ["说话人A", "未知", "说话人B", "未知"]
+    assert [u.text for u in assigned] == [u.text for u in original]
+    assert all(u.speaker is None for u in original)
+
+
+def test_no_diarization_segments_do_not_create_speakers():
+    assigned = assign_speakers([Utterance(0, 1, "未知的发言")], [])
+    assert relabel(assigned) == []
+    assert assigned[0].speaker == "未知"
+
+
 # ---------------- minutes（省 token 编排）----------------
 def test_render_merge_saves_lines():
     us = [
