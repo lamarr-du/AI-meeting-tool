@@ -57,7 +57,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "temperature": 0.3,
         "max_output_tokens": 2000,
         "timeout_sec": 120,
-        "retries": 3,
+        "retries": 3,  # 最大请求次数（含首次请求）
         "extra_request": {},  # 透传给接口的额外字段，如 DashScope 关闭思考：{"enable_thinking": false}
     },
     "summarizer": {

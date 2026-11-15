@@ -49,7 +49,7 @@ llm:
   temperature: 0.3
   max_output_tokens: 2000
   timeout_sec: 120
-  retries: 3
+  retries: 3                         # 最大请求次数（含首次请求）
   extra_request: {}                # 例如 DashScope 思考模型可设 {enable_thinking: false} 省输出 token
 
 summarizer:

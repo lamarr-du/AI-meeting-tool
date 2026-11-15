@@ -238,6 +238,7 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `llm.base_url` / `model` | DashScope 兼容端点 / `qwen-3.8-flash`，应按实际服务修改 |
 | `llm.api_key_env` | `DASHSCOPE_API_KEY`，从环境变量读取密钥 |
 | `llm.provider` | `openai_compatible`；设 `mock` 可离线联调纪要，不代表关闭本地模型下载 |
+| `llm.retries` | `3`，最大请求次数（含首次）；超时、连接错误、429 和 5xx 才重试。429 优先遵循 `Retry-After`；服务要求等待超过 300 秒时提示稍后重试 |
 | `llm.extra_request` | `{}`，透传请求字段，例如 `{"enable_thinking": false}`，是否支持由服务决定 |
 | `summarizer.strategy` | `auto`，按长度选择 `direct` 或 `map_reduce` |
 
