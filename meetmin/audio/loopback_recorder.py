@@ -6,13 +6,18 @@
 
 from __future__ import annotations
 
+import math
+import queue
 import threading
 import time
-import wave
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any
 
 import numpy as np
+
+from .segments import SegmentedWriter, merge_segments
 
 
 def _import_pyaudio():
@@ -44,8 +49,67 @@ def list_loopback_devices() -> list[dict]:
     return out
 
 
+class RecordingError(RuntimeError):
+    """录音失败；info 包含已写时长、文件位置和清理结果。"""
+
+    def __init__(self, message: str, info: dict):
+        super().__init__(message)
+        self.info = info
+
+
+@dataclass(frozen=True)
+class _AudioBlock:
+    data: bytes
+    frames: int
+    timing: dict
+    received_at: float
+
+
+class _Timeline:
+    """只在写线程使用；采集时间决定位置，消费队列的时间不参与计算。"""
+
+    def __init__(self, rate: int, chunk_frames: int, start: float, stream_origin: float | None):
+        self.rate = rate
+        self.start = start
+        self.stream_origin = stream_origin
+        self.mode = "pending"
+        self.previous_adc: float | None = None
+        self.tolerance = max(round(rate * 0.02), chunk_frames // 2)
+
+    def position(self, block: _AudioBlock, cursor: int) -> int:
+        adc = block.timing.get("input_buffer_adc_time", 0.0)
+        current = block.timing.get("current_time", 0.0)
+        valid = (
+            isinstance(adc, (int, float))
+            and isinstance(current, (int, float))
+            and math.isfinite(adc)
+            and math.isfinite(current)
+            and 0 < adc <= current
+        )
+        if self.mode == "pending":
+            self.mode = "device" if valid and self.stream_origin is not None else "arrival"
+        if self.mode == "device":
+            if not valid or (self.previous_adc is not None and adc <= self.previous_adc):
+                raise RuntimeError("音频采集时间戳无效或倒退，无法可靠定位音频")
+            assert self.stream_origin is not None
+            seconds = adc - self.stream_origin
+            # Reject a clock reset / bogus timestamp before it can generate a huge zero-filled file.
+            if seconds > block.received_at - self.start + 0.5 or seconds < -0.5:
+                raise RuntimeError("音频采集时钟与录音时钟不一致")
+            self.previous_adc = adc
+        else:
+            # Arrival timing is approximate: scheduler delays are indistinguishable from gaps.
+            seconds = block.received_at - self.start - block.frames / self.rate
+        target = max(0, round(seconds * self.rate))
+        delta = target - cursor
+        if delta < -self.tolerance:
+            raise RuntimeError("音频块严重重叠或迟到，无法可靠保持时间轴")
+        # WASAPI timestamps have jitter; contiguous blocks must not acquire tiny gaps each time.
+        return target if delta > self.tolerance or cursor == 0 else cursor
+
+
 class LoopbackRecorder:
-    """后台线程持续把 loopback 输入写入 WAV（int16）。"""
+    """回调采集、有界队列、单写线程；start/stop 由控制线程顺序调用。"""
 
     def __init__(
         self,
@@ -54,6 +118,12 @@ class LoopbackRecorder:
         sample_rate: int | None = None,
         chunk_ms: int = 100,
         silence_threshold: float = 0.003,
+        *,
+        queue_seconds: float = 5.0,
+        stop_timeout: float = 5.0,
+        clock: Callable[[], float] | None = None,
+        segment_seconds: float = 300,
+        sync_seconds: float = 10,
     ):
         self.device = device
         self.channels = channels
@@ -62,25 +132,65 @@ class LoopbackRecorder:
         self.silence_threshold = float(silence_threshold)
         if not 0 <= self.silence_threshold <= 1:
             raise ValueError("silence_threshold 必须在 0 到 1 之间")
+        if not math.isfinite(queue_seconds) or queue_seconds <= 0:
+            raise ValueError("queue_seconds 必须是正数")
+        if not math.isfinite(stop_timeout) or stop_timeout <= 0:
+            raise ValueError("stop_timeout 必须是正数")
+        self._clock = clock
+        self._segment_seconds = segment_seconds
+        self._sync_seconds = sync_seconds
+        self._queue_size = max(1, math.ceil(queue_seconds * 1000 / self.chunk_ms))
+        self._stop_timeout = stop_timeout
         self._level_lock = threading.Lock()
         self._frames = 0
         self._silent_frames = 0
         self._active_frames = 0
         self._level = 0.0
         self._last_data_time: float | None = None
-        self._stop = threading.Event()
+        self._producer_done = threading.Event()
+        self._failed = threading.Event()
+        self._errors: queue.SimpleQueue[Exception] = queue.SimpleQueue()
+        self._queue: queue.Queue[_AudioBlock] = queue.Queue(self._queue_size)
+        self._state = "IDLE"
+        self._started_at = 0.0
+        self._stop_at: float | None = None
+        self._timeline: _Timeline | None = None
+        self._padded_frames = 0
+        self._received_frames = 0
+        self._finalized = False
+        self._secondary_errors: list[str] = []
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
         self._pa: Any = None
         self._stream: Any = None
-        self._wf: wave.Wave_write | None = None
-        self._audio_file: BinaryIO | None = None
-        self._chunks = 0
+        self._wf: SegmentedWriter | None = None
+        self._audio_file: SegmentedWriter | None = None
+        self._sealed_writer: SegmentedWriter | None = None
         self._chunk_frames = 0
         self.device_name = ""
         self.sample_rate_actual = 0
         self.channels_actual = 0
         self.path: Path | None = None
+
+    def _now(self) -> float:
+        return self._clock() if self._clock is not None else time.monotonic()
+
+    def _fail(self, error: Exception) -> None:
+        # SimpleQueue has no bounded-capacity wait. Keep exceptions inside the callback,
+        # rather than letting PyAudio inject them asynchronously into the main thread.
+        self._errors.put(error)
+        self._failed.set()
+
+    def _collect_errors(self) -> None:
+        while True:
+            try:
+                error = self._errors.get_nowait()
+            except queue.Empty:
+                break
+            if self._error is None:
+                self._error = error
+            else:
+                self._secondary_errors.append(str(error))
 
     # ---------------- 设备解析 ----------------
     def _resolve_device(self, pa):
@@ -113,24 +223,52 @@ class LoopbackRecorder:
 
     # ---------------- 生命周期 ----------------
     def start(self, wav_path: str | Path, *, overwrite: bool = False) -> None:
-        if self._thread is not None:
-            raise RuntimeError("录音已在进行中")
-        pyaudio = _import_pyaudio()
-        self._pa = pyaudio.PyAudio()
+        if self._thread is not None or self._stream is not None or self._pa is not None:
+            raise RuntimeError("录音正在进行或上次清理尚未完成")
+        self._state = "STARTING"
+        self._producer_done.clear()
+        self._failed.clear()
+        self._errors = queue.SimpleQueue()
+        self._queue = queue.Queue(self._queue_size)
+        self._error = None
+        self._secondary_errors = []
+        self._stop_at = None
+        self._timeline = None
+        self._finalized = False
+        self._received_frames = 0
+        self._padded_frames = 0
+        with self._level_lock:
+            self._frames = self._silent_frames = self._active_frames = 0
+            self._level = 0.0
+            self._last_data_time = None
+        self.path = Path(wav_path)
+        self.device_name = ""
+        self.sample_rate_actual = self.channels_actual = 0
         try:
+            pyaudio = _import_pyaudio()
+            self._pa = pyaudio.PyAudio()
             info = self._resolve_device(self._pa)
             sr = int(self.sample_rate or info["defaultSampleRate"])
             ch = int(self.channels or max(1, min(2, int(info["maxInputChannels"]))))
-            path = Path(wav_path)
+            path = self.path
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            self._audio_file = path.open("wb" if overwrite else "xb")
-            self._wf = wave.open(self._audio_file, "wb")
-            self._wf.setnchannels(ch)
-            self._wf.setsampwidth(2)
-            self._wf.setframerate(sr)
+            self._wf = SegmentedWriter(
+                path,
+                sr,
+                ch,
+                overwrite=overwrite,
+                segment_seconds=self._segment_seconds,
+                sync_seconds=self._sync_seconds,
+            )
+            self._audio_file = self._wf
 
             self._chunk_frames = max(16, int(sr * self.chunk_ms / 1000))
+            self.device_name = str(info["name"])
+            self.sample_rate_actual = sr
+            self.channels_actual = ch
+            self._pa_continue = pyaudio.paContinue
+            self._pa_abort = pyaudio.paAbort
             self._stream = self._pa.open(
                 format=pyaudio.paInt16,
                 channels=ch,
@@ -138,47 +276,138 @@ class LoopbackRecorder:
                 input=True,
                 input_device_index=int(info["index"]),
                 frames_per_buffer=self._chunk_frames,
+                stream_callback=self._callback,
+                start=False,
             )
-            self.device_name = str(info["name"])
-            self.sample_rate_actual = sr
-            self.channels_actual = ch
-            self.path = path
-            self._chunks = 0
-            self._error = None
-            self._stop.clear()
-            with self._level_lock:
-                self._last_data_time = time.monotonic()
-            self._thread = threading.Thread(target=self._run, daemon=True, name="loopback-rec")
+            # Pa_GetStreamTime and monotonic have different epochs on Windows.
+            before = self._now()
+            offset: float | None
+            try:
+                stream_time = float(self._stream.get_time())
+                offset = stream_time - (before + self._now()) / 2
+                if not math.isfinite(stream_time) or stream_time <= 0:
+                    offset = None
+            except (OSError, ValueError):
+                offset = None
+            self._started_at = self._now()
+            self._last_data_time = self._started_at
+            self._timeline = _Timeline(
+                sr,
+                self._chunk_frames,
+                self._started_at,
+                self._started_at + offset if offset is not None else None,
+            )
+            self._thread = threading.Thread(target=self._run, daemon=True, name="loopback-writer")
             self._thread.start()
-        except Exception:
-            self._cleanup()
+            self._stream.start_stream()
+            self._state = "RECORDING"
+        except Exception as error:
+            self._fail(error)
+            self._state = "FAILED"
+            self._stop_at = self._now()
+            complete = self._shutdown()
+            self._collect_errors()
+            if not complete or self._secondary_errors:
+                raise RecordingError(str(self._error), self._info()) from error
             raise
 
-    def _run(self) -> None:
+    def _callback(self, data, frame_count, time_info, status_flags):
+        if self._failed.is_set():
+            return None, self._pa_abort
         try:
-            assert self._wf is not None
-            while not self._stop.is_set():
-                data = self._stream.read(self._chunk_frames, exception_on_overflow=False)
-                self._wf.writeframes(data)
-                self._chunks += 1
-                self._update_level(data)
-        except Exception as e:  # 记录错误，由 stop() 抛出
-            self._error = e
-        finally:
-            try:
-                if self._wf is not None:
-                    self._wf.close()
-            except Exception:
-                pass
+            if status_flags:
+                raise RuntimeError(f"音频采集异常（PortAudio flags={status_flags}），可能丢帧")
+            if frame_count:
+                if not 0 < frame_count <= self._chunk_frames:
+                    raise RuntimeError("音频回调帧数超过配置的缓冲区大小")
+                if data is None or len(data) != frame_count * self.channels_actual * 2:
+                    raise RuntimeError("音频回调数据长度与帧数不符")
+                received = self._now()
+                self._queue.put_nowait(_AudioBlock(data, frame_count, time_info, received))
+                self._last_data_time = received
+                self._received_frames += frame_count
+        except queue.Full:
+            self._fail(RuntimeError("录音队列已满，写盘速度不足；已停止采集以避免静默丢帧"))
+            return None, self._pa_abort
+        except Exception as error:
+            self._fail(error)
+            return None, self._pa_abort
+        return None, self._pa_continue
 
-    def _update_level(self, data: bytes) -> None:
+    def _run(self) -> None:
+        pending: _AudioBlock | None = None
+        try:
+            while not self._producer_done.is_set() or not self._queue.empty():
+                try:
+                    block = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    assert self._wf is not None
+                    self._wf.checkpoint()
+                    continue
+                # Hold the last block so stop() can trim samples past the stop boundary.
+                if pending is not None:
+                    self._write_block(pending)
+                pending = block
+            if pending is not None:
+                self._write_block(pending)
+            if not self._failed.is_set():
+                self._pad_to(self._stop_frame())
+        except Exception as error:
+            self._fail(error)
+        finally:
+            self._close_audio()
+
+    def _stop_frame(self) -> int:
+        assert self._stop_at is not None
+        return max(0, round((self._stop_at - self._started_at) * self.sample_rate_actual))
+
+    def _pad_to(self, target: int) -> None:
+        assert self._wf is not None
+        while self._frames < target:
+            frames = min(target - self._frames, self.sample_rate_actual)
+            self._wf.writeframesraw(bytes(frames * self.channels_actual * 2))
+            with self._level_lock:
+                self._frames += frames
+                self._padded_frames += frames
+
+    def _write_block(self, block: _AudioBlock) -> None:
+        assert self._timeline is not None and self._wf is not None
+        position = self._timeline.position(block, self._frames)
+        frames = block.frames
+        if self._stop_at is not None:
+            end = self._stop_frame()
+            position = min(position, end)
+            frames = min(frames, max(0, end - position))
+        self._pad_to(position)
+        data = block.data[: frames * self.channels_actual * 2]
+        if data:
+            self._wf.writeframesraw(data)
+            self._update_level(data, record_arrival=False)
+
+    def _close_audio(self) -> None:
+        # Called by the writer, or by start() only if no writer was ever started.
+        closed = True
+        writer = self._wf
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception as error:
+                closed = False
+                self._fail(error)
+            self._sealed_writer = writer
+        self._wf = None
+        self._audio_file = None
+        self._finalized = closed
+
+    def _update_level(self, data: bytes, *, record_arrival: bool = True) -> None:
         samples = np.frombuffer(data, dtype="<i2").astype(np.float64)
         frames = len(samples) // self.channels_actual
         if not frames:
             return
         level = float(np.sqrt(np.mean((samples / 32768.0) ** 2)))
         with self._level_lock:
-            self._last_data_time = time.monotonic()
+            if record_arrival:
+                self._last_data_time = self._now()
             self._level = level
             self._frames += frames
             if level < self.silence_threshold:
@@ -188,65 +417,111 @@ class LoopbackRecorder:
                 self._active_frames += frames
 
     def status(self) -> dict:
+        if self._state == "RECORDING" and not self._failed.is_set():
+            try:
+                if not self._stream.is_active():
+                    self._fail(RuntimeError("录音流意外停止"))
+                elif self._thread is None or not self._thread.is_alive():
+                    self._fail(RuntimeError("录音写线程意外退出"))
+            except Exception as error:
+                self._fail(error)
+        self._collect_errors()
         with self._level_lock:
             sr = self.sample_rate_actual or 1
+            now = self._stop_at if self._stop_at is not None else self._now()
             return {
                 "duration_sec": self._frames / sr,
                 "level": self._level,
-                "no_data_sec": max(0.0, time.monotonic() - self._last_data_time)
+                "no_data_sec": max(0.0, now - self._last_data_time)
                 if self._last_data_time is not None
                 else 0.0,
                 "silent_sec": self._silent_frames / sr,
                 "active_fraction": self._active_frames / self._frames if self._frames else 0.0,
-                "failed": self._error is not None,
+                "failed": self._failed.is_set(),
+                "state": "FAILED" if self._failed.is_set() else self._state,
+                "error": str(self._error) if self._error is not None else None,
+                "cleanup_errors": list(self._secondary_errors),
+                "received_sec": self._received_frames / sr,
+                "padded_sec": self._padded_frames / sr,
+                "timing_mode": self._timeline.mode if self._timeline is not None else "pending",
+                "finalized": self._finalized,
+                "cleanup_pending": self._thread is not None
+                or self._stream is not None
+                or self._pa is not None,
             }
 
     def stop(self) -> dict:
-        if self._thread is None:
+        if self._state == "IDLE":
             raise RuntimeError("未在录音")
-        self._stop.set()
-        self._thread.join(timeout=5)
-        stats = self.status()
-        info = self._cleanup()
-        info.update(stats)
+        # Detect a stream that died just before the user requested stop, even if no
+        # status polling occurred since the last successful callback.
+        if self._state == "RECORDING":
+            self.status()
+        if self._stop_at is None:
+            self._stop_at = self._now()
+        self._state = "STOPPING"
+        complete = self._shutdown()
+        self._state = "STOPPED" if complete and not self._failed.is_set() else "FAILED"
+        info = self._info()
         if self._error is not None:
-            raise self._error
+            raise RecordingError(str(self._error), info) from self._error
         return info
 
-    def _cleanup(self) -> dict:
-        duration = 0.0
+    def _shutdown(self) -> bool:
         if self._stream is not None:
             try:
                 self._stream.stop_stream()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-        if self._wf is not None:
+            except Exception as error:
+                self._fail(error)
             try:
-                self._wf.close()
-            except Exception:
-                pass
-            self._wf = None
-        if self._audio_file is not None:
-            self._audio_file.close()
-            self._audio_file = None
+                # Closing is the barrier after which callbacks can no longer enqueue data.
+                self._stream.close()
+            except Exception as error:
+                self._fail(error)
+                # Keep resources alive for a later cleanup attempt.
+                return False
+            self._stream = None
+        self._producer_done.set()
+        if self._thread is not None and self._thread.ident is not None:
+            self._thread.join(timeout=self._stop_timeout)
+            if self._thread.is_alive():
+                self._fail(RuntimeError("等待录音写线程退出超时；文件仍由该线程持有，禁止复用"))
+                return False
+        elif self._wf is not None or self._audio_file is not None:
+            self._close_audio()
+        self._thread = None
+        if self._sealed_writer is not None:
+            writer = self._sealed_writer
+            try:
+                if not self._failed.is_set():
+                    merge_segments(writer.directory, writer.path, overwrite=writer.overwrite)
+            except Exception as error:
+                self._finalized = False
+                self._fail(error)
+            finally:
+                try:
+                    writer.release()
+                except Exception as error:
+                    self._fail(error)
+                self._sealed_writer = None
         if self._pa is not None:
             try:
                 self._pa.terminate()
-            except Exception:
-                pass
+            except Exception as error:
+                self._fail(error)
+                return False
             self._pa = None
-        if self.sample_rate_actual and self._chunk_frames:
-            duration = self._chunks * self._chunk_frames / self.sample_rate_actual
+        return True
+
+    def _info(self) -> dict:
         return {
             "path": str(self.path) if self.path else None,
-            "duration_sec": round(duration, 1),
             "sample_rate": self.sample_rate_actual,
             "channels": self.channels_actual,
             "device": self.device_name,
+            **self.status(),
         }
 
     @property
     def is_recording(self) -> bool:
-        return self._thread is not None and not self._stop.is_set()
+        return self._state == "RECORDING" and not self.status()["failed"]

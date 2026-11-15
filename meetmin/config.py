@@ -15,6 +15,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "channels": None,  # null=跟随设备（最多取 2）
         "sample_rate": None,  # null=跟随设备默认采样率
         "chunk_ms": 100,  # 每次读取的块长（毫秒）
+        "segment_seconds": 300,  # 单个录音分段时长
+        "sync_seconds": 10,  # 活动分段的磁盘同步间隔
     },
     "asr": {
         "provider": "faster_whisper",  # faster_whisper（本地，零 token）| dashscope（云端 Paraformer）
