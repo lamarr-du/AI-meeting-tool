@@ -6,6 +6,8 @@ recorder:
   device: null        # 内录设备索引或名称片段；null = 默认输出设备的 loopback（python main.py devices 查看）
   channels: null
   sample_rate: null
+  microphone: false   # true = 同时录麦克风；临时启用可加 --mic
+  microphone_device: null  # null = 默认 WASAPI 输入，也可填 devices 列出的麦克风索引
   silence_threshold: 0.003  # 归一化 RMS；低于此值连续 30 秒告警
   segment_seconds: 300      # 分段长度（秒）
   sync_seconds: 10          # 活动分段同步磁盘的间隔（秒）
@@ -18,6 +20,8 @@ asr:
   compute_type: int8
   beam_size: 1
   condition_on_previous_text: false  # 关闭前文条件；设为 true 恢复以前的行为
+  punctuation_prompt: null   # language 为 zh 时可选填，例如 "好的，我们继续。"
+  hotwords: null             # 可填少量已确认的术语，和标点提示合并传给 faster-whisper
   word_timestamps: true      # 说话人分离对齐需要
   hf_endpoint: null          # 国内下不动模型时改: https://hf-mirror.com
   hf_disable_xet: true       # 规避 Xet 重建服务 401；需要 Xet 时设 false

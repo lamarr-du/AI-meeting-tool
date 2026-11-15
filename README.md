@@ -2,7 +2,7 @@
 
 命令行流程：**录音 → 转写 → 说话人分离/对齐 → AI 纪要**。
 
-- **录音**：Windows WASAPI loopback 录制电脑输出，保存为 `audio.wav`。macOS 和 Linux 可使用已有音频，内录仅支持 Windows。
+- **录音**：Windows WASAPI 录制电脑输出，保存为 `audio.wav`。加 `--mic` 可同时录制麦克风，另存 `microphone.wav`。macOS 和 Linux 可使用已有音频。
 - **转写**：默认使用本地 faster-whisper，完成后先保存 `asr_raw.json`，保留可用的词级时间戳、模型信息和转写参数。
 - **分离**：可选 SpeechBrain ECAPA 声纹聚类，生成精简的 `transcript.json` 和可读的 `transcript.md`；可从原始转写独立重跑。
 - **纪要**：通过 OpenAI 兼容的 `/chat/completions` 调用大模型，生成 `minutes.md`。默认配置指向 DashScope，示例模型名为 `qwen-3.8-flash`，使用前须改成账户实际可用的模型。
@@ -87,14 +87,14 @@ meetmin run --audio "recordings/meeting.m4a" -n review
 
 | 命令 | 作用与主要参数 |
 |---|---|
-| `doctor` | 预检；`--no-record` 跳过设备检查，云端 ASR 可传 `--file-url` |
-| `devices` | 列出 Windows loopback 设备及索引 |
-| `record` | 新建会话并录音；`-n` 名称前缀、`--device` 索引、`--max-seconds` 最长秒数 |
-| `recover` | 从录音分段恢复；`-n` 必须是完整会话 ID，可用 `--take` 选择某次录音、`--output` 指定新文件 |
+| `doctor` | 预检；`--mic` 同时检查麦克风，`--no-record` 跳过设备检查，云端 ASR 可传 `--file-url` |
+| `devices` | 列出 Windows 内录、麦克风设备及索引 |
+| `record` | 新建会话并录音；`-n` 名称前缀、`--device` 内录索引、`--mic` 双轨、`--mic-device` 麦克风索引、`--max-seconds` 最长秒数 |
+| `recover` | 从录音分段恢复；`-n` 必须是完整会话 ID，可用 `--take` 选择某次录音，`--output` 指定新文件（单轨）或新目录（双轨） |
 | `transcribe` | 保存原始转写；`-n` 会话 ID/前缀、`--audio` 本地音频、`--file-url` 云端音频 URL |
 | `diarize` | 从 `asr_raw.json` 重跑分离/对齐；必须提供 `-n` 会话 ID/前缀 |
 | `summarize` | 从 `transcript.json` 生成纪要；`--export-web` 导出网页版提示词，`--import-web` 导入网页版结果 |
-| `run` | 自动完成全部流程；支持 `-n`、`--audio`、`--file-url`、`--device`、`--max-seconds` |
+| `run` | 自动完成全部流程；支持 `record` 的录音选项，也可用 `--audio` 处理已有音频 |
 
 每次普通 `record -n weekly` 或 `run -n weekly` 都新建目录，形如 `data/sessions/weekly-20261113-090000123456-ab12/`。名称作为前缀，非法字符和连续的点会被替换，前缀最长 100 个字符；日期时间由运行机器的本地时钟生成。未提供名称时使用时间戳和随机后缀。
 
@@ -102,7 +102,7 @@ meetmin run --audio "recordings/meeting.m4a" -n review
 
 - `transcribe` 未找到会话时，只有提供 `--audio` 才会新建；仅传 `--file-url` 不会创建会话。
 - `diarize` 不会新建会话，且必须已有 `asr_raw.json`。
-- `summarize` 省略 `-n` 时，按目录修改时间选择含 `audio.wav` 或 `transcript.json` 的最近会话，再检查其中是否有转写结果；不会继续寻找更早的可用转写。
+- `summarize` 省略 `-n` 时，按目录修改时间选择含 `audio.wav`、`recording.json` 或 `transcript.json` 的最近会话，再检查其中是否有转写结果。
 - `run --audio` 新建会话并引用外部音频，不会把它复制为会话内的 `audio.wav`。
 
 录音默认拒绝覆盖已有文件。确需重新录制时，必须指定完整现有会话 ID 和 `--overwrite`：
@@ -112,6 +112,24 @@ meetmin record -n weekly-20261113-090000123456-ab12 --overwrite
 ```
 
 `run` 也支持相同用法；`--overwrite` 不能与 `--audio` 同用。覆盖录音不会删除旧转写、嵌入缓存或纪要，后续应重新执行转写、分离和纪要。`transcribe`、`diarize`、普通 API 模式的 `summarize` 在同一会话重跑时会替换各自的输出，不需要 `--overwrite`；网页版导出和导入默认不覆盖。
+
+## 同时录制麦克风与电脑声音
+
+```powershell
+meetmin devices
+meetmin doctor --mic
+meetmin record --mic -n weekly
+meetmin transcribe -n weekly
+meetmin diarize -n weekly
+# 或由一条命令完成录音、转写、分离和纪要
+meetmin run --mic -n weekly
+```
+
+`--mic` 使用默认 WASAPI 麦克风。`--mic-device <索引>` 会启用双轨并选择指定输入，也可在配置中设置 `recorder.microphone: true` 和 `recorder.microphone_device`。`--no-mic` 可临时切回仅内录。
+
+双轨共享录音起止时间，分别补齐采集缺口并保存原始 WAV。本地 faster-whisper 分别转写两轨，`diarize` 对内录分配说话人、把麦克风发言标为“我”，最后按起始时间合并，两边同时说话时会保留双方的发言。双轨会话的自动转写使用本地 faster-whisper。
+
+录音时建议佩戴耳机，并关闭 Windows 的麦克风“侦听此设备”。扬声器的声音可能被麦克风重复采集，转写时会出现重复发言或误标为“我”。自动串音抑制列在改进计划中。
 
 ## 使用 AI 网页生成纪要
 
@@ -147,6 +165,8 @@ meetmin recover -n weekly-20261113-090000123456-ab12
 ```
 
 如果有多次录音，命令会列出分段目录，用 `--take audio_parts-...` 选择；若 `audio.wav` 已存在，可用 `--output 路径` 恢复到另一个新文件。恢复不会覆盖现有文件，也不会删除分段。恢复时检查分段顺序和格式，并从最后一个未完成分段的文件长度修复 WAV；不完整的末尾帧会被丢弃并报告。录音或恢复正在进行时，同一会话不能同时恢复。
+
+双轨分段在同一个 `audio_parts-*` 批次下的 `loopback/` 和 `microphone/` 子目录。两轨都恢复后才发布会话录音，异常中断时两轨的尾部长度可能不同。已有录音时用 `--output <新目录>` 导出两份 WAV。清理时可删除已确认无需恢复的分段子目录，保留当前批次中的两个 WAV。
 
 同步只能尽量减少断电时的损失，无法保证存储设备上的数据一定持久化。写线程尚未处理的队列和最后一个待处理音频块可能丢失；长时间没有设备回调时，尚未写入的末尾无数据区间也可能缺失，恢复不会猜测补齐。恢复结果需要检查时长和内容。
 
@@ -196,8 +216,9 @@ ECAPA 模型按需加载到用户目录 `~/.cache/meetmin/speechbrain`，使用 
 
 | 文件 | 内容和生成时机 |
 |---|---|
-| `audio.wav` | Windows 内录的 16-bit PCM 音频；已有外部音频模式不会生成此副本 |
-| `asr_raw.json` | 转写完成后、分离前原子写入；包含原始句子、可用的词级时间戳、模型信息和转写参数 |
+| `audio.wav` | 单轨模式的 Windows 内录音频，格式为 16-bit PCM；外部音频模式沿用原文件 |
+| `recording.json` | 双轨模式的当前录音批次，指向同批次的 `audio.wav` 与 `microphone.wav`；切回单轨后使用会话根目录的 `audio.wav` |
+| `asr_raw.json` | 转写完成后、分离前原子写入；包含原始句子、可用的词级时间戳、模型信息和转写参数。双轨的麦克风转写保存在 `microphone.utterances` |
 | `embeddings.npz` | 本地 ECAPA 窗口嵌入，提取完成后、聚类前原子写入；单说话人和云端自带分离不生成新嵌入，短音频也可能不生成 |
 | `transcript.json` | 分离/对齐后的句级时间戳、文本和说话人，不含词级数据 |
 | `transcript.md` | 供人工查看的转写文本 |
@@ -217,11 +238,16 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 
 本地 ECAPA 重跑仍需要原始音频，外部音频请保留在记录的绝对路径。Whisper 保留 `asr.word_timestamps: true` 才会请求词级数据；当前 DashScope 实现只解析句级数据。旧会话没有 `asr_raw.json` 时，需重新转写一次才能独立分离；已有 `transcript.json` 仍可用于生成纪要。
 
+对于本地 Whisper 的中文转写，`diarize` 会统一中文上下文中的半角逗号，并在至少 0.8 秒的段间停顿或音轨结束处为以文字或数字收尾的片段补句号。双轨会话按各自的时间轴处理。可对已有的 `asr_raw.json` 直接重跑 `diarize` 应用标点整理，原始转写保留模型文本和词级时间戳。
+
+如需让模型直接输出更多标点，可在 `asr.language: zh` 时设置 `asr.punctuation_prompt: "好的，我们继续。"`，也可用 `asr.hotwords` 填写少量确认过的术语。两项内容会合并传给 Whisper 的 `hotwords`，实际使用值记录在 `asr_raw.json`。标点提示可能影响识别与词级时间戳，默认关闭。
+
 ## 配置要点
 
 | 配置 | 当前默认值与作用 |
 |---|---|
 | `recorder.device` | `null`，自动选择；配置中可填索引或名称片段，CLI `--device` 只接受整数索引 |
+| `recorder.microphone` / `recorder.microphone_device` | `false` / `null`，是否开启双轨及麦克风索引，`null` 使用默认 WASAPI 输入 |
 | `recorder.silence_threshold` | `0.003`，连续低电平告警阈值，允许 0–1 |
 | `recorder.segment_seconds` / `recorder.sync_seconds` | `300` / `10`，分段时长与磁盘同步间隔，单位为秒 |
 | `asr.provider` | `faster_whisper`；也可用 `dashscope` |
@@ -229,6 +255,7 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 | `asr.device` / `compute_type` | `auto` / `int8`，选择和回退行为见上文 |
 | `asr.beam_size` / `word_timestamps` | `1` / `true` |
 | `asr.condition_on_previous_text` | `false`；关闭前文条件以减少重复和幻觉，设为 `true` 可恢复原行为，实际值记录在 `asr_raw.json` |
+| `asr.punctuation_prompt` / `asr.hotwords` | 均为 `null`，可填带标点的中文示例和术语文本 |
 | `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
 | `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
 | `diarization.window_sec` / `hop_sec` | `1.5` / `0.75`，声纹窗口和步长 |
@@ -311,7 +338,7 @@ AI-meeting-tool/
 
 ## 已知限制
 
-- **本地麦克风**：loopback 只录电脑输出，默认不含你的麦克风声音。可在 Windows 开启麦克风“侦听此设备”让声音回到输出，但可能产生回声；会前应试录。当前没有麦克风与内录双轨功能。
+- **本地麦克风**：默认只录电脑输出，本人发言需用 `--mic` 录入。双轨外放时会受串音影响，建议会前用耳机试录。
 - **多人重叠发言**：窗口聚类并非重叠语音分离，换人和同时说话的场景可能误判。可调整分离参数后重跑 `diarize`。
 - **人工校对**：`transcript.md` 只用于查看；`summarize` 读取 `transcript.json`，修改 Markdown 不会改变纪要输入。人工修订 JSON 后可重跑纪要，再次运行 `diarize` 会重建该 JSON。
 - **缓存与下载**：缓存检测是启发式检查，路径和文件存在不代表完整可用。模型可用性应通过会前短音频实跑确认。
@@ -319,7 +346,7 @@ AI-meeting-tool/
 
 ## 后续方向
 
-- 麦克风与内录双轨采集
+- 外放时的双轨串音抑制
 - 分段滚动转写与近实时纪要
 - 说话人声纹注册及跨会议复用
 - GUI / 系统托盘入口

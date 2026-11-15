@@ -65,24 +65,40 @@ def _model_cached(model):
     return any(p.is_file() for p in snapshots.glob("*/model.bin"))
 
 
-def run_doctor(cfg, *, recording=True, device=None, file_url=None):
+def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=True):
     print("预检（不联网、不下载模型）：")
     ok = True
     if recording:
         try:
-            from .audio.loopback_recorder import LoopbackRecorder, _import_pyaudio
+            from .audio.loopback_recorder import (
+                LoopbackRecorder,
+                MicrophoneRecorder,
+                _import_pyaudio,
+            )
 
             pa = _import_pyaudio().PyAudio()
             try:
-                d = LoopbackRecorder(device=device)._resolve_device(pa)
-                print(f"  内录设备：[{d['index']}] {d['name']}")
+                recorder = cfg.get("recorder", {})
+                checks = [("内录", LoopbackRecorder(device=device))]
+                if recorder.get("microphone"):
+                    checks.append(
+                        ("麦克风", MicrophoneRecorder(device=recorder.get("microphone_device")))
+                    )
+                for label, capture in checks:
+                    try:
+                        d = capture._resolve_device(pa)
+                        print(f"  {label}设备：[{d['index']}] {d['name']}")
+                    except Exception as e:
+                        print(f"  错误：无法选择{label}设备：{e}")
+                        ok = False
             finally:
                 pa.terminate()
         except Exception as e:
             print(f"  错误：无法选择内录设备：{e}")
             ok = False
     asr = cfg.get("asr", {}) or {}
-    if asr.get("provider", "faster_whisper") == "faster_whisper":
+    asr_provider = asr.get("provider", "faster_whisper") if check_asr else None
+    if asr_provider == "faster_whisper":
         for mod in ("faster_whisper", "av"):
             if importlib.util.find_spec(mod) is None:
                 print(f"  错误：缺少 {mod}；请安装 requirements.txt")
@@ -108,7 +124,7 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None):
         else:
             print("  未检测到 NVIDIA GPU；CPU int8 可用（速度取决于机器和模型）。")
         print("  建议：16 GB 内存可尝试 large-v3-turbo int8；GPU 显存需求随音频和配置变化。")
-    elif asr.get("provider") == "dashscope":
+    elif asr_provider == "dashscope":
         dc = cfg.get("dashscope_asr", {}) or {}
         if not (file_url or dc.get("file_url")):
             print("  错误：DashScope 转写需要 --file-url 或配置 file_url")

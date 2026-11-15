@@ -1,7 +1,7 @@
 """AI 会议纪要小工具 —— 命令行入口。
 
-meetmin devices                         # 查看可用的内录(loopback)设备
-meetmin record   [-n 会议名] [--device 0]  # 步骤1：内录（Ctrl+C 停止）
+meetmin devices                         # 查看可用的内录和麦克风设备
+meetmin record   [-n 会议名] [--mic]       # 步骤1：录音（Ctrl+C 停止）
 meetmin transcribe [--session 会议名] [--audio 路径]
 meetmin diarize    --session 会议名       # 单独重跑分离
 meetmin summarize  [--session 会议名]
@@ -16,8 +16,13 @@ import sys
 import time
 from pathlib import Path
 
-from meetmin.audio.loopback_recorder import RecordingError, list_loopback_devices
-from meetmin.audio.segments import SessionLock, merge_segments
+from meetmin.audio.loopback_recorder import (
+    RecordingError,
+    list_loopback_devices,
+    list_microphone_devices,
+)
+from meetmin.audio.segments import SessionLock
+from meetmin.audio.session_recorder import recover_recording
 from meetmin.config import load_config
 from meetmin.pipeline import Pipeline
 from meetmin.session import Session, clean_session_name
@@ -76,7 +81,9 @@ def _latest_session(out_dir: str) -> Session | None:
     if not root.exists():
         return None
     dirs = [
-        d for d in root.iterdir() if (d / "audio.wav").exists() or (d / "transcript.json").exists()
+        d
+        for d in root.iterdir()
+        if any((d / name).exists() for name in ("audio.wav", "recording.json", "transcript.json"))
     ]
     if not dirs:
         return None
@@ -85,26 +92,32 @@ def _latest_session(out_dir: str) -> Session | None:
 
 
 def cmd_devices(args, cfg) -> None:
-    try:
-        devs = list_loopback_devices()
-    except Exception as e:
-        print(f"枚举 loopback 设备失败：{e}")
-        return
-    if not devs:
-        print("未找到 loopback 设备（需要 Windows + WASAPI，且系统有输出设备）")
-        return
-    print("可用内录(loopback)设备：")
-    for d in devs:
-        print(f"  [{d['index']}] {d['name']}  ({d['sample_rate']}Hz, {d['max_channels']}ch)")
-    print("用 record --device <索引> 指定；缺省自动选默认扬声器对应的 loopback。")
+    for label, devices, option in (
+        ("内录(loopback)", list_loopback_devices, "--device"),
+        ("麦克风", list_microphone_devices, "--mic-device"),
+    ):
+        try:
+            devs = devices()
+        except Exception as e:
+            print(f"枚举{label}设备失败：{e}")
+            continue
+        if not devs:
+            print(f"未找到{label}设备（需要 Windows + WASAPI）")
+            continue
+        print(f"可用{label}设备（用 record {option} <索引> 指定）：")
+        for d in devs:
+            print(f"  [{d['index']}] {d['name']}  ({d['sample_rate']}Hz, {d['max_channels']}ch)")
 
 
 def _do_record(pipe: Pipeline, session: Session, args) -> dict:
-    if session.audio_path.exists() and not args.overwrite:
-        sys.exit(f"录音已存在：{session.audio_path}；使用 --overwrite 显式覆盖")
-    rec = pipe.recorder()
+    if (session.audio_path.exists() or session.recording_manifest.exists()) and not args.overwrite:
+        sys.exit(f"录音已存在：{session.root}；使用 --overwrite 显式覆盖")
+    rec = pipe.recorder(for_session=True)
+    dual = getattr(rec, "dual_track", False)
+    if dual:
+        print("双轨录音建议佩戴耳机。扬声器外放可能被麦克风重复采集并标为“我”。")
     try:
-        rec.start(session.audio_path, overwrite=args.overwrite)
+        rec.start(session, overwrite=args.overwrite)
     except Exception as e:
         print(f"录音启动失败：{e}")
         if isinstance(e, RecordingError):
@@ -113,7 +126,7 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
             for cleanup_error in e.info.get("cleanup_errors", []):
                 print(f"收尾错误：{cleanup_error}")
         sys.exit(2)
-    print(f"开始内录 → {session.audio_path}")
+    print(f"开始双轨录音 → {session.root}" if dual else f"开始内录 → {session.audio_path}")
     print("（会议进行中… 按 Ctrl+C 结束录音）")
     stop = {"flag": False}
 
@@ -125,13 +138,18 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
     t0 = time.monotonic()
     warned = False
     no_data_warned = False
+    mic_no_data_warned = False
     timing_warned = False
     interactive = sys.stdout.isatty()
     try:
         while not stop["flag"]:
             time.sleep(1)
             status = rec.status()
-            if status.get("timing_mode") == "arrival" and not timing_warned:
+            mic = status.get("microphone")
+            if (
+                status.get("timing_mode") == "arrival"
+                or (mic and mic.get("timing_mode") == "arrival")
+            ) and not timing_warned:
                 print("\n! 设备未提供有效采集时间戳，使用回调到达时间估算，时间轴精度可能降低。")
                 timing_warned = True
             elapsed = time.monotonic() - t0
@@ -145,6 +163,9 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
                 else f"电平 [{'#' * bars}{'-' * (20 - bars)}] RMS {level:.4f}"
             )
             line = f"经过 {ts(elapsed)}  已录 {ts(status['duration_sec'])}  {level_display}"
+            if mic:
+                mic_level = "无新数据" if mic["no_data_sec"] >= 2 else f"RMS {mic['level']:.4f}"
+                line += f"  麦克风 {ts(mic['duration_sec'])}  {mic_level}"
             print(("\r" if interactive else "") + line, end="" if interactive else "\n", flush=True)
             if status["silent_sec"] >= 30 and not warned:
                 print(
@@ -163,6 +184,12 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
             elif no_data_sec < 10 and no_data_warned:
                 print("\n已恢复接收音频数据，正在按采集时间补齐时间轴。", flush=True)
                 no_data_warned = False
+            if mic and mic["no_data_sec"] >= 10 and not mic_no_data_warned:
+                print("\n!!! 麦克风连续 10 秒无数据，请检查输入设备、静音和权限。", flush=True)
+                mic_no_data_warned = True
+            elif mic and mic["no_data_sec"] < 10 and mic_no_data_warned:
+                print("\n已恢复接收麦克风数据。", flush=True)
+                mic_no_data_warned = False
             if status["failed"]:
                 print("\n录音线程发生错误，正在停止。")
                 break
@@ -190,16 +217,28 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
         finally:
             signal.signal(signal.SIGINT, old)
     info["elapsed"] = round(time.monotonic() - t0, 1)
+    for label, track in (
+        ("内录轨" if dual else "", info),
+        ("麦克风轨", info.get("microphone")),
+    ):
+        if track is not None:
+            _report_recording(track, label, timing_warned=timing_warned)
+    return info
+
+
+def _report_recording(info: dict, label: str, *, timing_warned: bool) -> None:
     print(
-        f"\n录音结束：时长 {ts(info.get('duration_sec', 0))}，设备 [{info.get('device')}]"
+        f"\n{label}录音结束：时长 {ts(info.get('duration_sec', 0))}，设备 [{info.get('device')}]"
         f"，{info.get('sample_rate')}Hz/{info.get('channels')}ch"
     )
+    if label:
+        print(f"文件：{info['path']}")
     if info.get("timing_mode") == "arrival" and not timing_warned:
         print("! 设备未提供有效采集时间戳，已使用回调到达时间估算，时间轴精度可能降低。")
     if info.get("padded_sec", 0):
         print(f"时间轴补零：{info['padded_sec']:.2f} 秒（无数据区间，不代表已确认的静音）。")
     if info.get("duration_sec", 0) < 1:
-        print("! 录到的内容极短，请确认选对了 loopback 设备（会议声音是否在默认输出播放）。")
+        print(f"! 录音极短，请检查{label or '内录'}设备。")
     if info.get("duration_sec", 0) > 0:
         try:
             from faster_whisper.vad import get_speech_timestamps
@@ -207,7 +246,7 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
             from meetmin.audio.dsp import to_mono_16k
 
             print("正在估算语音占比…", flush=True)
-            audio = to_mono_16k(session.audio_path)
+            audio = to_mono_16k(info["path"])
             spans = get_speech_timestamps(audio, sampling_rate=16000)
             samples = sum(max(0, span["end"] - span["start"]) for span in spans)
             fraction = min(1.0, samples / len(audio)) if len(audio) else 0.0
@@ -217,7 +256,6 @@ def _do_record(pipe: Pipeline, session: Session, args) -> dict:
             print(
                 f"无法估算语音占比：{e}；有声占比（RMS 阈值估算，包含音乐和噪声）：{info['active_fraction']:.1%}"
             )
-    return info
 
 
 def _record_session(pipe, cfg, args):
@@ -235,7 +273,8 @@ def _record_session(pipe, cfg, args):
 def cmd_record(args, cfg) -> None:
     from meetmin.doctor import run_doctor
 
-    if not run_doctor(cfg, device=cfg.get("recorder", {}).get("device")):
+    recorder = cfg.get("recorder", {})
+    if not run_doctor(cfg, device=recorder.get("device"), check_asr=not recorder.get("microphone")):
         sys.exit(2)
     pipe = Pipeline(cfg)
     session = _record_session(pipe, cfg, args)
@@ -251,8 +290,7 @@ def cmd_recover(args, cfg) -> None:
     if not session.root.is_dir() or session.root.is_symlink():
         sys.exit(f"会话不存在：{name}")
     try:
-        lock = SessionLock(session.root)
-        try:
+        with SessionLock(session.root):
             if args.take:
                 if not args.take.startswith("audio_parts-") or Path(args.take).name != args.take:
                     raise ValueError("无效的分段目录名")
@@ -271,17 +309,21 @@ def cmd_recover(args, cfg) -> None:
             directory = directories[0]
             if directory.is_symlink() or not directory.is_dir():
                 raise ValueError("分段目录不存在或不安全")
-            output = Path(args.output) if args.output else session.audio_path
-            info = merge_segments(directory, output)
-        finally:
-            lock.close()
+            if not args.output and (
+                session.audio_path.exists() or session.recording_manifest.exists()
+            ):
+                raise FileExistsError("会话录音已存在，请使用 --output 恢复到新位置")
+            recovered = recover_recording(
+                session, directory, Path(args.output) if args.output else None
+            )
     except (OSError, ValueError, RuntimeError) as error:
         sys.exit(f"恢复失败：{error}；原始分段未删除")
-    print(f"恢复完成：{output}，时长 {ts(info['duration_sec'])}，{info['parts']} 个分段。")
-    if info["partial"]:
-        print("已根据文件长度恢复未完成分段；异常退出前未写入的尾部音频或无数据区间可能缺失。")
-    if info["discarded_bytes"]:
-        print(f"已忽略尾部不足一帧的 {info['discarded_bytes']} 字节。")
+    for output, info in recovered:
+        print(f"恢复完成：{output}，时长 {ts(info['duration_sec'])}，{info['parts']} 个分段。")
+        if info["partial"]:
+            print("已根据文件长度恢复未完成分段；异常退出前未写入的尾部音频或无数据区间可能缺失。")
+        if info["discarded_bytes"]:
+            print(f"已忽略尾部不足一帧的 {info['discarded_bytes']} 字节。")
 
 
 def cmd_transcribe(args, cfg) -> None:
@@ -296,11 +338,15 @@ def cmd_transcribe(args, cfg) -> None:
     if cfg["asr"]["provider"] == "dashscope" and not (
         args.file_url or (cfg.get("dashscope_asr") or {}).get("file_url")
     ):
-        print(
+        if not args.audio and session.recording_manifest.exists():
+            sys.exit("双轨会话需要本地 faster-whisper 分别转写两轨")
+        sys.exit(
             "dashscope 模式需要 --file-url（音频的服务端可访问 URL），或在 config.yaml 的 dashscope_asr 节配置 file_url"
         )
-        sys.exit(1)
-    pipe.transcribe(session, audio_path=args.audio, file_url=args.file_url)
+    try:
+        pipe.transcribe(session, audio_path=args.audio, file_url=args.file_url)
+    except (OSError, ValueError) as error:
+        sys.exit(f"转写失败：{error}")
     print(f"\n下一步：meetmin diarize --session {session.session_id}")
 
 
@@ -353,6 +399,12 @@ def cmd_run(args, cfg) -> None:
 
     if args.audio and not Path(args.audio).is_file():
         sys.exit(f"找不到音频：{args.audio}")
+    if (
+        not args.audio
+        and cfg.get("recorder", {}).get("microphone")
+        and cfg.get("asr", {}).get("provider") == "dashscope"
+    ):
+        sys.exit("run 的双轨模式需要本地 faster-whisper；也可先用 record --mic 保存两轨")
     if not run_doctor(
         cfg,
         recording=not bool(args.audio),
@@ -367,7 +419,7 @@ def cmd_run(args, cfg) -> None:
     if args.audio:
         print(f"[1/3] 跳过录音，使用已有音频：{args.audio}")
     else:
-        print("[1/3] 内录")
+        print("[1/3] 录音")
         _do_record(pipe, session, args)
     pipe.transcribe(session, audio_path=args.audio, file_url=args.file_url)
     pipe.diarize(session)
@@ -408,16 +460,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None, help="配置文件路径（默认 ./config.yaml）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("devices", help="列出内录(loopback)设备").set_defaults(fn=cmd_devices)
+    sub.add_parser("devices", help="列出内录和麦克风设备").set_defaults(fn=cmd_devices)
+
+    def add_microphone_options(parser):
+        parser.add_argument(
+            "--mic", action=argparse.BooleanOptionalAction, help="同时录制麦克风（--no-mic 仅内录）"
+        )
+        parser.add_argument("--mic-device", type=int, help="指定并启用麦克风（索引见 devices）")
 
     sp = sub.add_parser("doctor", help="检查录音和处理环境（不联网）")
     sp.add_argument("--no-record", action="store_true", help="使用已有音频，跳过录音设备检查")
     sp.add_argument("--file-url", default=None)
+    add_microphone_options(sp)
     sp.set_defaults(fn=cmd_doctor)
 
     sp = sub.add_parser("record", help="步骤1：录制电脑输出（Ctrl+C 停止）")
     sp.add_argument("--session", "-n", default=None, help="会话名（不存在则新建）")
     sp.add_argument("--device", type=int, default=None, help="loopback 设备索引（见 devices）")
+    add_microphone_options(sp)
     sp.add_argument("--max-seconds", type=float, default=None, help="最长录音秒数（调试用）")
     sp.add_argument("--overwrite", action="store_true", help="覆盖 -n 指定的完整现有会话 ID 的录音")
     sp.set_defaults(fn=cmd_record)
@@ -425,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("recover", help="从分段恢复异常中断的录音")
     sp.add_argument("--session", "-n", required=True, help="完整会话 ID")
     sp.add_argument("--take", default=None, help="存在多次录音时指定 audio_parts-* 目录")
-    sp.add_argument("--output", default=None, help="恢复到指定的新文件（不得覆盖已有文件）")
+    sp.add_argument("--output", default=None, help="恢复到新文件（单轨）或新目录（双轨）")
     sp.set_defaults(fn=cmd_recover)
 
     sp = sub.add_parser("transcribe", help="步骤2a：转写并保存原始词级时间戳")
@@ -451,6 +511,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--audio", default=None)
     sp.add_argument("--file-url", default=None)
     sp.add_argument("--device", type=int, default=None)
+    add_microphone_options(sp)
     sp.add_argument("--max-seconds", type=float, default=None)
     sp.add_argument("--overwrite", action="store_true", help="覆盖 -n 指定的完整现有会话 ID 的录音")
     sp.add_argument(
@@ -465,6 +526,13 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config)
     if args.cmd in ("record", "run") and getattr(args, "device", None) is not None:
         cfg.setdefault("recorder", {})["device"] = args.device
+    if args.cmd in ("record", "run", "doctor"):
+        recorder = cfg.setdefault("recorder", {})
+        if args.mic_device is not None:
+            recorder["microphone_device"] = args.mic_device
+            recorder["microphone"] = True
+        if args.mic is not None:
+            recorder["microphone"] = args.mic
     args.fn(args, cfg)
 
 

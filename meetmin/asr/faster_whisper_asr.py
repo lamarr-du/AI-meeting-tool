@@ -106,12 +106,23 @@ class FasterWhisperASR(ASRProvider):
         condition_on_previous_text = self.acfg.get("condition_on_previous_text", False)
         if not isinstance(condition_on_previous_text, bool):
             raise ValueError("asr.condition_on_previous_text 必须为 true 或 false")
+        language = self.acfg.get("language") or None
+        punctuation_prompt = self.acfg.get("punctuation_prompt")
+        hotwords = self.acfg.get("hotwords")
+        for key, value in (("punctuation_prompt", punctuation_prompt), ("hotwords", hotwords)):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"asr.{key} 必须是字符串或 null")
+        prompts = (punctuation_prompt if language == "zh" else None, hotwords)
+        effective_hotwords = (
+            " ".join(prompt.strip() for prompt in prompts if prompt and prompt.strip()) or None
+        )
         segments, info = self.model.transcribe(
             audio,
-            language=self.acfg.get("language") or None,
+            language=language,
             beam_size=int(self.acfg.get("beam_size", 1)),
             word_timestamps=bool(self.acfg.get("word_timestamps", True)),
             condition_on_previous_text=condition_on_previous_text,
+            hotwords=effective_hotwords,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 400},
         )
@@ -140,6 +151,9 @@ class FasterWhisperASR(ASRProvider):
                 "asr_model": self.acfg.get("model_size", "small"),
                 "effective_device": self._device,
                 "effective_compute_type": self._compute,
-                "parameters": {"condition_on_previous_text": condition_on_previous_text},
+                "parameters": {
+                    "condition_on_previous_text": condition_on_previous_text,
+                    "hotwords": effective_hotwords,
+                },
             },
         )

@@ -48,6 +48,12 @@ class SessionLock:
             fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
         self.file.close()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
 
 def _parts(directory: Path):
     files = sorted(directory.iterdir())
@@ -164,6 +170,8 @@ class SegmentedWriter:
         overwrite: bool,
         segment_seconds: float,
         sync_seconds: float,
+        directory: Path | None = None,
+        session_locked: bool = False,
     ):
         if (
             not math.isfinite(segment_seconds)
@@ -173,7 +181,7 @@ class SegmentedWriter:
         ):
             raise ValueError("分段长度和落盘间隔必须为正数")
         self.path = path
-        self.lock = SessionLock(path.parent)
+        self.lock = None if session_locked else SessionLock(path.parent)
         self.closed = False
         self.overwrite = overwrite
         self.rate = rate
@@ -188,13 +196,13 @@ class SegmentedWriter:
         try:
             if path.exists() and not overwrite:
                 raise FileExistsError(f"录音已存在：{path}")
-            self.directory = path.parent / ("audio_parts-" + uuid.uuid4().hex)
+            self.directory = directory or path.parent / ("audio_parts-" + uuid.uuid4().hex)
             self.directory.mkdir()
             self._open()
         except BaseException:
             if self.file is not None:
                 self.file.close()
-            self.lock.close()
+            self.release()
             raise
 
     def _open(self):
@@ -254,4 +262,5 @@ class SegmentedWriter:
             self.closed = True
 
     def release(self):
-        self.lock.close()
+        if self.lock is not None:
+            self.lock.close()
