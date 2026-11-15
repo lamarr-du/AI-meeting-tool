@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ctypes
-import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,7 +16,7 @@ _TURBO = "large-v3-turbo"
 def memory_status() -> tuple[int, int] | None:
     """Return (total, available) RAM in MiB; unknown hosts use the light profile."""
     try:
-        if os.name == "nt":
+        if sys.platform == "win32":
 
             class MemoryStatus(ctypes.Structure):
                 _fields_ = [
