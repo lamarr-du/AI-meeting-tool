@@ -42,11 +42,16 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        save = buttons.button(QDialogButtonBox.StandardButton.Save)
+        save.setText("保存")
+        save.setProperty("primaryAction", True)
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QFormLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setHorizontalSpacing(14)
+        layout.setVerticalSpacing(12)
         layout.addRow("会话存储位置", folder)
         layout.addRow("纪要 API 地址", self.url)
         layout.addRow("纪要模型", self.model)

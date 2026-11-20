@@ -7,20 +7,29 @@ import shutil
 import sys
 import time
 from collections.abc import Callable
+from html import escape
 from pathlib import Path
 from threading import Event
 from typing import Any
 
 import yaml
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QTextDocument
+from PySide6.QtCore import QSettings, QSize, QStandardPaths, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFontDatabase,
+    QTextBlockFormat,
+    QTextCursor,
+    QTextDocument,
+    QTextFrameFormat,
+    QTextLength,
+    QTextTable,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -33,6 +42,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
+    QStackedWidget,
     QTabWidget,
     QTextBrowser,
     QToolButton,
@@ -50,7 +61,15 @@ from ..summarizer.llm_client import MockLLM, get_llm
 from ..textutil import ts
 from . import workflow
 from .settings import SettingsDialog
-from .style import STYLESHEET
+from .style import (
+    HISTORY_DATE,
+    AudioLevel,
+    DeviceComboBox,
+    HistoryDelegate,
+    apply_light_theme,
+    line_icon,
+    style_property,
+)
 
 
 def label(text: str = "", style: str = "") -> QLabel:
@@ -60,28 +79,108 @@ def label(text: str = "", style: str = "") -> QLabel:
     return widget
 
 
-class MarkdownPreview(QTextBrowser):
+def session_date(session: Session | None) -> dt.date | None:
+    if session is None:
+        return None
+    parts = session.session_id.rsplit("-", 3)[-3:]
+    if len(parts) == 3 and len(parts[0]) == 8:
+        try:
+            return dt.datetime.strptime(parts[0], "%Y%m%d").date()
+        except ValueError:
+            pass
+    return None
+
+
+class MarkdownBrowser(QTextBrowser):
     def loadResource(self, resource_type: int, name: QUrl | str) -> Any:
         # Imported or generated Markdown can contain references to local or remote files.
         return None
 
+
+class MarkdownPreview(QStackedWidget):
+    def __init__(self, name: str):
+        super().__init__()
+        self.reader = MarkdownBrowser(openLinks=False)
+        self.reader.setAccessibleName(name)
+        self.addWidget(self.reader)
+        empty = QWidget()
+        layout = QVBoxLayout(empty)
+        layout.setContentsMargins(20, 14, 20, 18)
+        layout.setSpacing(12)
+        mark = label(style="emptyMark")
+        mark.setFixedSize(42, 42)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setPixmap(line_icon("note").pixmap(QSize(20, 20), self.devicePixelRatioF()))
+        self.message = label(style="emptyMessage")
+        self.message.setWordWrap(True)
+        self.message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch(1)
+        layout.addWidget(mark, alignment=Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.message)
+        layout.addStretch(1)
+        self.addWidget(empty)
+
     def show_file(self, path: Path | None, empty_text: str, heading: str = "") -> None:
-        self.document().setDocumentMargin(16)
+        document = self.reader.document()
+        document.setDocumentMargin(26)
         try:
             if path is not None and path.is_file():
                 text = path.read_text(encoding="utf-8")
                 if heading and text.startswith(heading + "\n"):
                     text = text[len(heading) :].lstrip("\n")
                 features = QTextDocument.MarkdownFeature
-                self.document().setMarkdown(
-                    text,
-                    features.MarkdownDialectGitHub | features.MarkdownNoHTML,
-                )
-                self.verticalScrollBar().setValue(0)
-                return
+                document.setMarkdown(text, features.MarkdownDialectGitHub | features.MarkdownNoHTML)
+                if not document.isEmpty():
+                    document.setLayoutEnabled(False)
+                    try:
+                        self.format_document(document)
+                    finally:
+                        document.setLayoutEnabled(True)
+                    self.reader.verticalScrollBar().setValue(0)
+                    self.setCurrentWidget(self.reader)
+                    return
         except (OSError, ValueError) as error:
             empty_text = f"无法读取结果：{error}"
-        self.setPlainText(empty_text)
+        self.reader.clear()
+        self.message.setText(empty_text)
+        self.setCurrentIndex(1)
+
+    @staticmethod
+    def format_document(document: QTextDocument) -> None:
+        for frame in document.rootFrame().childFrames():
+            if not isinstance(frame, QTextTable):
+                continue
+            table_format = frame.format()
+            table_format.setBorder(1)
+            table_format.setBorderStyle(QTextFrameFormat.BorderStyle.BorderStyle_Solid)
+            table_format.setBorderBrush(QColor("#e5def0"))
+            table_format.setCellPadding(8)
+            table_format.setCellSpacing(0)
+            table_format.setTopMargin(7)
+            table_format.setWidth(QTextLength(QTextLength.Type.PercentageLength, 100))
+            table_format.setHeaderRowCount(1)
+            frame.setFormat(table_format)
+            for column in range(frame.columns()):
+                cell = frame.cellAt(0, column)
+                cell_format = cell.format()
+                cell_format.setBackground(QColor("#f7f3fc"))
+                cell.setFormat(cell_format)
+
+        block = document.begin()
+        while block.isValid():
+            cursor = QTextCursor(block)
+            if cursor.currentTable() is None:
+                fmt = block.blockFormat()
+                if fmt.headingLevel():
+                    fmt.setTopMargin(16 if block.position() else 0)
+                    fmt.setBottomMargin(6)
+                else:
+                    fmt.setBottomMargin(max(7, fmt.bottomMargin()))
+                    fmt.setLineHeight(
+                        142, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value
+                    )
+                cursor.setBlockFormat(fmt)
+            block = block.next()
 
 
 class Job(QThread):
@@ -121,7 +220,7 @@ class MeetingWindow(QMainWindow):
         self.transcript_path: Path | None = None
         self.minutes_path: Path | None = None
         self.setWindowTitle("MeetMin · 会议纪要")
-        self.resize(1100, 780)
+        self.resize(1180, 780)
         self.setMinimumSize(890, 650)
         self.build_interface()
         self.refresh_history()
@@ -137,49 +236,88 @@ class MeetingWindow(QMainWindow):
 
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(228)
+        sidebar.setFixedWidth(226)
         navigation = QVBoxLayout(sidebar)
-        navigation.setContentsMargins(18, 24, 18, 20)
-        navigation.setSpacing(10)
-        navigation.addWidget(label("MeetMin", "brand"))
+        navigation.setContentsMargins(16, 24, 16, 16)
+        navigation.setSpacing(12)
+        branding = QHBoxLayout()
+        branding.setSpacing(10)
+        mark = label(style="brandMark")
+        mark.setFixedSize(38, 38)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setPixmap(line_icon("audio").pixmap(QSize(20, 20), self.devicePixelRatioF()))
+        branding.addWidget(mark)
+        branding.addWidget(label("MeetMin", "brand"), 1)
+        navigation.addLayout(branding)
+        navigation.addSpacing(4)
         self.new = QPushButton("＋ 新建会议")
+        self.new.setObjectName("newMeeting")
         self.new.clicked.connect(self.new_meeting)
         navigation.addWidget(self.new)
-        navigation.addSpacing(10)
-        navigation.addWidget(label("会议历史", "section"))
+        navigation.addSpacing(8)
+        navigation.addWidget(label("会议历史", "navCaption"))
         self.sessions = QListWidget()
+        self.sessions.setObjectName("historyList")
+        self.sessions.setUniformItemSizes(True)
+        self.sessions.setMouseTracking(True)
+        self.sessions.setItemDelegate(HistoryDelegate(self.sessions))
         self.sessions.setAccessibleName("会议历史")
         self.sessions.currentItemChanged.connect(self.select_session)
         navigation.addWidget(self.sessions, 1)
+        divider = QFrame()
+        divider.setObjectName("navDivider")
+        divider.setFixedHeight(1)
+        navigation.addWidget(divider)
         self.settings_button = QPushButton("设置")
+        self.settings_button.setObjectName("settingsButton")
+        self.settings_button.setIcon(line_icon("settings"))
         self.settings_button.clicked.connect(self.show_settings)
         navigation.addWidget(self.settings_button)
         layout.addWidget(sidebar)
 
         detail = QWidget()
         content = QVBoxLayout(detail)
-        content.setContentsMargins(24, 22, 24, 20)
-        content.setSpacing(12)
+        content.setContentsMargins(28, 24, 28, 24)
+        content.setSpacing(16)
+        heading = QVBoxLayout()
+        heading.setSpacing(3)
         self.title = label("新建会议", "title")
         self.title.setWordWrap(True)
-        content.addWidget(self.title)
+        self.title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        heading.addWidget(self.title)
+        self.date = label(style="muted")
+        heading.addWidget(self.date)
+        content.addLayout(heading)
         content.addWidget(self.build_capture_card())
 
+        self.status_strip = QFrame()
+        self.status_strip.setObjectName("statusStrip")
+        status = QVBoxLayout(self.status_strip)
+        status.setContentsMargins(16, 10, 12, 10)
+        status.setSpacing(8)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.status_dot = label(style="statusDot")
+        self.status_dot.setFixedSize(8, 8)
+        actions.addWidget(self.status_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.stage = label("", "status")
         self.stage.setWordWrap(True)
-        content.addWidget(self.stage)
+        self.stage.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        actions.addWidget(self.stage, 1)
+        status.addLayout(actions)
         self.indicator = QProgressBar()
+        self.indicator.setAccessibleName("处理进度")
         self.indicator.setRange(0, 0)
         self.indicator.setTextVisible(False)
-        content.addWidget(self.indicator)
-
-        actions = QHBoxLayout()
+        self.indicator.setFixedHeight(7)
+        status.addWidget(self.indicator)
+        content.addWidget(self.status_strip)
         self.retry = QPushButton("转写音频")
         self.retry.clicked.connect(self.retry_transcription)
         self.generate = QPushButton("生成纪要")
-        self.generate.setObjectName("primary")
         self.generate.clicked.connect(self.generate_minutes)
         self.more = QToolButton()
+        self.more.setObjectName("moreActions")
         self.more.setText("更多操作")
         self.more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(self.more)
@@ -196,79 +334,148 @@ class MeetingWindow(QMainWindow):
         self.open_folder = menu.addAction("打开会话文件夹")
         self.open_folder.triggered.connect(self.open_session_folder)
         self.more.setMenu(menu)
-        actions.addWidget(self.generate)
         actions.addWidget(self.retry)
+        actions.addWidget(self.generate)
         actions.addWidget(self.more)
-        actions.addStretch()
-        content.addLayout(actions)
 
+        result = QFrame()
+        result.setObjectName("resultCard")
+        result_layout = QVBoxLayout(result)
+        result_layout.setContentsMargins(1, 1, 1, 1)
         self.tabs = QTabWidget()
-        self.transcript = MarkdownPreview(openLinks=False)
-        self.minutes = MarkdownPreview(openLinks=False)
+        self.transcript = MarkdownPreview("会议转写")
+        self.minutes = MarkdownPreview("会议纪要")
         self.log = QPlainTextEdit(readOnly=True, maximumBlockCount=300)
+        self.log.setAccessibleName("处理日志")
         self.tabs.addTab(self.transcript, "转写")
         self.tabs.addTab(self.minutes, "纪要")
         self.tabs.addTab(self.log, "处理日志")
-        content.addWidget(self.tabs, 1)
+        result_layout.addWidget(self.tabs)
+        content.addWidget(result, 1)
         layout.addWidget(detail, 1)
 
     def build_capture_card(self) -> QWidget:
         card = QFrame()
-        card.setObjectName("card")
-        grid = QGridLayout(card)
-        grid.setContentsMargins(15, 13, 15, 13)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        heading = label("录音或导入", "section")
-        self.meeting_name = QLineEdit(placeholderText="会议名称（可选）", maxLength=100)
-        self.meeting_name.setAccessibleName("会议名称")
-        self.start = QPushButton("开始录音")
-        self.start.setObjectName("primary")
-        self.start.clicked.connect(self.start_recording)
-        self.stop = QPushButton("停止录音")
-        self.stop.setObjectName("stop")
-        self.stop.clicked.connect(self.request_stop)
-        self.import_button = QPushButton("导入音频…")
-        self.import_button.clicked.connect(self.import_audio)
-        grid.addWidget(heading, 0, 0, 1, 2)
-        grid.addWidget(self.meeting_name, 0, 2)
-        grid.addWidget(self.start, 0, 3)
-        grid.addWidget(self.stop, 0, 3)
-        grid.addWidget(self.import_button, 0, 4)
-
-        self.loopback_devices = QComboBox()
-        self.loopback_devices.setAccessibleName("电脑声音设备")
-        self.microphone_devices = QComboBox()
-        self.microphone_devices.setAccessibleName("麦克风设备")
-        self.microphone = QCheckBox("同时录制麦克风")
-        self.microphone.setChecked(bool(self.cfg["recorder"].get("microphone")))
-        self.microphone.toggled.connect(self.update_controls)
-        self.refresh_audio = QPushButton("刷新设备")
-        self.refresh_audio.clicked.connect(self.refresh_devices)
-        grid.addWidget(label("电脑声音", "muted"), 1, 0)
-        grid.addWidget(self.loopback_devices, 1, 1, 1, 2)
-        grid.addWidget(self.refresh_audio, 1, 3, 1, 2)
-        grid.addWidget(self.microphone, 2, 0, 1, 2)
-        grid.addWidget(self.microphone_devices, 2, 2, 1, 3)
-
-        self.device_hint = label("", "muted")
-        self.device_hint.setWordWrap(True)
-        grid.addWidget(self.device_hint, 3, 0, 1, 5)
-        self.meter_area = QWidget()
-        meter_layout = QGridLayout(self.meter_area)
-        meter_layout.setContentsMargins(0, 0, 0, 0)
-        self.track_labels = [label(), label()]
-        self.track_levels = [QProgressBar(), QProgressBar()]
-        for index, (caption, level) in enumerate(zip(self.track_labels, self.track_levels)):
-            level.setAccessibleName(("电脑声音电平", "麦克风电平")[index])
-            level.setTextVisible(False)
-            meter_layout.addWidget(caption, index, 0)
-            meter_layout.addWidget(level, index, 1)
-        grid.addWidget(self.meter_area, 4, 0, 1, 5)
-        grid.setColumnStretch(2, 1)
+        card.setObjectName("captureCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(22, 20, 22, 20)
+        self.capture_setup = self.build_capture_setup()
+        self.capture_recording = self.build_recording_panel()
+        layout.addWidget(self.capture_setup)
+        layout.addWidget(self.capture_recording)
         self.capture_card = card
         self.loopback_available = self.mic_available = False
         return card
+
+    def build_capture_setup(self) -> QWidget:
+        panel = QWidget()
+        columns = QHBoxLayout(panel)
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(18)
+        form = QVBoxLayout()
+        form.setSpacing(9)
+        form.addWidget(label("录音或导入", "captureTitle"))
+        form.addSpacing(9)
+        form.addWidget(label("会议名称", "fieldLabel"))
+        self.meeting_name = QLineEdit(placeholderText="输入会议名称（可选）", maxLength=100)
+        self.meeting_name.setAccessibleName("会议名称")
+        form.addWidget(self.meeting_name)
+        form.addSpacing(9)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        self.start = QPushButton("开始录音")
+        self.start.setMinimumWidth(106)
+        self.start.setProperty("primaryAction", True)
+        self.start.setIcon(line_icon("audio", "#ffffff"))
+        self.start.clicked.connect(self.start_recording)
+        self.import_button = QPushButton("导入音频…")
+        self.import_button.setMinimumWidth(104)
+        self.import_button.clicked.connect(self.import_audio)
+        buttons.addWidget(self.start)
+        buttons.addWidget(self.import_button)
+        buttons.addStretch()
+        form.addLayout(buttons)
+        hint = label("录音结束或导入后自动转写", "muted")
+        hint.setWordWrap(True)
+        form.addWidget(hint)
+        form.addStretch()
+        columns.addLayout(form, 5)
+
+        device_panel = QFrame()
+        device_panel.setObjectName("devicePanel")
+        devices = QVBoxLayout(device_panel)
+        devices.setContentsMargins(16, 10, 16, 14)
+        devices.setSpacing(6)
+        device_heading = QHBoxLayout()
+        device_heading.addWidget(label("录音设备", "section"), 1)
+        self.refresh_audio = QPushButton("刷新设备")
+        self.refresh_audio.setObjectName("refreshAudio")
+        self.refresh_audio.clicked.connect(self.refresh_devices)
+        device_heading.addWidget(self.refresh_audio)
+        devices.addLayout(device_heading)
+        self.loopback_devices = DeviceComboBox("电脑声音设备")
+        self.microphone_devices = DeviceComboBox("麦克风设备")
+        devices.addWidget(label("电脑声音", "fieldLabel"))
+        devices.addWidget(self.loopback_devices)
+        devices.addSpacing(4)
+        self.microphone = QCheckBox("同时录制麦克风")
+        self.microphone.setChecked(bool(self.cfg["recorder"].get("microphone")))
+        self.microphone.toggled.connect(self.update_controls)
+        devices.addWidget(self.microphone)
+        devices.addWidget(self.microphone_devices)
+        columns.addWidget(device_panel, 6)
+
+        self.device_hint = label("", "muted")
+        self.device_hint.setWordWrap(True)
+        devices.addWidget(self.device_hint)
+        return panel
+
+    def build_recording_panel(self) -> QWidget:
+        panel = QWidget()
+        columns = QHBoxLayout(panel)
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(18)
+        timer = QVBoxLayout()
+        timer.setSpacing(8)
+        self.record_badge = label("正在启动录音…", "recordBadge")
+        timer.addWidget(self.record_badge, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.record_clock = label("00:00:00", "recordClock")
+        self.record_clock.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.record_clock.setAccessibleName("录音时长")
+        timer.addWidget(self.record_clock)
+        controls = QHBoxLayout()
+        self.stop = QPushButton("停止录音")
+        self.stop.setObjectName("stop")
+        self.stop.setIcon(line_icon("stop", "#89253e"))
+        self.stop.clicked.connect(self.request_stop)
+        controls.addWidget(self.stop)
+        hint = label("停止后自动转写", "muted")
+        hint.setWordWrap(True)
+        controls.addWidget(hint, 1)
+        timer.addLayout(controls)
+        timer.addStretch()
+        columns.addLayout(timer, 5)
+
+        meter_panel = QFrame()
+        meter_panel.setObjectName("meterPanel")
+        meters = QVBoxLayout(meter_panel)
+        meters.setContentsMargins(15, 13, 15, 13)
+        meters.setSpacing(10)
+        self.tracks: list[tuple[QWidget, QLabel, AudioLevel]] = []
+        for name, color in (("电脑声音", "#7655d6"), ("麦克风", "#9270c2")):
+            track = QWidget()
+            readings = QVBoxLayout(track)
+            readings.setContentsMargins(0, 0, 0, 0)
+            readings.setSpacing(5)
+            caption = label(name, "fieldLabel")
+            caption.setWordWrap(True)
+            level = AudioLevel(f"{name}电平", color)
+            readings.addWidget(caption)
+            readings.addWidget(level)
+            self.tracks.append((track, caption, level))
+            meters.addWidget(track)
+        columns.addWidget(meter_panel, 6)
+        return panel
 
     def refresh_devices(self) -> None:
         if sys.platform != "win32":
@@ -314,7 +521,12 @@ class MeetingWindow(QMainWindow):
                 title = workflow.metadata(session).get("title") or session.session_id
                 item = QListWidgetItem(str(title))
                 item.setData(Qt.ItemDataRole.UserRole, session.session_id)
-                item.setToolTip(session.session_id)
+                date = session_date(session)
+                if date is not None:
+                    caption = f"{date.month} 月 {date.day} 日"
+                    item.setData(HISTORY_DATE, caption)
+                    item.setData(Qt.ItemDataRole.AccessibleTextRole, f"{title}，{caption}")
+                item.setToolTip(f"<qt>{escape(str(title))}<br>{escape(session.session_id)}</qt>")
                 self.sessions.addItem(item)
                 if selected and session.session_id == selected.session_id:
                     chosen = item
@@ -342,7 +554,10 @@ class MeetingWindow(QMainWindow):
         self.minutes_path = None
         self.recovery = []
         self.has_audio = False
-        message = "从录音或导入开始。"
+        message, tone = "", "neutral"
+        date = session_date(session)
+        self.date.setVisible(date is not None)
+        self.date.setText(f"{date.year} 年 {date.month} 月 {date.day} 日" if date else "")
         if session is not None:
             self.title.setText(str(workflow.metadata(session).get("title") or session.session_id))
             if session.minutes_md.is_file():
@@ -354,11 +569,16 @@ class MeetingWindow(QMainWindow):
                 self.has_audio = workflow.available_audio(session)[0]
                 self.recovery = workflow.recovery_sources(session)
                 message = self.session_status(session)
+                if self.minutes_path is not None or self.transcript_path is not None:
+                    tone = "success"
+                elif self.recovery:
+                    tone = "warning"
             except (OSError, ValueError) as error:
                 message = f"无法读取会话音频：{error}"
+                tone = "error"
         else:
             self.title.setText("新建会议")
-        self.stage.setText(message)
+        self.set_status(message, tone)
         self.transcript.show_file(
             self.transcript_path, "转写完成后在这里查看带时间戳的发言。", f"# 会议转写 {session_id}"
         )
@@ -382,20 +602,30 @@ class MeetingWindow(QMainWindow):
             return "检测到未完成的录音，可以从已保存的分段恢复。"
         return "该会话暂无可用音频。"
 
+    def recording_active(self) -> bool:
+        return self.stop_requested is not None and not self.stop_requested.is_set()
+
+    def set_status(self, message: str, tone: str = "neutral") -> None:
+        style_property(self.status_dot, "tone", tone)
+        self.stage.setText(message)
+        self.status_strip.setVisible(bool(message) and not self.recording_active())
+
     def update_controls(self) -> None:
         running = self.job is not None
         stop = self.stop_requested
-        recording = stop is not None
-        cleanup = self.recorder is not None and not recording
+        capturing = self.recording_active()
+        cleanup = self.recorder is not None and stop is None
         ready = not running and not cleanup
-        self.capture_card.setVisible(self.session is None or recording)
+        setup = self.session is None and not running and stop is None
+        self.capture_card.setVisible(setup or capturing)
+        self.capture_setup.setVisible(setup)
+        self.capture_recording.setVisible(capturing)
+        style_property(self.new, "primaryAction", self.session is not None and ready)
         self.new.setEnabled(ready)
         self.sessions.setEnabled(ready)
         self.settings_button.setEnabled(ready)
-        self.start.setVisible(not recording)
         self.start.setEnabled(ready and self.loopback_available)
-        self.stop.setVisible(recording)
-        self.stop.setEnabled(stop is not None and not stop.is_set())
+        self.stop.setEnabled(capturing)
         self.import_button.setEnabled(ready)
         self.meeting_name.setEnabled(ready)
         self.loopback_devices.setEnabled(ready and self.loopback_available)
@@ -404,10 +634,11 @@ class MeetingWindow(QMainWindow):
             ready and self.mic_available and self.microphone.isChecked()
         )
         self.refresh_audio.setEnabled(ready and sys.platform == "win32")
-        self.meter_area.setVisible(recording)
-        self.indicator.setVisible(running and (stop is None or stop.is_set()))
+        self.indicator.setVisible(running and not capturing)
         raw = self.session is not None and (self.session.root / "asr_raw.json").is_file()
-        self.retry.setVisible(cleanup or bool(self.recovery) or raw or self.has_audio)
+        self.retry.setVisible(
+            not running and (cleanup or bool(self.recovery) or raw or self.has_audio)
+        )
         self.retry.setEnabled(not running)
         self.retry.setText(
             "重试保存录音"
@@ -420,10 +651,12 @@ class MeetingWindow(QMainWindow):
             if self.transcript_path
             else "转写音频"
         )
-        self.generate.setVisible(self.session is not None)
+        show_actions = self.session is not None and not running
+        self.generate.setVisible(show_actions)
         self.generate.setEnabled(ready and self.transcript_path is not None)
         self.generate.setText("重新生成纪要" if self.minutes_path is not None else "生成纪要")
-        self.more.setVisible(self.session is not None)
+        style_property(self.generate, "primaryAction", self.minutes_path is None)
+        self.more.setVisible(show_actions)
         self.more.setEnabled(ready)
         self.export_transcript.setEnabled(self.transcript_path is not None)
         self.export_minutes.setEnabled(self.minutes_path is not None)
@@ -451,7 +684,9 @@ class MeetingWindow(QMainWindow):
 
     def show_stage(self, message: str) -> None:
         self.indicator.setRange(0, 0)
-        self.stage.setText(message)
+        if self.recording_active():
+            self.record_badge.setText(message)
+        self.set_status(message)
 
     def show_model_download(self, progress: ModelDownloadProgress) -> None:
         downloaded, total = progress.downloaded, progress.total
@@ -464,7 +699,7 @@ class MeetingWindow(QMainWindow):
         self.indicator.setValue(int(fraction * 1000))
         size = f"{downloaded / 2**20:.1f} / {total / 2**20:.1f} MiB"
         if progress.complete:
-            self.stage.setText(f"Whisper 模型 {progress.model} 已下载 · {size}")
+            self.set_status(f"Whisper 模型 {progress.model} 已下载 · {size}")
             return
         if downloaded == total:
             timing = "正在校验文件"
@@ -473,7 +708,7 @@ class MeetingWindow(QMainWindow):
             timing = f"预计剩余 {ts(seconds)}"
         else:
             timing = "正在估算剩余时间"
-        self.stage.setText(
+        self.set_status(
             f"正在下载 Whisper 模型 {progress.model} · {fraction:.1%} · {size} · {timing}"
         )
 
@@ -497,7 +732,7 @@ class MeetingWindow(QMainWindow):
             elif was_recording and self.recovery:
                 error += "\n已写入的分段仍在，可以点击「恢复录音」。"
             self.log.appendPlainText(error)
-            self.stage.setText("处理失败 · " + error)
+            self.set_status("处理失败 · " + error, "error")
         elif done is not None:
             done(job.result)
         if self.close_after_recording and not self.job and self.recorder is None:
@@ -515,7 +750,7 @@ class MeetingWindow(QMainWindow):
             session = Pipeline(self.cfg).new_session(title)
             session.save_json("meeting.json", {"title": title})
         except (OSError, RuntimeError) as error:
-            self.stage.setText(f"无法新建会话：{error}")
+            self.set_status(f"无法新建会话：{error}", "error")
             return None
         self.meeting_name.clear()
         self.refresh_history(session)
@@ -551,18 +786,16 @@ class MeetingWindow(QMainWindow):
     def request_stop(self) -> None:
         if self.stop_requested is not None:
             self.stop_requested.set()
-            self.stage.setText("正在保存录音…")
+            self.set_status("正在保存录音…")
             self.update_controls()
 
     def show_meter(self, status: dict) -> None:
         if self.stop_requested is None:
             return
-        for index, (name, track) in enumerate(
-            (("电脑声音", status), ("麦克风", status.get("microphone")))
+        for (widget, caption, meter), (name, track) in zip(
+            self.tracks, (("电脑声音", status), ("麦克风", status.get("microphone")))
         ):
-            caption, meter = self.track_labels[index], self.track_levels[index]
-            caption.setVisible(track is not None)
-            meter.setVisible(track is not None)
+            widget.setVisible(track is not None)
             if track is None:
                 continue
             no_data = track.get("no_data_sec", 0)
@@ -573,8 +806,11 @@ class MeetingWindow(QMainWindow):
             caption.setText(f"{name}  {duration}{warning}")
             level = track.get("level", 0) if no_data < 2 else 0
             meter.setValue(min(100, int(max(0, level) ** 0.5 * 200)))
-        if not self.stop_requested.is_set():
-            self.stage.setText(f"正在录音 · {ts(time.monotonic() - self.recorded_at)}")
+        if self.recording_active():
+            elapsed = max(0, int(time.monotonic() - self.recorded_at))
+            hours, remainder = divmod(elapsed, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            self.record_clock.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
     def recording_saved(self, session: Session, result: dict) -> None:
         for caption, track in (("电脑声音", result), ("麦克风", result.get("microphone"))):
@@ -619,10 +855,10 @@ class MeetingWindow(QMainWindow):
     def transcription_saved(self, result: dict) -> None:
         self.tabs.setCurrentWidget(self.transcript)
         if not result["utterances"]:
-            self.stage.setText("转写未检测到发言。请检查录音设备或换一段音频。")
+            self.set_status("转写未检测到发言。请检查录音设备或换一段音频。", "warning")
             self.generate.setEnabled(False)
         elif result.get("diarization_status", {}).get("status") == "fallback":
-            self.stage.setText("转写已保存，内录说话人分离失败，已按单人显示。")
+            self.set_status("转写已保存，内录说话人分离失败，已按单人显示。", "warning")
 
     def retry_transcription(self) -> None:
         session = self.session
@@ -658,7 +894,7 @@ class MeetingWindow(QMainWindow):
         try:
             llm = get_llm(self.cfg, api_key=self.api_key or None)
         except (RuntimeError, ValueError) as error:
-            self.stage.setText(f"请检查纪要设置：{error}")
+            self.set_status(f"请检查纪要设置：{error}", "error")
             return
         if not isinstance(llm, MockLLM):
             prompt = (
@@ -693,9 +929,9 @@ class MeetingWindow(QMainWindow):
                 target = Path(filename)
                 if target.resolve() != path.resolve():
                     shutil.copyfile(path, target)
-                self.stage.setText(f"已导出至 {target}")
+                self.set_status(f"已导出至 {target}", "success")
             except OSError as error:
-                self.stage.setText(f"导出失败：{error}")
+                self.set_status(f"导出失败：{error}", "error")
 
     def export_prompt(self) -> None:
         session = self.session
@@ -740,7 +976,7 @@ class MeetingWindow(QMainWindow):
         if self.session is not None and not QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(self.session.root))
         ):
-            self.stage.setText(f"无法打开会话文件夹：{self.session.root}")
+            self.set_status(f"无法打开会话文件夹：{self.session.root}", "error")
 
     def show_settings(self) -> None:
         dialog = SettingsDialog(self.cfg, self.api_key, self)
@@ -776,8 +1012,7 @@ def run(config: Path | None) -> int:
     app = QApplication([])
     app.setOrganizationName("MeetMin")
     app.setApplicationName("MeetMin")
-    app.setStyle("Fusion")
-    app.setStyleSheet(STYLESHEET)
+    apply_light_theme(app)
     settings = QSettings()
     try:
         if config is not None:
