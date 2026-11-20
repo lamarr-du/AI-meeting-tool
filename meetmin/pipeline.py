@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, overload
 
 from .asr.base import ASRResult, Utterance
+from .asr.model_download import ModelDownloadProgress
 from .asr.punctuation import punctuate_chinese
 from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
@@ -89,6 +90,7 @@ class Pipeline:
         audio_path: str | Path | None = None,
         file_url: str | None = None,
         on_asr_ready: Callable[[], None] | None = None,
+        on_model_download: Callable[[ModelDownloadProgress], None] | None = None,
     ) -> dict:
         audio, microphone = (Path(audio_path), None) if audio_path else session.recording_paths()
         if microphone is not None and self.cfg.get("asr", {}).get("provider") == "dashscope":
@@ -100,7 +102,11 @@ class Pipeline:
         t0 = time.time()
         from .asr import get_asr
 
-        provider = get_asr(self.cfg)
+        provider = (
+            get_asr(self.cfg, on_model_download=on_model_download)
+            if on_model_download is not None
+            else get_asr(self.cfg)
+        )
         # 本地 ASR 传解码后的 16k 数组；云端（需 URL）传 None 由 provider 处理
         local_like = provider.name == "faster_whisper"
 

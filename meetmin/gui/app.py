@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import math
 import shutil
 import sys
 import time
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..asr.model_download import ModelDownloadProgress
 from ..audio.loopback_recorder import RecordingError, list_loopback_devices, list_microphone_devices
 from ..audio.session_recorder import SessionRecorder
 from ..config import deep_merge, load_config
@@ -86,6 +88,7 @@ class Job(QThread):
     stage = Signal(str)
     log = Signal(str)
     meter = Signal(dict)
+    model_download = Signal(object)
 
     def __init__(self, action: Callable[[Job], Any], parent: QWidget):
         super().__init__(parent)
@@ -435,15 +438,44 @@ class MeetingWindow(QMainWindow):
         done: Callable[[Any], None] | None = None,
     ) -> None:
         assert self.job is None
-        self.stage.setText(starting)
+        self.show_stage(starting)
         self.job = Job(action, self)
         self.job_done = done
-        self.job.stage.connect(self.stage.setText)
+        self.job.stage.connect(self.show_stage)
         self.job.log.connect(self.log.appendPlainText)
         self.job.meter.connect(self.show_meter)
+        self.job.model_download.connect(self.show_model_download)
         self.job.finished.connect(self.job_finished)
         self.job.start()
         self.update_controls()
+
+    def show_stage(self, message: str) -> None:
+        self.indicator.setRange(0, 0)
+        self.stage.setText(message)
+
+    def show_model_download(self, progress: ModelDownloadProgress) -> None:
+        downloaded, total = progress.downloaded, progress.total
+        if not total:
+            amount = f"{downloaded / 2**20:.1f} MiB"
+            self.show_stage(f"正在下载 Whisper 模型 {progress.model} · 已下载 {amount}")
+            return
+        fraction = downloaded / total
+        self.indicator.setRange(0, 1000)
+        self.indicator.setValue(int(fraction * 1000))
+        size = f"{downloaded / 2**20:.1f} / {total / 2**20:.1f} MiB"
+        if progress.complete:
+            self.stage.setText(f"Whisper 模型 {progress.model} 已下载 · {size}")
+            return
+        if downloaded == total:
+            timing = "正在校验文件"
+        elif progress.bytes_per_second and progress.bytes_per_second > 0:
+            seconds = math.ceil((total - downloaded) / progress.bytes_per_second)
+            timing = f"预计剩余 {ts(seconds)}"
+        else:
+            timing = "正在估算剩余时间"
+        self.stage.setText(
+            f"正在下载 Whisper 模型 {progress.model} · {fraction:.1%} · {size} · {timing}"
+        )
 
     def job_finished(self) -> None:
         job = self.job
@@ -579,6 +611,7 @@ class MeetingWindow(QMainWindow):
                 session,
                 job.stage.emit,
                 align_only=align_only,
+                on_model_download=job.model_download.emit,
             ),
             self.transcription_saved,
         )

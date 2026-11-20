@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ import numpy as np
 from ..audio.dsp import TARGET_SR
 from ..glossary import glossary_hotwords, load_terms, select_terms
 from .base import ASRProvider, ASRResult, Utterance
+from .model_download import ModelDownloadProgress, download_model
 from .profile import memory_status, select_profile
 from .quality import Decoded, QualityOptions, Span, review
 
@@ -84,7 +86,12 @@ def _configure_huggingface_download(acfg: dict) -> None:
 class FasterWhisperASR(ASRProvider):
     name = "faster_whisper"
 
-    def __init__(self, acfg: dict):
+    def __init__(
+        self,
+        acfg: dict,
+        *,
+        on_model_download: Callable[[ModelDownloadProgress], None] | None = None,
+    ):
         _configure_huggingface_download(acfg)
         try:
             from faster_whisper import WhisperModel
@@ -92,6 +99,7 @@ class FasterWhisperASR(ASRProvider):
             raise RuntimeError("缺少依赖 faster-whisper，请先: pip install faster-whisper") from e
         self.acfg = acfg
         self._model_class = WhisperModel
+        self._on_model_download = on_model_download
         from ..doctor import gpu_status
 
         self._profile = select_profile(
@@ -105,9 +113,7 @@ class FasterWhisperASR(ASRProvider):
         self._used_fallback = False
         try:
             try:
-                self.model = WhisperModel(
-                    self._size, device=self._device, compute_type=self._compute
-                )
+                self.model = self._load_model()
             except Exception as e:
                 if self._device != "cuda" or not self._is_oom(e):
                     raise
@@ -122,6 +128,13 @@ class FasterWhisperASR(ASRProvider):
                 "  · 已默认关闭 Hugging Face Xet 下载；如需启用可设 asr.hf_disable_xet: false\n"
                 "  · 或先手动下载模型，把 asr.model_size 指向本地模型目录"
             ) from e
+
+    def _load_model(self):
+        source = self._size
+        if self._on_model_download is not None:
+            path = Path(source).expanduser()
+            source = str(path) if path.is_dir() else download_model(source, self._on_model_download)
+        return self._model_class(source, device=self._device, compute_type=self._compute)
 
     @staticmethod
     def _is_oom(error: Exception) -> bool:
@@ -138,7 +151,7 @@ class FasterWhisperASR(ASRProvider):
         self._size = self._profile.cpu_fallback_model
         self._device, self._compute = "cpu", "int8"
         self._used_fallback = True
-        self.model = self._model_class(self._size, device="cpu", compute_type="int8")
+        self.model = self._load_model()
 
     def _apply_glossary(
         self, hotwords: str | None, language: str | None

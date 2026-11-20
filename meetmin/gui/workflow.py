@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from threading import Event
 
+from ..asr.model_download import ModelDownloadProgress
 from ..audio.segments import SessionLock
 from ..audio.session_recorder import SessionRecorder, recover_recording
 from ..pipeline import Pipeline
@@ -116,6 +117,7 @@ def transcribe(
     stage: Callable[[str], None],
     *,
     align_only: bool = False,
+    on_model_download: Callable[[ModelDownloadProgress], None] | None = None,
 ) -> dict:
     if not align_only:
         provider = (pipe.cfg["asr"].get("provider") or "faster_whisper").lower()
@@ -124,8 +126,13 @@ def transcribe(
         exists, source = available_audio(session)
         if not exists:
             raise FileNotFoundError("找不到该会话的音频文件。")
-        stage("正在准备语音模型，首次使用可能需要下载…")
-        pipe.transcribe(session, audio_path=source, on_asr_ready=lambda: stage("正在转写音频…"))
+        stage("正在检查语音模型缓存和文件大小…")
+        pipe.transcribe(
+            session,
+            audio_path=source,
+            on_asr_ready=lambda: stage("正在转写音频…"),
+            on_model_download=on_model_download,
+        )
     stage("正在整理转写与说话人…")
     return pipe.diarize(session)
 
