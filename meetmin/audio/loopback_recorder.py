@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from .dsp import rms
 from .segments import SegmentedWriter, merge_segments
 
 
@@ -81,6 +82,38 @@ class _AudioBlock:
     frames: int
     timing: dict
     received_at: float
+
+
+class _LoopbackLevel:
+    """在量化为 16 位 PCM 前补偿低电平。由写线程持有，每次录音重新初始化。"""
+
+    TARGET_RMS = 0.03
+    MAX_GAIN = 10_000.0  # 80 dB allows for strong attenuation at low playback volume.
+
+    def __init__(self, rate: int):
+        self.rate = rate
+        self.reference = 0.0
+        self.gain: float | None = None
+
+    def to_pcm(self, data: bytes, frames: int) -> bytes:
+        samples = np.frombuffer(data, dtype="<f4")
+        peak = float(np.max(np.abs(samples)))
+        if not math.isfinite(peak):
+            raise RuntimeError("内录采样包含无效浮点值")
+        if peak == 0:
+            return bytes(len(data) // 2)
+
+        # A slowly falling reference keeps short gaps from turning up the gain.
+        self.reference = max(rms(samples), self.reference * math.exp(-frames / self.rate / 0.4))
+        # Leave peak headroom when boosting and pass normal-level audio through at unity gain.
+        gain = max(1.0, min(self.TARGET_RMS / self.reference, self.MAX_GAIN, 0.95 / peak))
+        if self.gain is not None and gain > self.gain:
+            ramp = np.linspace(self.gain, gain, frames, dtype=np.float32)
+            samples = samples.reshape(frames, -1) * ramp[:, None]
+        else:
+            samples = samples * gain
+        self.gain = gain
+        return np.rint(np.clip(samples * 32768, -32768, 32767)).astype("<i2").tobytes()
 
 
 class _Timeline:
@@ -185,6 +218,8 @@ class LoopbackRecorder:
         self._audio_file: SegmentedWriter | None = None
         self._sealed_writer: SegmentedWriter | None = None
         self._chunk_frames = 0
+        self._capture_sample_width = 2
+        self._loopback_level: _LoopbackLevel | None = None
         self.device_name = ""
         self.sample_rate_actual = 0
         self.channels_actual = 0
@@ -290,6 +325,9 @@ class LoopbackRecorder:
         info = self._resolve_device(self._pa)
         sr = int(self.sample_rate or info["defaultSampleRate"])
         ch = int(self.channels or max(1, min(2, int(info["maxInputChannels"]))))
+        is_loopback = bool(info.get("isLoopbackDevice"))
+        self._loopback_level = _LoopbackLevel(sr) if is_loopback else None
+        self._capture_sample_width = 4 if is_loopback else 2
         path = self.path
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -312,7 +350,7 @@ class LoopbackRecorder:
         self._pa_continue = pyaudio.paContinue
         self._pa_abort = pyaudio.paAbort
         self._stream = self._pa.open(
-            format=pyaudio.paInt16,
+            format=pyaudio.paFloat32 if is_loopback else pyaudio.paInt16,
             channels=ch,
             rate=sr,
             input=True,
@@ -355,7 +393,8 @@ class LoopbackRecorder:
             if frame_count:
                 if not 0 < frame_count <= self._chunk_frames:
                     raise RuntimeError("音频回调帧数超过配置的缓冲区大小")
-                if data is None or len(data) != frame_count * self.channels_actual * 2:
+                expected_bytes = frame_count * self.channels_actual * self._capture_sample_width
+                if data is None or len(data) != expected_bytes:
                     raise RuntimeError("音频回调数据长度与帧数不符")
                 received = self._now()
                 self._queue.put_nowait(_AudioBlock(data, frame_count, time_info, received))
@@ -414,8 +453,10 @@ class LoopbackRecorder:
             position = min(position, end)
             frames = min(frames, max(0, end - position))
         self._pad_to(position)
-        data = block.data[: frames * self.channels_actual * 2]
+        data = block.data[: frames * self.channels_actual * self._capture_sample_width]
         if data:
+            if self._loopback_level is not None:
+                data = self._loopback_level.to_pcm(data, frames)
             self._wf.writeframesraw(data)
             self._update_level(data, record_arrival=False)
 
