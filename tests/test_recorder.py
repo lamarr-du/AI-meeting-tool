@@ -265,6 +265,37 @@ def test_loopback_boost_preserves_stereo_balance_and_peak_headroom(recording):
     assert stereo[4800, 1] == round(-0.95 * 32768)
 
 
+@pytest.mark.parametrize("capture_silence", [True, False])
+def test_loopback_reestimates_gain_after_silence(recording, capture_silence):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0, value=4000)
+    if capture_silence:
+        stream.emit(0.1, value=0)
+        stream.emit(0.2, value=0)
+    stream.emit(0.3, value=8)
+    r.rec.stop()
+
+    audio = read_audio(r.path)
+    np.testing.assert_array_equal(audio[:100], np.full(100, 4000))
+    np.testing.assert_array_equal(audio[100:300], np.zeros(200))
+    assert np.min(audio[300:]) > 600
+
+
+def test_loopback_boosts_quieter_speech_after_loud_speech_without_a_gap(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0, value=4000)
+    for block in range(1, 8):
+        stream.emit(block / 10, value=8)
+    r.rec.stop()
+
+    audio = read_audio(r.path)
+    assert np.min(audio[600:]) > 600
+
+
 def test_backlog_does_not_insert_silence(recording, monkeypatch):
     r = recording
     release = threading.Event()

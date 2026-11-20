@@ -89,11 +89,20 @@ class _LoopbackLevel:
 
     TARGET_RMS = 0.03
     MAX_GAIN = 10_000.0  # 80 dB allows for strong attenuation at low playback volume.
+    RELEASE_SECONDS = 0.08
+    RESET_AFTER_SILENCE_SECONDS = 0.2
 
     def __init__(self, rate: int):
         self.rate = rate
         self.reference = 0.0
         self.gain: float | None = None
+        self.silent_frames = 0
+
+    def add_silence(self, frames: int) -> None:
+        self.silent_frames += frames
+        if self.silent_frames >= self.rate * self.RESET_AFTER_SILENCE_SECONDS:
+            self.reference = 0.0
+            self.gain = None
 
     def to_pcm(self, data: bytes, frames: int) -> bytes:
         samples = np.frombuffer(data, dtype="<f4")
@@ -101,10 +110,13 @@ class _LoopbackLevel:
         if not math.isfinite(peak):
             raise RuntimeError("内录采样包含无效浮点值")
         if peak == 0:
+            self.add_silence(frames)
             return bytes(len(data) // 2)
 
-        # A slowly falling reference keeps short gaps from turning up the gain.
-        self.reference = max(rms(samples), self.reference * math.exp(-frames / self.rate / 0.4))
+        self.silent_frames = 0
+        # Release the previous level gradually when quieter speech follows without a pause.
+        release = math.exp(-frames / (self.rate * self.RELEASE_SECONDS))
+        self.reference = max(rms(samples), self.reference * release)
         # Leave peak headroom when boosting and pass normal-level audio through at unity gain.
         gain = max(1.0, min(self.TARGET_RMS / self.reference, self.MAX_GAIN, 0.95 / peak))
         if self.gain is not None and gain > self.gain:
@@ -437,6 +449,9 @@ class LoopbackRecorder:
 
     def _pad_to(self, target: int) -> None:
         assert self._wf is not None
+        gap_frames = target - self._frames
+        if gap_frames > 0 and self._loopback_level is not None:
+            self._loopback_level.add_silence(gap_frames)
         while self._frames < target:
             frames = min(target - self._frames, self.sample_rate_actual)
             self._wf.writeframesraw(bytes(frames * self.channels_actual * 2))
