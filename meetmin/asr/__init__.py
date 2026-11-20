@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from .base import ASRProvider, ASRResult, Utterance  # noqa: F401
+from .model_download import ModelDownloadProgress
 
 
-def get_asr(cfg: dict) -> ASRProvider:
+def get_asr(
+    cfg: dict, *, on_model_download: Callable[[ModelDownloadProgress], None] | None = None
+) -> ASRProvider:
     name = (cfg["asr"].get("provider") or "faster_whisper").lower()
     if name in ("faster_whisper", "faster-whisper", "whisper"):
         from .faster_whisper_asr import FasterWhisperASR
 
-        return FasterWhisperASR(cfg["asr"])
+        return FasterWhisperASR(cfg["asr"], on_model_download=on_model_download)
     if name in ("dashscope", "paraformer"):
         from .dashscope_asr import DashScopeParaformerASR
 

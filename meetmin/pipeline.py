@@ -6,10 +6,12 @@ import datetime as dt
 import os
 import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, overload
 
 from .asr.base import ASRResult, Utterance
+from .asr.model_download import ModelDownloadProgress
 from .asr.punctuation import punctuate_chinese
 from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
@@ -82,7 +84,13 @@ class Pipeline:
 
     # ---------------- (2) 转写 + 说话人分离 ----------------
     def transcribe(
-        self, session: Session, *, audio_path: str | Path | None = None, file_url: str | None = None
+        self,
+        session: Session,
+        *,
+        audio_path: str | Path | None = None,
+        file_url: str | None = None,
+        on_asr_ready: Callable[[], None] | None = None,
+        on_model_download: Callable[[ModelDownloadProgress], None] | None = None,
     ) -> dict:
         audio, microphone = (Path(audio_path), None) if audio_path else session.recording_paths()
         if microphone is not None and self.cfg.get("asr", {}).get("provider") == "dashscope":
@@ -94,7 +102,11 @@ class Pipeline:
         t0 = time.time()
         from .asr import get_asr
 
-        provider = get_asr(self.cfg)
+        provider = (
+            get_asr(self.cfg, on_model_download=on_model_download)
+            if on_model_download is not None
+            else get_asr(self.cfg)
+        )
         # 本地 ASR 传解码后的 16k 数组；云端（需 URL）传 None 由 provider 处理
         local_like = provider.name == "faster_whisper"
 
@@ -135,6 +147,8 @@ class Pipeline:
 
         provider_name = provider.name
         try:
+            if on_asr_ready is not None:
+                on_asr_ready()
             result, duration = transcribe_track(audio, file_url)
             utterances = [u for u in result.utterances if u.text.strip()]
             self.progress(
@@ -457,7 +471,7 @@ class Pipeline:
             lines.append("完整性：接口未报告截断（内容仍需人工核对）。")
         else:
             lines.append("完整性：无法确认（接口未提供可识别的结束原因）。")
-        path = session.save_text("minutes.md", "\n".join(lines))
+        path = session.save_text_safely("minutes.md", "\n".join(lines), overwrite=True)
         self.progress(f"  ✓ 纪要已写入：{path}")
         return path, usage
 

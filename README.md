@@ -46,6 +46,34 @@ uv pip compile requirements.txt --python-platform windows --python-version 3.12 
 
 受限 DSH 沙箱若出现带 `pip-unpack-*` 路径的权限错误，可尝试在 PowerShell 设置 `$env:PYTHONPATH="$PWD\scripts\sandbox_fix"` 后重新安装；普通环境无需设置。
 
+## Windows 桌面版
+
+从源码试用时，在仓库根目录执行：
+
+```powershell
+python -m pip install ".[gui]"
+meetmin-gui
+# 或指定现有 YAML，同时访问配置所指向的 CLI 会话
+python -m meetmin.gui --config config.yaml
+```
+
+在「新建会议」中选择「开始录音」或「导入音频」。录音可同时采集电脑声音和麦克风，并显示两轨电平。点击停止后，桌面版会先保存录音，再开始本地 Whisper 转写和说话人整理。首次下载 Whisper 模型时，界面显示下载百分比、已下载量、总大小和预计剩余时间。导入音频时，桌面版会将音频复制到会话目录，便于后续重试。
+
+转写完成后可以预览、生成纪要，或从「更多操作」导出 Markdown。调用纪要 API 前会显示接收转写的 API 地址和模型。「设置」中可配置 API 地址和模型，以及本次运行使用的 API Key。Key 留空时沿用 YAML 指定的环境变量。还可以从「更多操作」导出 AI 网页提示词，使用自己选的 AI 网页，再导入得到的纪要文本。
+
+默认会话位置由 Windows 用户应用数据目录提供，可在「设置」中修改。指定 `--config` 时，相对的 `output_dir` 以该 YAML 所在目录为基准。想要本地多说话人分离时，可在源码版本中安装 `.[gui,diar]`。Windows 以外的桌面版可导入已有音频。
+
+### 构建 Windows 便携版
+
+在 Windows Python 环境中构建：
+
+```powershell
+python -m pip install ".[gui]" "PyInstaller>=6,<7"
+python scripts/build_desktop.py
+```
+
+双击 `dist/desktop/MeetMin/MeetMin.exe` 启动，复制到另一台电脑时请携带整个 `MeetMin` 文件夹。便携版包含 Python 和 Qt 运行时，Whisper 权重在首次使用时下载或读取已有缓存。便携版采用单说话人分组，双轨录音中的麦克风发言仍标记为「我」。
+
 ## 快速开始
 
 安装后可使用 `meetmin` 或 `python -m meetmin`；从源码运行的 `python main.py` 仍保留。以下示例在仓库根目录执行，以便读取仓库中的配置。配置默认读取当前目录的 `config.yaml`，缺项使用内置默认值；自定义配置使用 `meetmin --config my-config.yaml <子命令>`，`--config` 放在子命令之前。
