@@ -84,16 +84,17 @@ class _AudioBlock:
     received_at: float
 
 
-class _LoopbackLevel:
+class _AdaptiveLevel:
     """在量化为 16 位 PCM 前补偿低电平。由写线程持有，每次录音重新初始化。"""
 
     TARGET_RMS = 0.03
-    MAX_GAIN = 10_000.0  # 80 dB allows for strong attenuation at low playback volume.
     RELEASE_SECONDS = 0.08
     RESET_AFTER_SILENCE_SECONDS = 0.2
 
-    def __init__(self, rate: int):
+    def __init__(self, rate: int, *, max_gain: float, noise_floor: float = 0.0):
         self.rate = rate
+        self.max_gain = max_gain
+        self.noise_floor = noise_floor
         self.reference = 0.0
         self.gain: float | None = None
         self.silent_frames = 0
@@ -108,17 +109,23 @@ class _LoopbackLevel:
         samples = np.frombuffer(data, dtype="<f4")
         peak = float(np.max(np.abs(samples)))
         if not math.isfinite(peak):
-            raise RuntimeError("内录采样包含无效浮点值")
+            raise RuntimeError("录音采样包含无效浮点值")
         if peak == 0:
             self.add_silence(frames)
             return bytes(len(data) // 2)
 
         self.silent_frames = 0
+        level = rms(samples)
         # Release the previous level gradually when quieter speech follows without a pause.
         release = math.exp(-frames / (self.rate * self.RELEASE_SECONDS))
-        self.reference = max(rms(samples), self.reference * release)
+        self.reference = max(level, self.reference * release)
+        gain_limit = self.max_gain
+        if self.noise_floor:
+            # Taper off boost near the microphone noise floor without gating the signal.
+            boost_fraction = max(0.0, min(1.0, (level - self.noise_floor) / self.noise_floor))
+            gain_limit = 1.0 + (self.max_gain - 1.0) * boost_fraction
         # Leave peak headroom when boosting and pass normal-level audio through at unity gain.
-        gain = max(1.0, min(self.TARGET_RMS / self.reference, self.MAX_GAIN, 0.95 / peak))
+        gain = max(1.0, min(self.TARGET_RMS / self.reference, gain_limit, 0.95 / peak))
         if self.gain is not None and gain > self.gain:
             ramp = np.linspace(self.gain, gain, frames, dtype=np.float32)
             samples = samples.reshape(frames, -1) * ramp[:, None]
@@ -231,7 +238,7 @@ class LoopbackRecorder:
         self._sealed_writer: SegmentedWriter | None = None
         self._chunk_frames = 0
         self._capture_sample_width = 2
-        self._loopback_level: _LoopbackLevel | None = None
+        self._level_control: _AdaptiveLevel | None = None
         self.device_name = ""
         self.sample_rate_actual = 0
         self.channels_actual = 0
@@ -286,6 +293,11 @@ class LoopbackRecorder:
             return d
         raise RuntimeError("未找到 WASAPI loopback 设备（需要 Windows，且系统有可用输出设备）")
 
+    def _create_level_control(self, rate: int, info: dict) -> _AdaptiveLevel | None:
+        if info.get("isLoopbackDevice"):
+            return _AdaptiveLevel(rate, max_gain=10_000.0)  # Up to 80 dB for playback attenuation.
+        return None
+
     # ---------------- 生命周期 ----------------
     def start(self, wav_path: str | Path, *, overwrite: bool = False) -> None:
         try:
@@ -337,9 +349,9 @@ class LoopbackRecorder:
         info = self._resolve_device(self._pa)
         sr = int(self.sample_rate or info["defaultSampleRate"])
         ch = int(self.channels or max(1, min(2, int(info["maxInputChannels"]))))
-        is_loopback = bool(info.get("isLoopbackDevice"))
-        self._loopback_level = _LoopbackLevel(sr) if is_loopback else None
-        self._capture_sample_width = 4 if is_loopback else 2
+        self._level_control = self._create_level_control(sr, info)
+        float_capture = self._level_control is not None
+        self._capture_sample_width = 4 if float_capture else 2
         path = self.path
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -362,7 +374,7 @@ class LoopbackRecorder:
         self._pa_continue = pyaudio.paContinue
         self._pa_abort = pyaudio.paAbort
         self._stream = self._pa.open(
-            format=pyaudio.paFloat32 if is_loopback else pyaudio.paInt16,
+            format=pyaudio.paFloat32 if float_capture else pyaudio.paInt16,
             channels=ch,
             rate=sr,
             input=True,
@@ -450,8 +462,8 @@ class LoopbackRecorder:
     def _pad_to(self, target: int) -> None:
         assert self._wf is not None
         gap_frames = target - self._frames
-        if gap_frames > 0 and self._loopback_level is not None:
-            self._loopback_level.add_silence(gap_frames)
+        if gap_frames > 0 and self._level_control is not None:
+            self._level_control.add_silence(gap_frames)
         while self._frames < target:
             frames = min(target - self._frames, self.sample_rate_actual)
             self._wf.writeframesraw(bytes(frames * self.channels_actual * 2))
@@ -470,8 +482,8 @@ class LoopbackRecorder:
         self._pad_to(position)
         data = block.data[: frames * self.channels_actual * self._capture_sample_width]
         if data:
-            if self._loopback_level is not None:
-                data = self._loopback_level.to_pcm(data, frames)
+            if self._level_control is not None:
+                data = self._level_control.to_pcm(data, frames)
             self._wf.writeframesraw(data)
             self._update_level(data, record_arrival=False)
 
@@ -627,6 +639,9 @@ class LoopbackRecorder:
 
 
 class MicrophoneRecorder(LoopbackRecorder):
+    def _create_level_control(self, rate: int, info: dict) -> _AdaptiveLevel:
+        return _AdaptiveLevel(rate, max_gain=16.0, noise_floor=0.0003)
+
     def _resolve_device(self, pa):
         pyaudio = _import_pyaudio()
         wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
