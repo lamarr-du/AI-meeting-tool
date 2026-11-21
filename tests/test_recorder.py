@@ -27,6 +27,8 @@ class Stream:
         self.callback = kwargs["stream_callback"]
         self.clock = clock
         self.rate = kwargs["rate"]
+        self.channels = kwargs["channels"]
+        self.float_capture = kwargs["format"] == 1
         self.epoch = 1000 if kwargs["input_device_index"] == 0 else 2000
         self.active = False
         self.closed = False
@@ -58,7 +60,10 @@ class Stream:
 
     def emit(self, position, *, value=1000, frames=100, timing=True, received=None, flags=0):
         self.clock.value = received if received is not None else 10 + position + frames / self.rate
-        data = np.full(frames, value, dtype="<i2").tobytes()
+        samples = np.broadcast_to(value, (frames, self.channels))
+        data = (
+            (samples / 32768).astype("<f4") if self.float_capture else samples.astype("<i2")
+        ).tobytes()
         times = (
             {
                 "input_buffer_adc_time": self.epoch + 10 + position,
@@ -110,6 +115,7 @@ def recording(monkeypatch, tmp_path):
         lambda: SimpleNamespace(
             PyAudio=PA,
             paInt16=8,
+            paFloat32=1,
             paContinue=0,
             paAbort=2,
             paWASAPI=13,
@@ -202,6 +208,99 @@ def test_stop_trims_pending_block(recording):
     info = r.rec.stop()
     assert info["duration_sec"] == 0.05
     np.testing.assert_array_equal(read_audio(r.path), np.full(50, 1000))
+
+
+def test_quiet_loopback_is_boosted_before_pcm_and_recovery(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    assert stream.float_capture
+    stream.emit(0, value=0)
+    stream.emit(0.1, value=0.025)  # Below one 16-bit PCM step at capture.
+    stream.emit(0.2, value=2000, received=10.25)
+    info = r.rec.stop()
+
+    expected = np.repeat([0, 250, 2000], [100, 100, 50])
+    np.testing.assert_array_equal(read_audio(r.path), expected)
+    assert info["active_fraction"] == pytest.approx(0.6)
+    recovered = r.path.with_name("recovered.wav")
+    directory = next(r.path.parent.glob("audio_parts-*"))
+    merge_segments(directory, recovered)
+    np.testing.assert_array_equal(read_audio(recovered), expected)
+
+    # A second recording must start without the previous session's level estimate.
+    r.clock.value = 10
+    r.rec.start(r.path.with_name("second.wav"))
+    r.streams[-1].emit(0, value=0.025)
+    info = r.rec.stop()
+    np.testing.assert_array_equal(read_audio(info["path"]), np.full(100, 250))
+
+
+def test_microphone_boosts_quiet_input_without_boosting_very_low_noise(recording):
+    r = recording
+    microphone = MicrophoneRecorder(clock=r.clock)
+    microphone.start(r.path)
+    stream = r.streams[-1]
+    assert stream.float_capture
+    stream.emit(0, value=0, frames=200)
+    stream.emit(0.1, value=32, frames=200)
+    low_noise = np.tile([2, -2], 100)
+    stream.emit(0.2, value=low_noise[:, None], frames=200)
+    stream.emit(0.3, value=2400, frames=200)
+    info = microphone.stop()
+
+    expected = np.concatenate((np.zeros(200), np.full(200, 512), low_noise, np.full(200, 2400)))
+    np.testing.assert_array_equal(read_audio(r.path, rate=2000), expected)
+    assert info["active_fraction"] == pytest.approx(0.5)
+
+
+def test_loopback_boost_preserves_stereo_balance_and_peak_headroom(recording):
+    r = recording
+    r.rec.sample_rate = 48000
+    r.rec.channels = 2
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0, value=[16, -8], frames=4800)
+    samples = np.tile([16, -8], (4800, 1))
+    samples[0, 1] = -29000
+    stream.emit(0.1, value=samples, frames=4800)
+    r.rec.stop()
+
+    stereo = read_audio(r.path, rate=48000).reshape(-1, 2)
+    assert stereo[0, 0] > 100
+    assert stereo[0, 0] == pytest.approx(-2 * stereo[0, 1], abs=1)
+    assert stereo[4800, 1] == round(-0.95 * 32768)
+
+
+@pytest.mark.parametrize("capture_silence", [True, False])
+def test_loopback_reestimates_gain_after_silence(recording, capture_silence):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0, value=4000)
+    if capture_silence:
+        stream.emit(0.1, value=0)
+        stream.emit(0.2, value=0)
+    stream.emit(0.3, value=8)
+    r.rec.stop()
+
+    audio = read_audio(r.path)
+    np.testing.assert_array_equal(audio[:100], np.full(100, 4000))
+    np.testing.assert_array_equal(audio[100:300], np.zeros(200))
+    assert np.min(audio[300:]) > 600
+
+
+def test_loopback_boosts_quieter_speech_after_loud_speech_without_a_gap(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0, value=4000)
+    for block in range(1, 8):
+        stream.emit(block / 10, value=8)
+    r.rec.stop()
+
+    audio = read_audio(r.path)
+    assert np.min(audio[600:]) > 600
 
 
 def test_backlog_does_not_insert_silence(recording, monkeypatch):
@@ -474,8 +573,8 @@ def test_dual_recording_shares_boundaries_across_device_clocks(recording, monkey
     rec.start(session)
     with pytest.raises(RuntimeError, match="正在录音或恢复"):
         SessionLock(session.root)
-    r.streams[0].emit(0.20, value=1000)
-    r.streams[1].emit(0.20, value=2000, frames=200)
+    r.streams[0].emit(0.20, value=3000)
+    r.streams[1].emit(0.20, value=32, frames=200)
     r.clock.value = 10.60
     info = rec.stop()
 
@@ -483,8 +582,10 @@ def test_dual_recording_shares_boundaries_across_device_clocks(recording, monkey
     assert microphone is not None and microphone.parent == loopback.parent
     assert info["duration_sec"] == info["microphone"]["duration_sec"] == 0.6
     assert info["timing_mode"] == info["microphone"]["timing_mode"] == "device"
-    assert np.flatnonzero(read_audio(loopback)).tolist() == list(range(200, 300))
-    assert np.flatnonzero(read_audio(microphone, 2000)).tolist() == list(range(400, 600))
+    np.testing.assert_array_equal(read_audio(loopback), np.repeat([0, 3000, 0], [200, 100, 300]))
+    np.testing.assert_array_equal(
+        read_audio(microphone, 2000), np.repeat([0, 512, 0], [400, 200, 600])
+    )
     assert all(stream.closed for stream in r.streams)
 
     rec = SessionRecorder(r.rec)
@@ -506,8 +607,8 @@ def test_failed_dual_overwrite_preserves_active_take_and_can_export(recording, t
 
     r.clock.value = 10
     rec.start(session, overwrite=True)
-    r.streams[-2].emit(0.05, value=111)
-    r.streams[-1].emit(0.05, value=222, frames=200)
+    r.streams[-2].emit(0.05, value=1111)
+    r.streams[-1].emit(0.05, value=2222, frames=200)
     r.streams[-1].active = False
     assert rec.status()["failed"]
     with pytest.raises(RecordingError, match="microphone"):
@@ -519,8 +620,8 @@ def test_failed_dual_overwrite_preserves_active_take_and_can_export(recording, t
     output = tmp_path / "recovered"
     args = SimpleNamespace(session="dual", take=failed_take.name, output=str(output))
     cmd_recover(args, {"output_dir": str(tmp_path)})
-    assert 111 in read_audio(output / "audio.wav")
-    assert 222 in read_audio(output / "microphone.wav", 2000)
+    assert 1111 in read_audio(output / "audio.wav")
+    assert 2222 in read_audio(output / "microphone.wav", 2000)
     assert session.recording_paths() == original
 
 

@@ -1,5 +1,9 @@
 """网页版纪要导出、导入及无密钥接口行为。"""
 
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 
 from meetmin.cli import build_parser, cmd_run, cmd_summarize
@@ -61,6 +65,61 @@ def test_export_and_import_web_minutes(meeting, tmp_path, monkeypatch, capsys):
     assert session.minutes_md.read_bytes() == original
     cmd_summarize(args("--import-web", str(source), "--overwrite"), cfg)
     assert "更新后的纪要" in session.minutes_md.read_text(encoding="utf-8")
+
+
+def test_desktop_prompt_actions_use_chosen_export_path(meeting, tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from meetmin.gui import app
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(app.MeetingWindow, "refresh_devices", lambda self: None)
+    session, cfg = meeting
+    window = app.MeetingWindow(
+        cfg, QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    )
+    window.refresh_history(session)
+    monkeypatch.setattr(
+        window, "launch", lambda _, action, done: done(action(SimpleNamespace(log=Mock())))
+    )
+    target = tmp_path / "另存的 提示词.txt"
+    save_dialog = Mock(return_value=(str(target), ""))
+    open_url = Mock(return_value=True)
+    start_process = Mock(return_value=(True, 1))
+    monkeypatch.setattr(app.QFileDialog, "getSaveFileName", save_dialog)
+    monkeypatch.setattr(app.QDesktopServices, "openUrl", open_url)
+    monkeypatch.setattr(app.QProcess, "startDetached", start_process)
+
+    try:
+        window.export_prompt()
+        assert target.read_bytes() == (session.root / "minutes_web_prompt.txt").read_bytes()
+        assert not window.prompt_file_actions.isHidden()
+        buttons = {
+            item.text(): item for item in window.prompt_file_actions.findChildren(QPushButton)
+        }
+        buttons["打开文件"].click()
+        assert open_url.call_args.args[0].toLocalFile() == target.as_posix()
+        open_url.reset_mock()
+        buttons["在文件夹中显示"].click()
+        if sys.platform == "win32":
+            start_process.assert_called_once_with("explorer.exe", ["/select,", str(target)])
+        elif sys.platform == "darwin":
+            start_process.assert_called_once_with("open", ["-R", str(target)])
+        else:
+            assert open_url.call_args.args[0].toLocalFile() == target.parent.as_posix()
+
+        window.new_meeting()
+        assert window.prompt_file_actions.isHidden()
+        window.refresh_history(session)
+        save_dialog.return_value = ("", "")
+        window.export_prompt()
+        assert window.prompt_file_actions.isHidden()
+    finally:
+        window.close()
+        application.processEvents()
 
 
 def test_empty_or_invalid_import_preserves_minutes(meeting, tmp_path):

@@ -1,6 +1,10 @@
 # AI 会议纪要小工具 — 用户配置（缺项自动使用代码内置默认值，见 meetmin/config.py）
 
 output_dir: data
+# null 默认使用工程（独立便携版为程序目录）下的 .cache。
+# Whisper 和 SpeechBrain 权重均放在 huggingface/hub。
+# 可填写绝对路径，或相对于此配置文件的目录。asr.model_size 指向的本地模型优先。
+model_cache_dir: null
 
 recorder:
   device: null        # 内录设备索引或名称片段；null = 默认输出设备的 loopback（python main.py devices 查看）

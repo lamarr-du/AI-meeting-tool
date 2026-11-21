@@ -13,7 +13,7 @@ from threading import Event
 from typing import Any
 
 import yaml
-from PySide6.QtCore import QSettings, QSize, QStandardPaths, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QProcess, QSettings, QSize, QStandardPaths, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -219,6 +219,7 @@ class MeetingWindow(QMainWindow):
         self.recovery: list[Path] = []
         self.transcript_path: Path | None = None
         self.minutes_path: Path | None = None
+        self.exported_prompt_path: Path | None = None
         self.setWindowTitle("MeetMin · 会议纪要")
         self.resize(1180, 780)
         self.setMinimumSize(890, 650)
@@ -305,6 +306,17 @@ class MeetingWindow(QMainWindow):
         self.stage.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         actions.addWidget(self.stage, 1)
         status.addLayout(actions)
+        self.prompt_file_actions = QWidget()
+        file_actions = QHBoxLayout(self.prompt_file_actions)
+        file_actions.setContentsMargins(0, 0, 0, 0)
+        open_prompt = QPushButton("打开文件")
+        open_prompt.clicked.connect(self.open_exported_prompt)
+        reveal_prompt = QPushButton("在文件夹中显示")
+        reveal_prompt.clicked.connect(lambda: self.open_exported_prompt(reveal=True))
+        file_actions.addWidget(open_prompt)
+        file_actions.addWidget(reveal_prompt)
+        file_actions.addStretch()
+        status.addWidget(self.prompt_file_actions)
         self.indicator = QProgressBar()
         self.indicator.setAccessibleName("处理进度")
         self.indicator.setRange(0, 0)
@@ -605,9 +617,13 @@ class MeetingWindow(QMainWindow):
     def recording_active(self) -> bool:
         return self.stop_requested is not None and not self.stop_requested.is_set()
 
-    def set_status(self, message: str, tone: str = "neutral") -> None:
+    def set_status(
+        self, message: str, tone: str = "neutral", *, prompt: Path | None = None
+    ) -> None:
         style_property(self.status_dot, "tone", tone)
         self.stage.setText(message)
+        self.exported_prompt_path = prompt
+        self.prompt_file_actions.setVisible(prompt is not None)
         self.status_strip.setVisible(bool(message) and not self.recording_active())
 
     def update_controls(self) -> None:
@@ -918,7 +934,7 @@ class MeetingWindow(QMainWindow):
             lambda _result: self.tabs.setCurrentWidget(self.minutes),
         )
 
-    def export_file(self, path: Path | None) -> None:
+    def export_file(self, path: Path | None, *, offer_prompt_actions: bool = False) -> None:
         if path is None:
             return
         filename, _ = QFileDialog.getSaveFileName(
@@ -926,10 +942,12 @@ class MeetingWindow(QMainWindow):
         )
         if filename:
             try:
-                target = Path(filename)
+                target = Path(filename).absolute()
                 if target.resolve() != path.resolve():
                     shutil.copyfile(path, target)
-                self.set_status(f"已导出至 {target}", "success")
+                self.set_status(
+                    f"已导出至 {target}", "success", prompt=target if offer_prompt_actions else None
+                )
             except OSError as error:
                 self.set_status(f"导出失败：{error}", "error")
 
@@ -941,8 +959,28 @@ class MeetingWindow(QMainWindow):
             lambda job: Pipeline(self.cfg, progress=job.log.emit).export_web_prompt(
                 session, overwrite=True
             ),
-            self.export_file,
+            lambda path: self.export_file(path, offer_prompt_actions=True),
         )
+
+    def open_exported_prompt(self, *, reveal: bool = False) -> None:
+        path = self.exported_prompt_path
+        if path is None:
+            return
+        if not path.is_file():
+            self.set_status(f"找不到导出的提示词：{path}", "error")
+            return
+        if reveal and sys.platform == "win32":
+            opened, _ = QProcess.startDetached("explorer.exe", ["/select,", str(path)])
+        elif reveal and sys.platform == "darwin":
+            opened, _ = QProcess.startDetached("open", ["-R", str(path)])
+        else:
+            opened = QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(path.parent if reveal else path))
+            )
+        if not opened:
+            self.set_status(
+                f"无法打开{'文件夹' if reveal else '文件'}：{path}", "error", prompt=path
+            )
 
     def import_minutes(self) -> None:
         session = self.session
@@ -1022,9 +1060,6 @@ def run(config: Path | None) -> int:
             )
             cfg = load_config(config)
             output = config.parent / Path(cfg["output_dir"]).expanduser()
-            model = cfg["asr"].get("model_size")
-            if isinstance(model, str) and (config.parent / Path(model).expanduser()).is_dir():
-                cfg["asr"]["model_size"] = str(config.parent / Path(model).expanduser())
         else:
             data = QStandardPaths.writableLocation(
                 QStandardPaths.StandardLocation.AppLocalDataLocation

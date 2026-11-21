@@ -18,7 +18,9 @@ import numpy as np
 
 from ..audio.dsp import TARGET_SR
 from ..glossary import glossary_hotwords, load_terms, select_terms
+from ..model_cache import configure_xet_cache, hub_cache_dir
 from .base import ASRProvider, ASRResult, Utterance
+from .cuda import prepare_cuda_runtime
 from .model_download import ModelDownloadProgress, download_model
 from .profile import memory_status, select_profile
 from .quality import Decoded, QualityOptions, Span, review
@@ -90,9 +92,19 @@ class FasterWhisperASR(ASRProvider):
         self,
         acfg: dict,
         *,
+        model_cache_dir: str | Path | None = None,
         on_model_download: Callable[[ModelDownloadProgress], None] | None = None,
     ):
         _configure_huggingface_download(acfg)
+        configure_xet_cache(model_cache_dir)
+        self._hub_cache = hub_cache_dir(model_cache_dir)
+        from ..doctor import gpu_status
+
+        device = acfg.get("device", "auto")
+        auto_cuda = device == "auto" and acfg.get("profile") not in ("cpu_light", "cpu_standard")
+        gpu = gpu_status(acfg.get("compute_type") or "int8_float16") if auto_cuda else None
+        if device == "cuda":
+            prepare_cuda_runtime()
         try:
             from faster_whisper import WhisperModel
         except ImportError as e:  # pragma: no cover
@@ -100,27 +112,35 @@ class FasterWhisperASR(ASRProvider):
         self.acfg = acfg
         self._model_class = WhisperModel
         self._on_model_download = on_model_download
-        from ..doctor import gpu_status
-
         self._profile = select_profile(
             acfg,
             memory=memory_status(),
-            gpu=gpu_status() if acfg.get("device", "auto") == "auto" else None,
+            gpu=gpu,
         )
         self._size = self._profile.model
         self._device = self._profile.device
         self._compute = self._profile.compute_type
         self._used_fallback = False
+        self._fallbacks: list[dict[str, str]] = []
+        self._load_with_fallback()
+
+    def _load_with_fallback(self) -> None:
         try:
-            try:
-                self.model = self._load_model()
-            except Exception as e:
-                if self._device != "cuda" or not self._is_oom(e):
-                    raise
-                reason = str(e)
-            else:
-                return
-            self._fallback_to_cpu(reason)
+            while True:
+                source = self._model_source()
+                try:
+                    self.model = self._model_class(
+                        source,
+                        device=self._device,
+                        compute_type=self._compute,
+                        download_root=str(self._hub_cache),
+                    )
+                    return
+                except (OSError, RuntimeError) as error:
+                    failure = self._cuda_failure(error)
+                    if failure is None:
+                        raise
+                self._advance_fallback(*failure)
         except Exception as e:
             raise RuntimeError(
                 f"加载/下载 whisper 模型失败（{self._size}）：{e}\n"
@@ -129,29 +149,66 @@ class FasterWhisperASR(ASRProvider):
                 "  · 或先手动下载模型，把 asr.model_size 指向本地模型目录"
             ) from e
 
-    def _load_model(self):
+    def _model_source(self) -> str:
         source = self._size
+        path = Path(source).expanduser()
+        if path.is_dir():
+            return str(path.resolve())
         if self._on_model_download is not None:
-            path = Path(source).expanduser()
-            source = str(path) if path.is_dir() else download_model(source, self._on_model_download)
-        return self._model_class(source, device=self._device, compute_type=self._compute)
+            return download_model(source, self._on_model_download, cache_dir=self._hub_cache)
+        return source
 
-    @staticmethod
-    def _is_oom(error: Exception) -> bool:
+    def _cuda_failure(self, error: Exception) -> tuple[str, bool] | None:
+        if self._device != "cuda":
+            return None
         message = str(error).lower()
-        return "out of memory" in message or "cuda_error_out_of_memory" in message
+        if any(
+            marker in message
+            for marker in ("out of memory", "cuda_error_out_of_memory", "status_alloc_failed")
+        ):
+            return str(error), True
+        if self.acfg.get("device", "auto") == "auto" and any(
+            marker in message
+            for marker in (
+                "cuda failed with error",
+                "cuda driver version",
+                "cuda initialization",
+                "cudnn_status_",
+                "cublas_status_",
+                "cuinit",
+                "no cuda-capable device",
+                "requested int8_float16 compute type",
+                "cublas64_",
+                "cublaslt64_",
+                "cudnn64_",
+                "libcublas",
+                "libcudnn",
+            )
+        ):
+            return str(error), False
+        return None
 
     def close(self) -> None:
         if hasattr(self, "model"):
             del self.model
 
-    def _fallback_to_cpu(self, reason: str) -> None:
-        logging.getLogger("meetmin").warning("GPU 显存不足，回退 CPU int8：%s", reason)
+    def _advance_fallback(self, reason: str, oom: bool) -> None:
+        previous = f"{self._size} / {self._device} / {self._compute}"
         self.close()
-        self._size = self._profile.cpu_fallback_model
-        self._device, self._compute = "cpu", "int8"
-        self._used_fallback = True
-        self.model = self._load_model()
+        if (
+            oom
+            and self.acfg.get("device", "auto") == "auto"
+            and not self.acfg.get("model_size")
+            and self._size != "small"
+        ):
+            self._size = "small"
+        else:
+            self._size = self._profile.cpu_fallback_model
+            self._device, self._compute = "cpu", "int8"
+        self._used_fallback |= oom
+        target = f"{self._size} / {self._device} / {self._compute}"
+        self._fallbacks.append({"from": previous, "to": target, "reason": reason})
+        logging.getLogger("meetmin").warning("%s → %s：%s", previous, target, reason)
 
     def _apply_glossary(
         self, hotwords: str | None, language: str | None
@@ -186,14 +243,17 @@ class FasterWhisperASR(ASRProvider):
         return hotwords, {"path": str(source.resolve()), "terms": selected}
 
     def transcribe(self, audio, *, file_path=None, progress_cb=None, **kwargs):
-        try:
-            return self._transcribe(audio, file_path=file_path, progress_cb=progress_cb, **kwargs)
-        except Exception as e:
-            if self._device != "cuda" or not self._is_oom(e):
-                raise
-            reason = str(e)
-        self._fallback_to_cpu(reason)
-        return self._transcribe(audio, file_path=file_path, progress_cb=progress_cb, **kwargs)
+        while True:
+            try:
+                return self._transcribe(
+                    audio, file_path=file_path, progress_cb=progress_cb, **kwargs
+                )
+            except (OSError, RuntimeError) as error:
+                failure = self._cuda_failure(error)
+                if failure is None:
+                    raise
+            self._advance_fallback(*failure)
+            self._load_with_fallback()
 
     def _transcribe(
         self,
@@ -285,7 +345,11 @@ class FasterWhisperASR(ASRProvider):
             extra={
                 "asr_model": getattr(self, "_size", None) or self.acfg.get("model_size") or "small",
                 **(
-                    {"profile": asdict(self._profile), "cuda_oom_fallback": self._used_fallback}
+                    {
+                        "profile": asdict(self._profile),
+                        "cuda_oom_fallback": self._used_fallback,
+                        "fallbacks": list(self._fallbacks),
+                    }
                     if hasattr(self, "_profile")
                     else {}
                 ),

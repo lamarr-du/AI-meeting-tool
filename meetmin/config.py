@@ -10,6 +10,7 @@ import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "output_dir": "data",  # 会话产物目录：<output_dir>/sessions/<session_id>/
+    "model_cache_dir": None,  # 默认工程或独立便携版目录下的 .cache
     "recorder": {
         "device": None,  # 内录设备索引或名称片段；null=默认输出设备的 loopback
         "channels": None,  # null=跟随设备（最多取 2）
@@ -104,11 +105,20 @@ def load_config(path: str | Path | None = None) -> dict:
         if not isinstance(user, dict):
             raise ValueError(f"配置文件格式错误（应为 YAML 映射）: {p}")
         cfg = deep_merge(cfg, user)
+    config_dir = p.resolve().parent
+    if (cache_dir := cfg.get("model_cache_dir")) is not None:
+        if not isinstance(cache_dir, str) or not cache_dir.strip():
+            raise ValueError("model_cache_dir 必须是目录路径或 null")
+        cfg["model_cache_dir"] = str(config_dir / Path(cache_dir).expanduser())
     asr = cfg.get("asr")
+    if isinstance(asr, dict) and isinstance(model := asr.get("model_size"), str):
+        local_model = config_dir / Path(model).expanduser()
+        if local_model.is_dir():
+            asr["model_size"] = str(local_model)
     glossary = asr.get("glossary") if isinstance(asr, dict) else None
     if isinstance(glossary, dict):
         for key in ("path", "correction_path"):
             value = glossary.get(key)
             if isinstance(value, str) and value.strip():
-                glossary[key] = str(p.resolve().parent / Path(value).expanduser())
+                glossary[key] = str(config_dir / Path(value).expanduser())
     return cfg

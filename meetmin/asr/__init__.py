@@ -15,7 +15,11 @@ def get_asr(
     if name in ("faster_whisper", "faster-whisper", "whisper"):
         from .faster_whisper_asr import FasterWhisperASR
 
-        return FasterWhisperASR(cfg["asr"], on_model_download=on_model_download)
+        return FasterWhisperASR(
+            cfg["asr"],
+            model_cache_dir=cfg.get("model_cache_dir"),
+            on_model_download=on_model_download,
+        )
     if name in ("dashscope", "paraformer"):
         from .dashscope_asr import DashScopeParaformerASR
 

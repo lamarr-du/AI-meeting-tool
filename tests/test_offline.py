@@ -87,18 +87,20 @@ def test_faster_whisper_decodes_wav():
         assert np.max(np.abs(decoded - x)) < 1e-3
 
 
-def test_speechbrain_model_uses_copy_and_user_cache():
+def test_speechbrain_model_downloads_directly_to_configured_cache(monkeypatch):
     from types import ModuleType, SimpleNamespace
     from unittest.mock import patch
+
+    import huggingface_hub
 
     from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
     calls = []
-    copy_strategy = object()
+    no_link = object()
     speaker = ModuleType("speechbrain.inference.speaker")
     speaker.EncoderClassifier = SimpleNamespace(from_hparams=lambda **kwargs: calls.append(kwargs))
     fetching = ModuleType("speechbrain.utils.fetching")
-    fetching.LocalStrategy = SimpleNamespace(COPY=copy_strategy)
+    fetching.LocalStrategy = SimpleNamespace(NO_LINK=no_link)
     modules = {
         name: ModuleType(name)
         for name in ("torch", "speechbrain", "speechbrain.inference", "speechbrain.utils")
@@ -109,23 +111,37 @@ def test_speechbrain_model_uses_copy_and_user_cache():
     with (
         _TmpDir() as td,
         patch.dict(sys.modules, modules),
-        patch.object(Path, "home", return_value=Path(td)),
     ):
-        EcapaSpeechbrainDiarizer({})._load_encoder()
-        assert calls[0]["local_strategy"] is copy_strategy
-        assert calls[0]["savedir"] == str(Path(td) / ".cache" / "meetmin" / "speechbrain")
+        monkeypatch.delenv("HF_XET_CACHE", raising=False)
+        monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *_, **kwargs: None)
+        snapshot = Path(td) / "snapshot"
+        requests = []
+
+        def fake_download(repo, *, cache_dir, allow_patterns):
+            requests.append((repo, cache_dir, allow_patterns))
+            return str(snapshot)
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_download)
+        EcapaSpeechbrainDiarizer({}, model_cache_dir=td)._load_encoder()
+        assert requests[0][0] == "speechbrain/spkrec-ecapa-voxceleb"
+        assert requests[0][1] == Path(td).resolve() / "huggingface" / "hub"
+        assert "embedding_model.ckpt" in requests[0][2]
+        assert calls[0]["local_strategy"] is no_link
+        assert calls[0]["source"] == str(snapshot)
+        assert calls[0]["overrides"] == {"pretrained_path": str(snapshot)}
 
 
 def test_whisper_gpu_oom_retries_cpu():
     from types import ModuleType, SimpleNamespace
     from unittest.mock import patch
 
+    from meetmin.asr.cuda import CudaStatus
     from meetmin.asr.faster_whisper_asr import FasterWhisperASR
 
     calls = []
 
     class FakeModel:
-        def __init__(self, size, device, compute_type):
+        def __init__(self, size, device, compute_type, download_root):
             calls.append((device, compute_type))
             self.device = device
 
@@ -143,7 +159,7 @@ def test_whisper_gpu_oom_retries_cpu():
     module.WhisperModel = FakeModel
     with (
         patch.dict(sys.modules, {"faster_whisper": module}),
-        patch("meetmin.doctor.gpu_status", return_value=("GPU", 8192, 8192, [])),
+        patch("meetmin.doctor.gpu_status", return_value=CudaStatus(memory=("GPU", 8192, 8192))),
     ):
         asr = FasterWhisperASR({"device": "auto", "model_size": "small", "cuda_peak_mib": 2400})
         assert asr.transcribe(np.zeros(16000, dtype=np.float32)).utterances == []
