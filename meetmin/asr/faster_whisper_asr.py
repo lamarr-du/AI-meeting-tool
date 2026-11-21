@@ -25,14 +25,19 @@ from .model_download import ModelDownloadProgress, download_model
 from .profile import memory_status, select_profile
 from .quality import Decoded, QualityOptions, Span, review
 
-_VAD_PARAMETERS = {"min_silence_duration_ms": 400}
+_VAD_PARAMETERS = {
+    "min_silence_duration_ms": 600,
+    "min_speech_duration_ms": 250,
+    "speech_pad_ms": 100,
+}
+_QUALITY_VAD_PARAMETERS = {"min_silence_duration_ms": 400}
 
 
 def _speech_spans(audio: np.ndarray) -> list[Span]:
     from faster_whisper.vad import get_speech_timestamps
 
     # 不把 Silero 的边缘补齐样本计成有声缺口。
-    chunks = get_speech_timestamps(audio, **_VAD_PARAMETERS, speech_pad_ms=0)
+    chunks = get_speech_timestamps(audio, **_QUALITY_VAD_PARAMETERS, speech_pad_ms=0)
     return [(chunk["start"] / TARGET_SR, chunk["end"] / TARGET_SR) for chunk in chunks]
 
 

@@ -133,6 +133,53 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
             print(
                 f"  声纹模型(ECAPA)：{'缓存目录存在，请确认文件完整' if cached else '未检测到缓存，请提前下载'} ({cache})"
             )
+    pcfg = cfg.get("punctuation", {}) or {}
+    punc_provider = str(pcfg.get("provider", "firered_onnx")).lower()
+    if asr_provider == "faster_whisper" and punc_provider not in ("rule", "none", "off", ""):
+        if punc_provider in ("firered_onnx", "firered", "fireredpunc"):
+            missing = [
+                m for m in ("onnxruntime", "tokenizers") if importlib.util.find_spec(m) is None
+            ]
+            if missing:
+                print("  标点模型依赖缺失：" + ", ".join(missing) + "；将降级为规则标点")
+            if pcfg.get("model_path"):
+                mp = Path(str(pcfg["model_path"])).expanduser()
+                exists = (mp / "punc.q8w.onnx").is_file() if mp.is_dir() else mp.is_file()
+                print(
+                    f"  标点模型(FireRedPunc)：{'本地文件存在' if exists else '未找到本地模型文件'} ({mp})"
+                )
+            else:
+                cache = hub_cache_dir(configured_cache) / "models--jiangzhuo9357--fireredpunc-onnx"
+                cached = any(cache.glob("snapshots/*/punc.q8w.onnx")) and any(
+                    cache.glob("snapshots/*/tokenizer.json")
+                )
+                print(
+                    f"  标点模型(FireRedPunc ONNX)：{'已缓存' if cached else '未检测到缓存，首次运行将自动下载（约 155 MB）'} ({cache})"
+                )
+        elif punc_provider in (
+            "ct_transformer_onnx",
+            "ct_transformer",
+            "ct-transformer",
+            "ct_punc",
+            "ct",
+        ):
+            if importlib.util.find_spec("onnxruntime") is None:
+                print("  标点模型依赖缺失：onnxruntime；将降级为规则标点")
+            if pcfg.get("model_path"):
+                mp = Path(str(pcfg["model_path"])).expanduser()
+                exists = (mp / "model.int8.onnx").is_file() if mp.is_dir() else mp.is_file()
+                print(
+                    f"  标点模型(CT-Transformer)：{'本地文件存在' if exists else '未找到本地模型文件'} ({mp})"
+                )
+            else:
+                cache = (
+                    hub_cache_dir(configured_cache)
+                    / "models--ranger810--sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+                )
+                cached = any(cache.glob("snapshots/*/model.int8.onnx"))
+                print(
+                    f"  标点模型(CT-Transformer ONNX)：{'已缓存' if cached else '未检测到缓存，首次运行将自动下载（约 72 MB）'} ({cache})"
+                )
     llm = cfg.get("llm", {}) or {}
     if llm.get("provider", "openai_compatible") not in ("mock", "none", "offline", ""):
         key = llm.get("api_key_env", "LLM_API_KEY")

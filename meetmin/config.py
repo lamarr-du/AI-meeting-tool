@@ -60,6 +60,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_cluster_sec": 4.0,  # 主簇最少核心累计时长（秒）
         "min_group_sec": 0.4,  # 短于该时长的说话人片段并入相邻片段
     },
+    "punctuation": {
+        "provider": "firered_onnx",  # firered_onnx（默认，中英高精度 155 MB）| ct_transformer_onnx（轻量 72 MB）| rule（零模型）
+        "model_path": None,  # 可选：指定本地 ONNX 标点模型文件或目录
+        "to_simplified": True,  # 统一将中文转写结果中的繁体字转为简体中文（解决 Whisper 混出繁体问题）
+        "max_sentence_tokens": 85,  # 超长独白软切分上限（词元数）
+        "max_sentence_sec": 18.0,  # 超长独白软切分上限（秒）
+        "left_context_tokens": 15,  # 跨块只读左上下文词元数，稳定句界预测
+        "enable_polish": True,  # 同步生成轻量零幻觉口语顺滑视图 polished_text
+        "paragraph_max_gap_sec": 2.2,  # transcript.md 同说话人停顿换段阈值（秒）
+        "paragraph_max_chars": 220,  # transcript.md 单段目标字数上限
+        "paragraph_max_duration_sec": 45.0,  # transcript.md 单段持续时长上限（秒）
+    },
     "dashscope_asr": {  # 云端 ASR（步骤2的可选接口，需要音频有可访问 URL）
         "base_url": "https://dashscope.aliyuncs.com",
         "api_key_env": "DASHSCOPE_API_KEY",
@@ -84,6 +96,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "strategy": "auto",  # auto | direct（整篇一次调用，最省）| map_reduce（长会议两级压缩）
         "merge_same_speaker": True,  # 相邻同发言人合并，显著省 token
         "with_timestamps": False,  # 时间戳对纪要价值低且耗 token，默认不进 prompt
+        "use_polished_text": False,  # true 时优先将去口癖的 polished_text 喂给纪要模型
         "max_chunk_chars": 4000,  # map_reduce 每段字符预算
         "direct_threshold_chars": 9000,  # 转写低于该长度直接一次调用
         "chars_per_token": 1.5,  # 估算用：每 token 约多少字符
@@ -129,4 +142,8 @@ def load_config(path: str | Path | None = None) -> dict:
             value = glossary.get(key)
             if isinstance(value, str) and value.strip():
                 glossary[key] = str(config_dir / Path(value).expanduser())
+    for section in ("diarization", "punctuation"):
+        sec = cfg.get(section)
+        if isinstance(sec, dict) and isinstance(mp := sec.get("model_path"), str) and mp.strip():
+            sec["model_path"] = str(config_dir / Path(mp).expanduser())
     return cfg

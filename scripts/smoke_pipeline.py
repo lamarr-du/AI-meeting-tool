@@ -72,7 +72,8 @@ def main() -> None:
     cfg = load_config(ROOT / "config.yaml")
     cfg["summarizer"]["strategy"] = "direct"
     cfg["summarizer"]["direct_threshold_chars"] = 100000
-    cfg["diarization"]["provider"] = "single"  # 冒烟不拉 ECAPA 模型
+    cfg["diarization"]["provider"] = "single"  # 冒烟不拉声纹模型
+    cfg["punctuation"]["provider"] = "rule"  # 冒烟不拉标点模型
 
     # 合成一段 16 秒音频作为"录音产物"
     sid = "smoke-%06d" % np.random.randint(0, 999999)

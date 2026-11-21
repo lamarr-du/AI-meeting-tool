@@ -19,6 +19,8 @@ class Utterance:
     speaker: str | int | None = None
     # 词级时间戳：[{'w': 文本, 's': 开始秒, 'e': 结束秒}]
     words: list[dict] | None = None
+    # 轻量口语顺滑视图（可选，与 text 不同时写入 transcript.json）
+    polished_text: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -28,6 +30,8 @@ class Utterance:
         }
         if self.speaker is not None:
             d["speaker"] = self.speaker
+        if self.polished_text and self.polished_text != self.text:
+            d["polished_text"] = self.polished_text
         if self.words:
             d["words"] = self.words
         return d
@@ -40,6 +44,7 @@ class Utterance:
             text=d.get("text", ""),
             speaker=d.get("speaker"),
             words=d.get("words"),
+            polished_text=d.get("polished_text"),
         )
 
 

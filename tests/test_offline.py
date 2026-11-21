@@ -1222,7 +1222,7 @@ def test_render_merge_saves_lines():
         Utterance(2, 3, "第三句", speaker="说话人B"),
     ]
     merged = render_transcript(us, merge_same_speaker=True)
-    assert merged.count("\n") == 1 and "第一句第二句" in merged.replace(" ", "")
+    assert merged.count("\n") == 1 and "第一句，第二句" in merged.replace(" ", "")
     unmerged = render_transcript(us, merge_same_speaker=False)
     assert unmerged.count("\n") == 2
 
@@ -1325,3 +1325,341 @@ def test_generate_minutes_empty_raises():
         assert False, "应当抛错"
     except RuntimeError:
         pass
+
+
+# ---------------- natural sentence reconstruction & paragraphing ----------------
+def test_tokenize_utterance_coalesces_whisper_bpe_and_preserves_special_tokens():
+    from meetmin.asr.punctuation import tokenize_utterance
+
+    u = Utterance(
+        start=5.86,
+        end=9.04,
+        text="开始review patch v1.2 共1,024个",
+        speaker="说话人A",
+        words=[
+            {"w": "开始", "s": 7.5, "e": 7.7},
+            {"w": "re", "s": 7.7, "e": 8.72},
+            {"w": "view", "s": 8.72, "e": 8.78},
+            {"w": " patch", "s": 8.78, "e": 9.04},
+        ],
+    )
+    spans = tokenize_utterance(u)
+    assert [s.text for s in spans] == ["开", "始", "review", "patch"]
+    assert spans[2].start_ms == 7700 and spans[2].end_ms == 8780
+    assert spans[3].start_ms == 8780 and spans[3].end_ms == 9040
+
+    # 无 words 时走加权插值，保留 v1.2、1,024、@、large-v3-turbo 等词元
+    u2 = Utterance(0.0, 4.0, "联系@张三看v1.2的1,024条large-v3-turbo日志", speaker="说话人A")
+    spans2 = tokenize_utterance(u2)
+    texts = [s.text for s in spans2]
+    assert "@" in texts
+    assert "v1.2" in texts
+    assert "1,024" in texts
+    assert "large-v3-turbo" in texts
+
+
+def test_reconstruct_sentences_merges_code_switch_and_tracks_timestamps():
+    from meetmin.asr.punctuation import reconstruct_sentences
+
+    class FakePunc:
+        name = "fake"
+
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        def predict_tags(self, tokens: list[str]) -> list[str]:
+            self.calls.append(list(tokens))
+            tags = [""] * len(tokens)
+            for i, tok in enumerate(tokens):
+                if tok == "定":
+                    tags[i] = "，"
+                elif tok == "慢" and i < 15:
+                    tags[i] = "。"
+                elif tok == "patch":
+                    tags[i] = "，"
+                elif tok == "了" and i == len(tokens) - 1:
+                    tags[i] = "。"
+            return tags
+
+    utts = [
+        Utterance(0.0, 2.0, "今天刚刚搞定", speaker="说话人A"),
+        Utterance(2.0, 3.5, "但是速度有点慢", speaker="说话人A"),
+        # 禁尾词 "那个" + 中英码转换 "review patch"，即使有 1.2s 停顿也应合并而非硬拆
+        Utterance(3.5, 5.0, "然后那个开始慢慢的开始那个", speaker="说话人A"),
+        Utterance(6.2, 7.0, "review patch", speaker="说话人A"),
+        Utterance(7.0, 9.0, "已经对齐过了", speaker="说话人A"),
+    ]
+    punc = FakePunc()
+    out = reconstruct_sentences(utts, language="zh", punctuator=punc)
+    assert len(out) == 2
+    assert out[0].start == 0.0 and out[0].end == 3.5
+    assert out[0].text == "今天刚刚搞定，但是速度有点慢。"
+    assert out[1].start == 3.5 and out[1].end == 9.0
+    assert "review patch" in out[1].text
+    assert out[1].polished_text is not None
+    assert "开始慢慢的开始" not in out[1].polished_text
+
+
+def test_reconstruct_sentences_monologue_soft_split():
+    from meetmin.asr.punctuation import reconstruct_sentences
+
+    class CommaOnlyPunc:
+        name = "comma_only"
+
+        def predict_tags(self, tokens: list[str]) -> list[str]:
+            tags = [""] * len(tokens)
+            if len(tokens) > 60:
+                tags[58] = "，"
+            return tags
+
+    utts = [Utterance(0.0, 20.0, "测" * 95, speaker="说话人A")]
+    out = reconstruct_sentences(
+        utts,
+        language="zh",
+        punctuator=CommaOnlyPunc(),
+        max_sentence_tokens=85,
+        max_sentence_sec=18.0,
+    )
+    assert len(out) == 2
+    assert out[0].text.endswith("。")
+    assert out[1].text.endswith("。")
+    assert out[0].start == 0.0 and out[1].end == 20.0
+
+
+def test_group_paragraphs_and_render_md_merges_fragments_and_splits_on_long_pause():
+    from meetmin.pipeline import Pipeline
+
+    transcript = {
+        "session_id": "demo",
+        "audio_path": "a.wav",
+        "meeting_time": "2026-11-21 10:00",
+        "duration": 30.0,
+        "language": "zh",
+        "asr": {"provider": "faster_whisper"},
+        "speakers": ["说话人A", "说话人B"],
+        "utterances": [
+            {"start": 0.0, "end": 2.0, "speaker": "说话人A", "text": "前几天网络出了点问题"},
+            {"start": 2.0, "end": 4.0, "speaker": "说话人A", "text": "然后开始那个"},
+            {"start": 4.0, "end": 5.0, "speaker": "说话人A", "text": "review patch"},
+            # 停顿 3.0s 触发自然换段
+            {"start": 8.0, "end": 10.0, "speaker": "说话人A", "text": "另外我们继续下一个议题。"},
+            {"start": 10.5, "end": 13.0, "speaker": "说话人B", "text": "好的我来同步进度。"},
+        ],
+    }
+    md = Pipeline._render_md(transcript)
+    assert "**说话人A** `[00:00-00:05]`" in md
+    assert "前几天网络出了点问题，然后开始那个 review patch" in md
+    assert "**说话人A** `[00:08-00:10]`" in md
+    assert "**说话人B** `[00:10-00:13]`" in md
+    assert md.count("**说话人A**") == 2
+
+
+def test_render_transcript_adds_punctuation_and_supports_polished_text():
+    utts = [
+        Utterance(0.0, 2.0, "网络出了点问题", speaker="说话人A", polished_text="网络出了问题"),
+        Utterance(2.1, 4.0, "今天刚刚搞定。", speaker="说话人A", polished_text="今天搞定。"),
+    ]
+    raw_rendered = render_transcript(utts, merge_same_speaker=True, language="zh")
+    assert raw_rendered == "说话人A: 网络出了点问题，今天刚刚搞定。"
+    polished_rendered = render_transcript(
+        utts, merge_same_speaker=True, language="zh", use_polished=True
+    )
+    assert polished_rendered == "说话人A: 网络出了问题，今天搞定。"
+
+
+def test_punc_onnx_downloads_to_cache_and_aligns_offsets(monkeypatch):
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import patch
+
+    import huggingface_hub
+
+    from meetmin.asr.punc_onnx import (
+        CT_TRANSFORMER_MODEL_FILE,
+        CT_TRANSFORMER_REPO,
+        FIRERED_MODEL_FILE,
+        FIRERED_REPO,
+        FIRERED_TOKENIZER_FILE,
+        CtTransformerOnnx,
+        FireRedPuncOnnx,
+    )
+
+    with _TmpDir() as td:
+        hub_root = Path(td) / "cache"
+        fr_onnx = Path(td) / FIRERED_MODEL_FILE
+        fr_tok = Path(td) / FIRERED_TOKENIZER_FILE
+        ct_onnx = Path(td) / CT_TRANSFORMER_MODEL_FILE
+        fr_onnx.write_bytes(b"fake")
+        fr_tok.write_text("{}", encoding="utf-8")
+        ct_onnx.write_bytes(b"fake")
+
+        downloads: list[tuple[str, str]] = []
+        states: list[bool] = []
+
+        def fake_download(repo_id, filename, *, cache_dir):
+            downloads.append((repo_id, filename))
+            if filename == FIRERED_MODEL_FILE:
+                return str(fr_onnx)
+            if filename == FIRERED_TOKENIZER_FILE:
+                return str(fr_tok)
+            return str(ct_onnx)
+
+        class FakeFireRedSession:
+            def __init__(self, path, opts, providers=None):
+                pass
+
+            def get_outputs(self):
+                return [SimpleNamespace(name="logits")]
+
+            def run(self, outputs, feeds):
+                seq_len = feeds["input_ids"].shape[1]
+                # seq_minus_1 输出（跳过 [CLS]），在最后一个词元（index seq_len - 3）输出句号 class 2
+                logits = np.zeros((1, seq_len - 1, 5), dtype=np.float32)
+                logits[0, :, 0] = 1.0
+                if seq_len >= 4:
+                    logits[0, seq_len - 3, 2] = 5.0
+                return [logits]
+
+        class FakeTokenizer:
+            @classmethod
+            def from_file(cls, path):
+                return cls()
+
+            def token_to_id(self, token):
+                return {"[CLS]": 101, "[SEP]": 102, "[UNK]": 100}.get(token, 100)
+
+            def encode(self, text, add_special_tokens=False):
+                return SimpleNamespace(ids=[10, 11] if text == "review" else [12])
+
+        class FakeCtSession:
+            def __init__(self, path, opts, providers=None):
+                pass
+
+            def get_inputs(self):
+                return [SimpleNamespace(name="inputs"), SimpleNamespace(name="text_lengths")]
+
+            def get_outputs(self):
+                return [SimpleNamespace(name="logits")]
+
+            def get_modelmeta(self):
+                return SimpleNamespace(
+                    custom_metadata_map={
+                        "punctuations": "<unk>|_|，|。|？|、",
+                        "tokens": "<unk>|好|的|patch",
+                        "unk_symbol": "<unk>",
+                    }
+                )
+
+            def run(self, outputs, feeds):
+                n = int(feeds["text_lengths"][0])
+                logits = np.zeros((1, n, 6), dtype=np.float32)
+                logits[0, :, 1] = 1.0
+                logits[0, n - 1, 3] = 5.0
+                return [logits]
+
+        fake_ort = ModuleType("onnxruntime")
+        fake_ort.SessionOptions = lambda: SimpleNamespace()  # type: ignore[attr-defined]
+        fake_ort.InferenceSession = FakeFireRedSession  # type: ignore[attr-defined]
+        fake_tok_mod = ModuleType("tokenizers")
+        fake_tok_mod.Tokenizer = FakeTokenizer  # type: ignore[attr-defined]
+
+        monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+        with patch.dict(sys.modules, {"onnxruntime": fake_ort, "tokenizers": fake_tok_mod}):
+            fr = FireRedPuncOnnx(model_cache_dir=hub_root, on_model_download=states.append)
+            tags = fr.predict_tags(["开", "始", "review"])
+            assert tags == ["", "", "。"]
+            assert (FIRERED_REPO, FIRERED_MODEL_FILE) in downloads
+            assert (FIRERED_REPO, FIRERED_TOKENIZER_FILE) in downloads
+            assert True in states and states[-1] is False
+
+        fake_ort.InferenceSession = FakeCtSession  # type: ignore[attr-defined]
+        with patch.dict(sys.modules, {"onnxruntime": fake_ort}):
+            ct = CtTransformerOnnx(model_cache_dir=hub_root)
+            ct_tags = ct.predict_tags(["好", "的", "patch"])
+            assert ct_tags == ["", "", "。"]
+            assert (CT_TRANSFORMER_REPO, CT_TRANSFORMER_MODEL_FILE) in downloads
+
+
+def test_diarize_punctuation_onnx_failure_falls_back_to_rule(tmp_path):
+    from meetmin.pipeline import Pipeline
+
+    messages: list[str] = []
+    pipe = Pipeline(
+        {
+            "output_dir": tmp_path,
+            "diarization": {"provider": "single"},
+            "punctuation": {
+                "provider": "firered_onnx",
+                "model_path": str(tmp_path / "missing.onnx"),
+            },
+        },
+        progress=messages.append,
+    )
+    session = pipe.new_session("punc-fallback")
+    session.save_json(
+        "asr_raw.json",
+        {
+            "session_id": session.session_id,
+            "asr": {"provider": "faster_whisper"},
+            "language": "zh",
+            "utterances": [
+                {"start": 0.0, "end": 1.0, "text": "网络出了点问题"},
+                {"start": 2.0, "end": 3.0, "text": "今天刚刚搞定"},
+            ],
+        },
+    )
+    tr = pipe.diarize(session)
+    assert [u["text"] for u in tr["utterances"]] == ["网络出了点问题。", "今天刚刚搞定。"]
+    assert any("降级为规则标点" in m for m in messages)
+
+
+def test_to_simplified_chinese_converts_traditional_and_respects_opencc_phrases(tmp_path):
+    from meetmin.asr.zh_convert import to_simplified
+    from meetmin.pipeline import Pipeline
+
+    assert (
+        to_simplified("在不開 DLC state 的時候，確認統計模組與預期行為怎麼工作？")
+        == "在不开 DLC state 的时候，确认统计模组与预期行为怎么工作？"
+    )
+    # 词组规则（一目瞭然 -> 一目了然）与防误转保护词条（乾坤 -> 乾坤）
+    assert to_simplified("這個方案一目瞭然，乾坤未定。") == "这个方案一目了然，乾坤未定。"
+
+    pipe = Pipeline(
+        {
+            "output_dir": tmp_path,
+            "diarization": {"provider": "single"},
+            "punctuation": {"provider": "rule", "to_simplified": True},
+        }
+    )
+    session = pipe.new_session("t2s")
+    session.save_json(
+        "asr_raw.json",
+        {
+            "session_id": session.session_id,
+            "asr": {"provider": "faster_whisper"},
+            "language": "zh",
+            "utterances": [
+                {
+                    "start": 0.0,
+                    "end": 2.0,
+                    "text": "這裡有這個變化，確認說沒有問題",
+                    "words": [{"w": "這裡有這個變化", "s": 0.0, "e": 2.0}],
+                }
+            ],
+        },
+    )
+    tr = pipe.diarize(session)
+    assert tr["utterances"][0]["text"] == "这里有这个变化，确认说没有问题。"
+    assert "这里有这个变化，确认说没有问题。" in session.transcript_md.read_text(encoding="utf-8")
+
+    # 允许显式关闭繁转简
+    pipe_keep = Pipeline(
+        {
+            "output_dir": tmp_path,
+            "diarization": {"provider": "single"},
+            "punctuation": {"provider": "rule", "to_simplified": False},
+        }
+    )
+    tr_keep = pipe_keep.diarize(session)
+    assert tr_keep["utterances"][0]["text"] == "這裡有這個變化，確認說沒有問題。"

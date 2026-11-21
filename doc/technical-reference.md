@@ -38,6 +38,7 @@ Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装
 | 本地 ASR 依赖 | 检查能否找到 `faster_whisper`、`av` 模块；缺失则退出，不验证其完整运行能力 |
 | Whisper 缓存 | 显示下载目录，并检查显式指定的本地模型目录或缓存快照中的 `model.bin` |
 | 声纹模型及依赖 | 默认 `campplus_onnx` 检查 `onnxruntime` 及缓存快照中的 CAM++ ONNX 模型（约 27 MB，或显式 `model_path`）；若切到 `ecapa_speechbrain` 则检查 `torch`、`speechbrain` 及 ECAPA 缓存快照中的 `embedding_model.ckpt` |
+| 标点模型及依赖 | 默认 `firered_onnx` 检查 `onnxruntime`、`tokenizers` 及 FireRedPunc ONNX 缓存（约 155 MB）；`ct_transformer_onnx` 检查 CT-Transformer INT8 缓存（约 72 MB）；`rule` 无需额外模型 |
 | API Key | 检查指定环境变量是否存在；LLM Key 缺失只提示，DashScope ASR Key 或音频 URL 缺失则退出 |
 | GPU | 通过 CTranslate2 检查 CUDA 设备和计算类型，尝试加载 CUDA/cuDNN 库，并在可对应到当前设备时用 `nvidia-smi` 查询空闲显存 |
 | 磁盘 | 报告输出目录所在磁盘的剩余空间，不做容量预算或写入测试 |
@@ -97,7 +98,7 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 
 本地声纹重跑仍需要原始音频，外部音频请保留在记录的绝对路径。Whisper 保留 `asr.word_timestamps: true` 才会请求词级数据；当前 DashScope 实现只解析句级数据。旧会话没有 `asr_raw.json` 时，需重新转写一次才能独立分离；已有 `transcript.json` 仍可用于生成纪要。
 
-对于本地 Whisper 的中文转写，`diarize` 会统一中文上下文中的半角逗号，并在至少 0.8 秒的段间停顿或音轨结束处为以文字或数字收尾的片段补句号。双轨会话按各自的时间轴处理。可对已有的 `asr_raw.json` 直接重跑 `diarize` 应用标点整理，原始转写保留模型文本和词级时间戳。
+对于本地 Whisper 的中文转写，`diarize` 默认执行四阶段自然成句与分段重排：先按语速自适应停顿阈值与禁尾词/中英码转换守卫预聚合同一说话人的短碎片段，再由纯 ONNX 标点模型（默认 `firered_onnx` FireRedPunc Q8W 155 MB，可选轻量 `ct_transformer_onnx` 72 MB 或零模型 `rule`）恢复中英混读标点并按终结标点切出自然句，同时通过词级时间戳无损回溯精确 `[start, end]` 并可选生成去口癖的 `polished_text` 视图；若 ONNX 模型不可用或离线未缓存，自动降级为规则标点不中断流程。在 `transcript.md`（及桌面端预览）中，相邻同说话人的自然句会按长停顿（默认 `2.2s`）与段落长度上限（默认 `220` 字 / `45s`）聚合成整洁段落。双轨会话按各自的时间轴处理。可对已有的 `asr_raw.json` 直接重跑 `diarize` 应用新的标点与分段参数，原始转写保留模型文本和词级时间戳。
 
 如需让模型直接输出更多标点，可在 `asr.language: zh` 时设置 `asr.punctuation_prompt: "好的，我们继续。"`，也可用 `asr.hotwords` 填写少量确认过的术语。两项内容会合并传给 Whisper 的 `hotwords`，实际使用值记录在 `asr_raw.json`。标点提示可能影响识别与词级时间戳，默认关闭。
 
@@ -149,12 +150,17 @@ asr:
 | `diarization.num_speakers` | `null`；非空时按指定人数聚类（默认 kNN 离群预筛 + Ward），不使用距离阈值选人数 |
 | `diarization.cluster_method` / `cluster_threshold` | `auto` / `null`；`auto` 在自动人数时用 `average`、指定人数时用 `ward`，也可选 `average` / `ward` / `spectral`；阈值留空随模型自动取值（`campplus_onnx: 0.54`、`ecapa_speechbrain: 0.64`），调大倾向合并、调小倾向拆分 |
 | `diarization.min_group_sec` | `0.4`，对齐阶段平滑过短换人片段 |
+| `punctuation.provider` / `model_path` | `firered_onnx`（默认，纯 ONNX 中英高精度 155 MB）；可选 `ct_transformer_onnx`（轻量 72 MB）或 `rule`（零模型）；`model_path` 可指定本地 ONNX 文件或目录 |
+| `punctuation.to_simplified` | `true`；基于内置 OpenCC 词典自动将中文转写中的繁体字统一转为简体中文（零外部依赖，不影响英文与数字） |
+| `punctuation.max_sentence_tokens` / `max_sentence_sec` | `85` / `18.0`；超长独白无终结标点时的软切分上限（词元数 / 秒） |
+| `punctuation.enable_polish` | `true`；同步生成轻量零幻觉口语顺滑视图 `polished_text` 存入 `transcript.json` |
+| `punctuation.paragraph_max_gap_sec` / `paragraph_max_chars` / `paragraph_max_duration_sec` | `2.2` / `220` / `45.0`；`transcript.md` 同说话人换段停顿阈值与单段上限 |
 | `llm.base_url` / `model` | DashScope 兼容端点 / `qwen-3.8-flash`，应按实际服务修改 |
 | `llm.api_key_env` | `DASHSCOPE_API_KEY`，从环境变量读取密钥 |
 | `llm.provider` | `openai_compatible`；设 `mock` 可离线联调纪要，不代表关闭本地模型下载 |
 | `llm.retries` | `3`，最大请求次数（含首次）；超时、连接错误、429 和 5xx 才重试。429 优先遵循 `Retry-After`；服务要求等待超过 300 秒时提示稍后重试 |
 | `llm.extra_request` | `{}`，透传请求字段，例如 `{"enable_thinking": false}`，是否支持由服务决定 |
-| `summarizer.strategy` | `auto`，按长度选择 `direct` 或 `map_reduce` |
+| `summarizer.strategy` / `use_polished_text` | `auto`（按长度选择 `direct` 或 `map_reduce`）/ `false`（设为 `true` 时优先将 `polished_text` 喂给纪要模型） |
 
 分离阶段遇到音频读取、依赖、模型或聚类等错误时，会提示原因并降级为单说话人，继续生成转写和纪要。`transcript.json` 的 `diarization_status` 和 `transcript.md` 会记录降级原因；原始转写不受影响，修复问题后可重跑 `diarize` 和纪要。
 

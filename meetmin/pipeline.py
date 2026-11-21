@@ -12,7 +12,15 @@ from typing import Any, Literal, overload
 
 from .asr.base import ASRResult, Utterance
 from .asr.model_download import ModelDownloadProgress
-from .asr.punctuation import punctuate_chinese
+from .asr.punc_onnx import Punctuator, get_punctuator
+from .asr.punctuation import (
+    group_paragraphs,
+    is_zh_like,
+    join_utterance_texts,
+    punctuate_chinese,
+    reconstruct_sentences,
+)
+from .asr.zh_convert import convert_utterances_to_simplified
 from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
 from .audio.segments import SessionLock
@@ -271,8 +279,12 @@ class Pipeline:
                 u.speaker = "说话人A"
             speakers = ["说话人A"] if utterances else []
         local_whisper = (raw.get("asr") or {}).get("provider") == "faster_whisper"
+        punctuator: Punctuator | None = None
         if local_whisper:
-            punctuate_chinese(utterances, raw.get("language"))
+            punctuator = self._resolve_punctuator(on_model_download=on_model_download)
+            utterances = self._format_utterances(
+                utterances, raw.get("language"), punctuator=punctuator
+            )
         transcript = {k: v for k, v in raw.items() if k != "schema_version"}
         if microphone := raw.get("microphone"):
             transcript["microphone"] = {k: v for k, v in microphone.items() if k != "utterances"}
@@ -282,7 +294,9 @@ class Pipeline:
             for u in mic_utterances:
                 u.speaker = "我"
             if local_whisper:
-                punctuate_chinese(mic_utterances, microphone.get("language"))
+                mic_utterances = self._format_utterances(
+                    mic_utterances, microphone.get("language"), punctuator=punctuator
+                )
             utterances.extend(mic_utterances)
             utterances.sort(key=lambda u: (u.start, u.end))
             speakers = list(
@@ -305,9 +319,58 @@ class Pipeline:
         self.progress(f"  ✓ 分离结果已保存：{session.root}")
         return transcript
 
+    def _resolve_punctuator(
+        self, *, on_model_download: Callable[[bool], None] | None = None
+    ) -> Punctuator | None:
+        pcfg = self.cfg.get("punctuation")
+        if not isinstance(pcfg, dict):
+            return None
+        try:
+            return get_punctuator(self.cfg, on_model_download=on_model_download)
+        except Exception as exc:
+            self.progress(
+                f"  ! 标点模型初始化失败（{type(exc).__name__}: {exc}），已降级为规则标点。"
+            )
+            return None
+
+    def _format_utterances(
+        self,
+        utterances: list[Utterance],
+        language: str | None,
+        *,
+        punctuator: Punctuator | None,
+    ) -> list[Utterance]:
+        if not utterances:
+            return utterances
+        pcfg = self.cfg.get("punctuation") or {}
+        zh_like = is_zh_like(utterances, language)
+        if zh_like and bool(pcfg.get("to_simplified", True)):
+            convert_utterances_to_simplified(utterances)
+        if punctuator is not None and zh_like:
+            try:
+                return reconstruct_sentences(
+                    utterances,
+                    language=language,
+                    punctuator=punctuator,
+                    max_sentence_tokens=int(pcfg.get("max_sentence_tokens", 85)),
+                    max_sentence_sec=float(pcfg.get("max_sentence_sec", 18.0)),
+                    left_context_tokens=int(pcfg.get("left_context_tokens", 15)),
+                    enable_polish=bool(pcfg.get("enable_polish", True)),
+                )
+            except Exception as exc:
+                self.progress(
+                    f"  ! 标点模型推理失败（{type(exc).__name__}: {exc}），已降级为规则标点。"
+                )
+        punctuate_chinese(utterances, language)
+        return utterances
+
     def _save_transcript(self, session: Session, transcript: dict) -> None:
         session.save_transcript(transcript)
-        session.save_text_safely("transcript.md", self._render_md(transcript), overwrite=True)
+        session.save_text_safely(
+            "transcript.md",
+            self._render_md(transcript, pcfg=self.cfg.get("punctuation")),
+            overwrite=True,
+        )
 
     @staticmethod
     def _transcript_lock(session: Session) -> SessionLock:
@@ -377,7 +440,7 @@ class Pipeline:
         return relabel(utterances)
 
     @staticmethod
-    def _render_md(transcript: dict) -> str:
+    def _render_md(transcript: dict, *, pcfg: dict | None = None) -> str:
         lines = [
             f"# 会议转写 {transcript['session_id']}",
             "",
@@ -401,11 +464,22 @@ class Pipeline:
         if status.get("status") == "fallback":
             track = "内录轨" if microphone else ""
             lines.extend([f"> {track}说话人分离失败，已降级为单说话人：{status.get('error')}", ""])
-        for u in transcript["utterances"]:
-            t0, t1 = float(u.get("start", 0)), float(u.get("end", 0))
-            lines.append(f"**{u.get('speaker', '?')}** `[{ts(t0)}-{ts(t1)}]`")
+        cfg = pcfg or {}
+        paragraphs = group_paragraphs(
+            transcript["utterances"],
+            max_gap_sec=float(cfg.get("paragraph_max_gap_sec", 2.2)),
+            max_chars=int(cfg.get("paragraph_max_chars", 220)),
+            max_duration_sec=float(cfg.get("paragraph_max_duration_sec", 45.0)),
+        )
+        language = transcript.get("language")
+        for group in paragraphs:
+            t0 = float(group[0].get("start", 0))
+            t1 = float(group[-1].get("end", 0))
+            speaker = group[0].get("speaker", "?")
+            body = join_utterance_texts(group, language=language, use_polished=False)
+            lines.append(f"**{speaker}** `[{ts(t0)}-{ts(t1)}]`")
             lines.append("")
-            lines.append(u["text"])
+            lines.append(body)
             lines.append("")
         return "\n".join(lines)
 
@@ -423,7 +497,9 @@ class Pipeline:
     def _save_corrected_transcript(self, session: Session, corrected: dict) -> None:
         session.save_json("transcript_corrected.json", corrected)
         session.save_text_safely(
-            "transcript_corrected.md", self._render_md(corrected), overwrite=True
+            "transcript_corrected.md",
+            self._render_md(corrected, pcfg=self.cfg.get("punctuation")),
+            overwrite=True,
         )
 
     def _correct_glossary(self, session: Session, transcript: dict) -> dict:

@@ -17,7 +17,8 @@ import logging
 from typing import Any
 
 from ..asr.base import Utterance
-from ..textutil import smart_join, ts
+from ..asr.punctuation import join_utterance_texts
+from ..textutil import ts
 from . import prompts
 from .llm_client import BaseLLM, Usage
 
@@ -36,27 +37,31 @@ def render_transcript(
     *,
     merge_same_speaker: bool = True,
     with_timestamps: bool = False,
+    language: str | None = None,
+    use_polished: bool = False,
 ) -> str:
     """把 utterances 渲染成喂给 LLM 的紧凑文本："说话人A: 文本" 每行一条。"""
     lines: list[str] = []
     cur_spk: str | int | None = None
-    cur_parts: list[str] = []
+    cur_items: list[Utterance] = []
     cur_start = 0.0
 
     def flush() -> None:
-        if not cur_parts:
+        if not cur_items:
             return
-        text = smart_join(cur_parts)
+        text = join_utterance_texts(cur_items, language=language, use_polished=use_polished)
+        if not text:
+            return
         prefix = f"[{ts(cur_start)}] " if with_timestamps else ""
         lines.append(f"{prefix}{cur_spk}: {text}")
 
     for u in utterances:
         spk = u.speaker or "说话人?"
         if merge_same_speaker and spk == cur_spk:
-            cur_parts.append(u.text)
+            cur_items.append(u)
         else:
             flush()
-            cur_spk, cur_parts, cur_start = spk, [u.text], u.start
+            cur_spk, cur_items, cur_start = spk, [u], u.start
     flush()
     return "\n".join(lines)
 
@@ -110,6 +115,8 @@ def build_web_prompt(transcript: dict, *, config: dict | None = None) -> str:
         utterances,
         merge_same_speaker=bool(scfg.get("merge_same_speaker", True)),
         with_timestamps=bool(scfg.get("with_timestamps", False)),
+        language=transcript.get("language"),
+        use_polished=bool(scfg.get("use_polished_text", False)),
     )
     if not utterances or not any(u.text.strip() for u in utterances):
         raise RuntimeError("转写结果为空，无法生成网页版提示词。")
@@ -142,6 +149,8 @@ def generate_minutes(
         utterances,
         merge_same_speaker=bool(scfg.get("merge_same_speaker", True)),
         with_timestamps=bool(scfg.get("with_timestamps", False)),
+        language=transcript.get("language"),
+        use_polished=bool(scfg.get("use_polished_text", False)),
     )
     meta_line, role_hint = _build_meta(transcript, scfg)
     threshold = int(scfg.get("direct_threshold_chars", 9000))
