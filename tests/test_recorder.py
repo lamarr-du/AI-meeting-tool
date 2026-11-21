@@ -11,6 +11,7 @@ from meetmin.audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
 from meetmin.audio.segments import SessionLock, merge_segments
 from meetmin.audio.session_recorder import SessionRecorder
 from meetmin.cli import cmd_recover
+from meetmin.pipeline import Pipeline
 from meetmin.session import Session
 
 
@@ -270,6 +271,40 @@ def test_loopback_boost_preserves_stereo_balance_and_peak_headroom(recording):
     assert stereo[0, 0] > 100
     assert stereo[0, 0] == pytest.approx(-2 * stereo[0, 1], abs=1)
     assert stereo[4800, 1] == round(-0.95 * 32768)
+
+
+def test_session_recording_saves_and_recovers_16k_mono_tracks(recording, tmp_path):
+    r = recording
+    recorder = Pipeline(
+        {"recorder": {"device": 0, "sample_rate": 48000, "channels": 2, "microphone": True}},
+        progress=lambda _: None,
+    ).recorder(for_session=True)
+    for track in recorder._recorders:
+        track._clock = r.clock
+    session = Session(tmp_path, "format")
+    recorder.start(session)
+    loopback, microphone = r.streams[-2:]
+    assert (loopback.rate, loopback.channels) == (48000, 2)
+    assert (microphone.rate, microphone.channels) == (2000, 1)
+    loopback.emit(0, value=[4000, 2000], frames=4800)
+    microphone.emit(0, value=3000, frames=200)
+    r.clock.value = 10.2
+    info = recorder.stop()
+    assert (info["sample_rate"], info["channels"]) == (16000, 1)
+    assert (info["capture_sample_rate"], info["capture_channels"]) == (48000, 2)
+    assert (info["microphone"]["sample_rate"], info["microphone"]["channels"]) == (16000, 1)
+    paths = session.recording_paths()
+    for path, track in zip(paths, ("loopback", "microphone")):
+        assert path is not None
+        with wave.open(str(path), "rb") as wav:
+            assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (16000, 1, 2)
+            assert wav.getnframes() == 3200
+            data = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+        assert np.mean(np.abs(data[200:1400])) > 1000
+        assert np.max(np.abs(data[2000:])) < 10
+        recovered = tmp_path / f"{track}.wav"
+        merge_segments(path.parent / track, recovered)
+        np.testing.assert_array_equal(read_audio(recovered, rate=16000), data)
 
 
 @pytest.mark.parametrize("capture_silence", [True, False])

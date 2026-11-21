@@ -194,10 +194,15 @@ class LoopbackRecorder:
         clock: Callable[[], float] | None = None,
         segment_seconds: float = 300,
         sync_seconds: float = 10,
+        output_sample_rate: int | None = None,
+        output_channels: int | None = None,
     ):
         self.device = device
         self.channels = channels
         self.sample_rate = sample_rate
+        self.output_sample_rate = output_sample_rate
+        self.output_channels = output_channels
+        self._resampler: Any = None
         self.chunk_ms = max(20, int(chunk_ms))
         self.silence_threshold = float(silence_threshold)
         if not 0 <= self.silence_threshold <= 1:
@@ -349,6 +354,15 @@ class LoopbackRecorder:
         info = self._resolve_device(self._pa)
         sr = int(self.sample_rate or info["defaultSampleRate"])
         ch = int(self.channels or max(1, min(2, int(info["maxInputChannels"]))))
+        output_rate = self.output_sample_rate or sr
+        output_ch = self.output_channels or ch
+        if output_rate <= 0 or output_ch not in (1, ch):
+            raise ValueError("录音保存格式的采样率或声道数无效")
+        self._resampler = None
+        if output_rate != sr:
+            import soxr
+
+            self._resampler = soxr.ResampleStream(sr, output_rate, output_ch, dtype="int16")
         self._level_control = self._create_level_control(sr, info)
         float_capture = self._level_control is not None
         self._capture_sample_width = 4 if float_capture else 2
@@ -357,8 +371,8 @@ class LoopbackRecorder:
 
         self._wf = SegmentedWriter(
             path,
-            sr,
-            ch,
+            output_rate,
+            output_ch,
             overwrite=overwrite,
             segment_seconds=self._segment_seconds,
             sync_seconds=self._sync_seconds,
@@ -466,7 +480,7 @@ class LoopbackRecorder:
             self._level_control.add_silence(gap_frames)
         while self._frames < target:
             frames = min(target - self._frames, self.sample_rate_actual)
-            self._wf.writeframesraw(bytes(frames * self.channels_actual * 2))
+            self._write_output(bytes(frames * self.channels_actual * 2))
             with self._level_lock:
                 self._frames += frames
                 self._padded_frames += frames
@@ -484,8 +498,19 @@ class LoopbackRecorder:
         if data:
             if self._level_control is not None:
                 data = self._level_control.to_pcm(data, frames)
-            self._wf.writeframesraw(data)
+            self._write_output(data)
             self._update_level(data, record_arrival=False)
+
+    def _write_output(self, data: bytes) -> None:
+        assert self._wf is not None
+        samples = np.frombuffer(data, dtype="<i2").reshape(-1, self.channels_actual)
+        if self._wf.channels == 1 and self.channels_actual > 1:
+            samples = np.rint(samples.astype(np.float32).mean(axis=1)).astype(np.int16)
+        elif self._wf.channels == 1:
+            samples = samples[:, 0]
+        if self._resampler is not None:
+            samples = self._resampler.resample_chunk(samples)
+        self._wf.writeframesraw(samples.astype("<i2", copy=False).tobytes())
 
     def _close_audio(self) -> None:
         # Called by the writer, or by start() only if no writer was ever started.
@@ -493,7 +518,16 @@ class LoopbackRecorder:
         writer = self._wf
         if writer is not None:
             try:
-                writer.close()
+                try:
+                    if self._resampler is not None:
+                        shape = (0,) if writer.channels == 1 else (0, writer.channels)
+                        tail = self._resampler.resample_chunk(
+                            np.empty(shape, dtype=np.int16), last=True
+                        )
+                        writer.writeframesraw(tail.astype("<i2", copy=False).tobytes())
+                        self._resampler = None
+                finally:
+                    writer.close()
             except Exception as error:
                 closed = False
                 self._fail(error)
@@ -627,8 +661,10 @@ class LoopbackRecorder:
     def _info(self) -> dict:
         return {
             "path": str(self.path) if self.path else None,
-            "sample_rate": self.sample_rate_actual,
-            "channels": self.channels_actual,
+            "sample_rate": self.output_sample_rate or self.sample_rate_actual,
+            "channels": self.output_channels or self.channels_actual,
+            "capture_sample_rate": self.sample_rate_actual,
+            "capture_channels": self.channels_actual,
             "device": self.device_name,
             **self.status(),
         }

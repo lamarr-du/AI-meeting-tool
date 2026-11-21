@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import replace
 from math import isclose
 
@@ -17,11 +18,30 @@ def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
     return max(0.0, min(a1, b1) - max(a0, b0))
 
 
+def _is_sorted_non_overlapping(segments: list[dict]) -> bool:
+    for i in range(1, len(segments)):
+        if segments[i]["start"] < segments[i - 1]["end"] - 1e-9:
+            return False
+    return True
+
+
+def _speaker_at_point_sorted(t: float, segments: list[dict], starts: list[float]):
+    idx = bisect_right(starts, t) - 1
+    if idx >= 0 and segments[idx]["start"] <= t <= segments[idx]["end"]:
+        return segments[idx]["label"]
+    return None
+
+
 def speaker_at_point(t: float, segments: list[dict]):
+    best_label = None
+    best_dist = float("inf")
     for s in segments:
         if s["start"] <= t <= s["end"]:
-            return s["label"]
-    return None
+            dist = abs((s["start"] + s["end"]) / 2.0 - t)
+            if dist < best_dist:
+                best_dist = dist
+                best_label = s["label"]
+    return best_label
 
 
 def majority_label(start: float, end: float, segments: list[dict]):
@@ -64,6 +84,8 @@ def assign_speakers(
     min_group_sec: float = 0.4,
 ) -> list[Utterance]:
     """为每条 utterance 赋 speaker；有词级时间戳时按换人点拆句。"""
+    sorted_fast = bool(segments) and _is_sorted_non_overlapping(segments)
+    seg_starts = [float(s["start"]) for s in segments] if sorted_fast else []
     out: list[Utterance] = []
     for u in utterances:
         if u.speaker is not None:
@@ -84,7 +106,12 @@ def assign_speakers(
         word_labels = []
         for w in u.words:
             s, e = _word_span(w, u)
-            lab = speaker_at_point((s + e) / 2, segments)
+            mid = (s + e) / 2
+            lab = (
+                _speaker_at_point_sorted(mid, segments, seg_starts)
+                if sorted_fast
+                else speaker_at_point(mid, segments)
+            )
             word_labels.append(base if lab is None else lab)
 
         groups: list[list] = []

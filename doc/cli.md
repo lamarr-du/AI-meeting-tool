@@ -13,7 +13,7 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -c requirements-win-py312.lock .
 
-# 可选：本地说话人分离；使用约束文件保持核心依赖版本
+# 可选：旧版 SpeechBrain ECAPA 说话人分离（默认 CAM++ ONNX 已开箱可用，无需此依赖）
 python -m pip install -c requirements-win-py312.lock ".[diar]"
 ```
 
@@ -23,7 +23,7 @@ macOS / Linux，使用兼容版本范围：
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install .
-# 可选：本地说话人分离
+# 可选：旧版 SpeechBrain ECAPA 说话人分离（默认 CAM++ ONNX 已开箱可用）
 python -m pip install ".[diar]"
 ```
 
@@ -113,7 +113,7 @@ meetmin run --mic -n weekly
 
 电脑内录和本机麦克风会分别根据各自采集到的电平自动调整增益。有声时持续调整，停顿后按新声音的电平重新估算。麦克风最多补偿约 24 dB，并减少对极低电平底噪的放大。增益作用于保存的录音，播放音量和麦克风输入音量仍由 Windows 控制。若静音导致设备只返回静音或停止送帧，录音中仍是静音。
 
-双轨共享录音起止时间，分别补齐采集缺口并保存原始 WAV。本地 faster-whisper 分别转写两轨，`diarize` 对内录分配说话人、把麦克风发言标为“我”，最后按起始时间合并，两边同时说话时会保留双方的发言。双轨会话的自动转写使用本地 faster-whisper。
+双轨共享录音起止时间，分别补齐采集缺口并保存为 16 kHz 单声道 16-bit PCM WAV。本地 faster-whisper 分别转写两轨，`diarize` 对内录分配说话人、把麦克风发言标为“我”，最后按起始时间合并，两边同时说话时会保留双方的发言。双轨会话的自动转写使用本地 faster-whisper。
 
 录音时建议佩戴耳机，并关闭 Windows 的麦克风“侦听此设备”。扬声器的声音可能被麦克风重复采集，转写时会出现重复发言或误标为“我”。自动串音抑制列在改进计划中。
 

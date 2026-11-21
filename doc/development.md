@@ -2,7 +2,7 @@
 
 使用说明见[项目首页](../README.md)，运行机制与配置项见[技术参考](technical-reference.md)。
 
-项目改进计划见 [improvement-plan.md](../improvement-plan.md)。
+项目改进计划见 [improvement-plan.md](improvement-plan.md)。
 
 ## 依赖与锁文件
 

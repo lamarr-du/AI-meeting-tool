@@ -57,8 +57,16 @@ def test_align_only_retry_does_not_need_original_audio_or_repeat_asr(tmp_path):
         == pipe.diarize.return_value
     )
     pipe.transcribe.assert_not_called()
-    pipe.diarize.assert_called_once_with(session)
-    assert stages == ["正在整理转写与说话人…"]
+    pipe.diarize.assert_called_once()
+    assert pipe.diarize.call_args.args == (session,)
+    callback = pipe.diarize.call_args.kwargs["on_model_download"]
+    callback(True)
+    callback(False)
+    assert stages == [
+        "正在整理转写与说话人…",
+        "正在下载说话人识别模型，首次下载可能需要较长时间…",
+        "正在整理转写与说话人…",
+    ]
 
 
 def test_desktop_can_reuse_legacy_cli_external_audio(tmp_path):

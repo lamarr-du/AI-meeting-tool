@@ -134,7 +134,15 @@ def transcribe(
             on_model_download=on_model_download,
         )
     stage("正在整理转写与说话人…")
-    return pipe.diarize(session)
+
+    def speaker_download(active: bool) -> None:
+        stage(
+            "正在下载说话人识别模型，首次下载可能需要较长时间…"
+            if active
+            else "正在整理转写与说话人…"
+        )
+
+    return pipe.diarize(session, on_model_download=speaker_download)
 
 
 def api_key_available(cfg: dict, api_key: str) -> bool:

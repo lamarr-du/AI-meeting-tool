@@ -44,13 +44,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "diarization": {
         "enabled": True,
-        "provider": "ecapa_speechbrain",  # ecapa_speechbrain | single
+        "provider": "campplus_onnx",  # campplus_onnx（默认，纯 ONNX 零 Torch）| ecapa_speechbrain | single
         "num_speakers": None,  # 已知人数时可填，聚类更准
-        "window_sec": 1.5,
-        "hop_sec": 0.75,
-        "cluster_threshold": 0.55,  # 余弦距离聚类阈值（num_speakers 为 null 时生效）
+        "model_path": None,  # 可选：指定本地 ONNX 声纹模型路径（campplus_onnx 模式生效）
+        "window_mode": "speech_spans",  # speech_spans（按语音段切分，推荐）| sliding（固定滑窗）
+        "window_sec": 2.5,  # speech_spans 模式下为长段切分上限，sliding 模式下为窗长
+        "hop_sec": 1.25,  # sliding 模式下为步长
+        "merge_gap_sec": 0.3,  # speech_spans 模式下合并短停顿相邻片段的间隔阈值
+        "min_cluster_dur_sec": 1.2,  # 短于该时长的片段不参与主聚类，仅在聚类后重分配
+        "cluster_method": "auto",  # auto（自动人数 average / 指定人数 ward）| average | ward | spectral
+        "cluster_threshold": None,  # null 随模型自动选默认值（campplus_onnx: 0.54，ecapa_speechbrain: 0.64）
         "min_window_rms": 0.003,  # 过窗能量阈值，过滤近静音窗口
+        "min_active_ratio": 0.45,  # 20ms 帧级语音活跃占比门槛，低于此值不参与主聚类
+        "min_cluster_size": 2,  # 主簇最少核心段数，小簇将重分配到最近主簇
+        "min_cluster_sec": 4.0,  # 主簇最少核心累计时长（秒）
         "min_group_sec": 0.4,  # 短于该时长的说话人片段并入相邻片段
+    },
+    "punctuation": {
+        "provider": "firered_onnx",  # firered_onnx（默认，中英高精度 155 MB）| ct_transformer_onnx（轻量 72 MB）| rule（零模型）
+        "model_path": None,  # 可选：指定本地 ONNX 标点模型文件或目录
+        "to_simplified": True,  # 统一将中文转写结果中的繁体字转为简体中文（解决 Whisper 混出繁体问题）
+        "max_sentence_tokens": 85,  # 超长独白软切分上限（词元数）
+        "max_sentence_sec": 18.0,  # 超长独白软切分上限（秒）
+        "left_context_tokens": 15,  # 跨块只读左上下文词元数，稳定句界预测
+        "enable_polish": True,  # 同步生成轻量零幻觉口语顺滑视图 polished_text
+        "paragraph_max_gap_sec": 2.2,  # transcript.md 同说话人停顿换段阈值（秒）
+        "paragraph_max_chars": 220,  # transcript.md 单段目标字数上限
+        "paragraph_max_duration_sec": 45.0,  # transcript.md 单段持续时长上限（秒）
     },
     "dashscope_asr": {  # 云端 ASR（步骤2的可选接口，需要音频有可访问 URL）
         "base_url": "https://dashscope.aliyuncs.com",
@@ -76,6 +96,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "strategy": "auto",  # auto | direct（整篇一次调用，最省）| map_reduce（长会议两级压缩）
         "merge_same_speaker": True,  # 相邻同发言人合并，显著省 token
         "with_timestamps": False,  # 时间戳对纪要价值低且耗 token，默认不进 prompt
+        "use_polished_text": False,  # true 时优先将去口癖的 polished_text 喂给纪要模型
         "max_chunk_chars": 4000,  # map_reduce 每段字符预算
         "direct_threshold_chars": 9000,  # 转写低于该长度直接一次调用
         "chars_per_token": 1.5,  # 估算用：每 token 约多少字符
@@ -121,4 +142,8 @@ def load_config(path: str | Path | None = None) -> dict:
             value = glossary.get(key)
             if isinstance(value, str) and value.strip():
                 glossary[key] = str(config_dir / Path(value).expanduser())
+    for section in ("diarization", "punctuation"):
+        sec = cfg.get(section)
+        if isinstance(sec, dict) and isinstance(mp := sec.get("model_path"), str) and mp.strip():
+            sec["model_path"] = str(config_dir / Path(mp).expanduser())
     return cfg
