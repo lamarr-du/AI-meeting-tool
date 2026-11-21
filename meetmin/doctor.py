@@ -9,9 +9,10 @@ from pathlib import Path
 
 from .asr.cuda import gpu_status as gpu_status
 from .asr.profile import memory_status, select_profile
+from .model_cache import hub_cache_dir
 
 
-def _model_cached(model):
+def _model_cached(model, cache_dir):
     path = Path(str(model)).expanduser()
     if path.is_dir():
         return (path / "model.bin").is_file()
@@ -20,11 +21,7 @@ def _model_cached(model):
         "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
     }.get(str(model), str(model))
     repo = repo if "/" in repo else "Systran/faster-whisper-" + repo
-    root = Path(
-        os.environ.get("HF_HUB_CACHE")
-        or Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface") / "hub"
-    )
-    snapshots = root / ("models--" + repo.replace("/", "--")) / "snapshots"
+    snapshots = cache_dir / ("models--" + repo.replace("/", "--")) / "snapshots"
     return any(p.is_file() for p in snapshots.glob("*/model.bin"))
 
 
@@ -60,6 +57,7 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
             print(f"  错误：无法选择内录设备：{e}")
             ok = False
     asr = cfg.get("asr", {}) or {}
+    configured_cache = cfg.get("model_cache_dir")
     asr_provider = asr.get("provider", "faster_whisper") if check_asr else None
     if asr_provider == "faster_whisper":
         for mod in ("faster_whisper", "av"):
@@ -77,15 +75,17 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
             ok = False
         else:
             model = profile.model
+            cache = hub_cache_dir(configured_cache)
             print(
                 f"  转写档位：{profile.selected} · {model} / {profile.device} / {profile.compute_type}（{profile.reason}）"
             )
             print(
-                f"  Whisper {model}：{'缓存中发现模型文件' if _model_cached(model) else '未检测到缓存，请提前下载或配置本地模型目录'}"
+                f"  Whisper {model}：{'缓存中发现模型文件' if _model_cached(model, cache) else '未检测到缓存，请提前下载或配置本地模型目录'}"
             )
+            print(f"  Whisper 下载目录：{cache}")
             if profile.device == "cuda" and profile.cpu_fallback_model != model:
                 fallback = profile.cpu_fallback_model
-                if not _model_cached(fallback):
+                if not _model_cached(fallback, cache):
                     print(f"  CPU 回退模型 {fallback} 未检测到缓存，请提前准备。")
         if gpu is not None and gpu.memory is not None:
             name, free, total = gpu.memory
@@ -108,9 +108,10 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
         ]
         if missing:
             print("  可选说话人分离依赖缺失：" + ", ".join(missing) + "；将降级为单说话人")
-        cache = Path.home() / ".cache" / "meetmin" / "speechbrain"
+        cache = hub_cache_dir(configured_cache) / "models--speechbrain--spkrec-ecapa-voxceleb"
+        cached = any(cache.glob("snapshots/*/embedding_model.ckpt"))
         print(
-            f"  声纹模型：{'缓存目录存在，请确认文件完整' if cache.is_dir() and any(cache.iterdir()) else '未检测到缓存，请提前下载'} ({cache})"
+            f"  声纹模型：{'缓存目录存在，请确认文件完整' if cached else '未检测到缓存，请提前下载'} ({cache})"
         )
     llm = cfg.get("llm", {}) or {}
     if llm.get("provider", "openai_compatible") not in ("mock", "none", "offline", ""):

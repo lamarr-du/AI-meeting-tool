@@ -15,5 +15,5 @@ def get_diarizer(cfg: dict) -> Diarizer:
     if provider in ("ecapa_speechbrain", "ecapa", "speechbrain"):
         from .ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
-        return EcapaSpeechbrainDiarizer(d)
+        return EcapaSpeechbrainDiarizer(d, model_cache_dir=cfg.get("model_cache_dir"))
     raise ValueError(f"未知 diarization provider: {provider}（可选 ecapa_speechbrain | single）")

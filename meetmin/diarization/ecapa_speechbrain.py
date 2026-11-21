@@ -16,15 +16,26 @@ from typing import Any
 
 import numpy as np
 
+from ..model_cache import configure_xet_cache, hub_cache_dir
 from .base import Diarizer
 
 SR = 16000
+ECAPA_REPO = "speechbrain/spkrec-ecapa-voxceleb"
+ECAPA_FILES = [
+    "hyperparams.yaml",
+    "embedding_model.ckpt",
+    "mean_var_norm_emb.ckpt",
+    "classifier.ckpt",
+    "label_encoder.txt",
+]
 
 
 class EcapaSpeechbrainDiarizer(Diarizer):
     name = "ecapa_speechbrain"
 
-    def __init__(self, dcfg: dict):
+    def __init__(self, dcfg: dict, *, model_cache_dir: str | Path | None = None):
+        configure_xet_cache(model_cache_dir)
+        self._hub_cache = hub_cache_dir(model_cache_dir)
         try:
             import torch  # noqa: F401  (speechbrain 依赖)
             from speechbrain.inference.speaker import EncoderClassifier
@@ -36,14 +47,26 @@ class EcapaSpeechbrainDiarizer(Diarizer):
         self.dcfg = dcfg
         self._torch = torch
         self._classifier = EncoderClassifier
-        self._strategy = LocalStrategy.COPY
+        self._strategy = LocalStrategy.NO_LINK
         self.encoder: Any = None
 
     def _load_encoder(self):
         if self.encoder is None:
+            from huggingface_hub import snapshot_download, try_to_load_from_cache
+
+            cached = try_to_load_from_cache(
+                ECAPA_REPO, "hyperparams.yaml", cache_dir=self._hub_cache
+            )
+            source = Path(cached).parent if isinstance(cached, str) else None
+            if source is None or not all((source / name).is_file() for name in ECAPA_FILES):
+                source = Path(
+                    snapshot_download(
+                        ECAPA_REPO, cache_dir=self._hub_cache, allow_patterns=ECAPA_FILES
+                    )
+                )
             self.encoder = self._classifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                savedir=str(Path.home() / ".cache" / "meetmin" / "speechbrain"),
+                source=str(source),
+                overrides={"pretrained_path": str(source)},
                 local_strategy=self._strategy,
                 run_opts={"device": "cpu"},
             )
@@ -78,7 +101,7 @@ class EcapaSpeechbrainDiarizer(Diarizer):
             wavs.append(w)
         metadata = {
             "schema_version": 1,
-            "model": "speechbrain/spkrec-ecapa-voxceleb",
+            "model": ECAPA_REPO,
             "sample_rate": SR,
             "window_samples": win,
             "hop_samples": hop,

@@ -18,6 +18,7 @@ import numpy as np
 
 from ..audio.dsp import TARGET_SR
 from ..glossary import glossary_hotwords, load_terms, select_terms
+from ..model_cache import configure_xet_cache, hub_cache_dir
 from .base import ASRProvider, ASRResult, Utterance
 from .cuda import prepare_cuda_runtime
 from .model_download import ModelDownloadProgress, download_model
@@ -91,9 +92,12 @@ class FasterWhisperASR(ASRProvider):
         self,
         acfg: dict,
         *,
+        model_cache_dir: str | Path | None = None,
         on_model_download: Callable[[ModelDownloadProgress], None] | None = None,
     ):
         _configure_huggingface_download(acfg)
+        configure_xet_cache(model_cache_dir)
+        self._hub_cache = hub_cache_dir(model_cache_dir)
         from ..doctor import gpu_status
 
         device = acfg.get("device", "auto")
@@ -126,7 +130,10 @@ class FasterWhisperASR(ASRProvider):
                 source = self._model_source()
                 try:
                     self.model = self._model_class(
-                        source, device=self._device, compute_type=self._compute
+                        source,
+                        device=self._device,
+                        compute_type=self._compute,
+                        download_root=str(self._hub_cache),
                     )
                     return
                 except (OSError, RuntimeError) as error:
@@ -144,9 +151,11 @@ class FasterWhisperASR(ASRProvider):
 
     def _model_source(self) -> str:
         source = self._size
+        path = Path(source).expanduser()
+        if path.is_dir():
+            return str(path.resolve())
         if self._on_model_download is not None:
-            path = Path(source).expanduser()
-            source = str(path) if path.is_dir() else download_model(source, self._on_model_download)
+            return download_model(source, self._on_model_download, cache_dir=self._hub_cache)
         return source
 
     def _cuda_failure(self, error: Exception) -> tuple[str, bool] | None:

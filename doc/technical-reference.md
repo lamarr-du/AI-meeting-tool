@@ -34,8 +34,8 @@ Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装
 |---|---|
 | 录音设备 | 解析配置的设备；默认先寻找系统默认输出对应的 loopback，找不到时回退到首个 loopback；失败则退出 |
 | 本地 ASR 依赖 | 检查能否找到 `faster_whisper`、`av` 模块；缺失则退出，不验证其完整运行能力 |
-| Whisper 缓存 | 检查本地目录或推测的 Hugging Face 缓存中的 `model.bin`；未找到仅提示，不能保证模型完整 |
-| 声纹模型及可选依赖 | 检查缓存目录是否非空及能否找到 `torch`、`speechbrain`、`sklearn`；给出提示，不试加载模型 |
+| Whisper 缓存 | 显示下载目录，并检查显式指定的本地模型目录或缓存快照中的 `model.bin` |
+| 声纹模型及可选依赖 | 检查 ECAPA 缓存快照中的 `embedding_model.ckpt` 以及 `torch`、`speechbrain`、`sklearn` 是否可用 |
 | API Key | 检查指定环境变量是否存在；LLM Key 缺失只提示，DashScope ASR Key 或音频 URL 缺失则退出 |
 | GPU | 通过 CTranslate2 检查 CUDA 设备和计算类型，尝试加载 CUDA/cuDNN 库，并在可对应到当前设备时用 `nvidia-smi` 查询空闲显存 |
 | 磁盘 | 报告输出目录所在磁盘的剩余空间，不做容量预算或写入测试 |
@@ -58,9 +58,13 @@ Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装
 
 Windows 的当前 CUDA 路径需要可加载的 CUDA 12 cuBLAS 和 cuDNN 9 库，预检会列出缺失项。[faster-whisper 安装说明](https://github.com/SYSTRAN/faster-whisper#gpu)
 
-Whisper 默认使用 Hugging Face 缓存（通常在 `~/.cache/huggingface/hub`，也受 `HF_HOME` / `HF_HUB_CACHE` 影响）。可把 `asr.model_size` 指向已下载的 CTranslate2 模型目录。`asr.hf_endpoint` 用于配置下载端点，默认设置 `HF_HUB_DISABLE_XET=1`；已有相关环境变量优先，不会被配置强行覆盖。
+Whisper 和 SpeechBrain ECAPA 的自动下载共用 Hugging Face Hub 缓存。源码版和工程内构建的便携版默认使用工程目录下的 `.cache/huggingface/hub`，独立便携版使用程序目录下的同名路径。从已安装的 Python 包在工程外运行时，默认以当前工作目录为基准。
 
-ECAPA 模型按需加载到用户目录 `~/.cache/meetmin/speechbrain`，使用 `LocalStrategy.COPY`，避免在该目录使用 SpeechBrain 默认的软链接策略。缓存命中并仅重跑聚类时不会加载 ECAPA 编码器；仍需安装可选依赖。
+可设置 `model_cache_dir` 自定义缓存根目录，Hub 权重存放在其 `huggingface/hub` 子目录。相对路径以配置文件所在目录为基准。未配置时，依次采用已设置的 `HF_HUB_CACHE`、`HUGGINGFACE_HUB_CACHE` 或 `HF_HOME/hub`。将 `asr.model_size` 指向已有 CTranslate2 模型目录时，Whisper 直接加载该目录。迁移已有 Hub 缓存时，请保留模型仓库目录内部的结构，包括 `refs`、`snapshots` 和已有的 `blobs`。
+
+`asr.hf_endpoint` 用于配置 Whisper 下载端点，默认设置 `HF_HUB_DISABLE_XET=1`。启用 Xet 时，其缓存默认位于模型缓存根目录下的 `huggingface/xet`，可用 `HF_XET_CACHE` 指定。
+
+ECAPA 仍需安装可选依赖。它从 Hub 缓存快照直接加载配置和权重。已有会话的声纹嵌入缓存命中时，可以复用嵌入重跑聚类。
 
 ## 会话产物与失败恢复
 
@@ -118,6 +122,7 @@ asr:
 
 | 配置 | 当前默认值与作用 |
 |---|---|
+| `model_cache_dir` | `null`，按应用或工程位置确定缓存根目录，见模型缓存说明 |
 | `recorder.device` | `null`，自动选择；配置中可填索引或名称片段，CLI `--device` 只接受整数索引 |
 | `recorder.microphone` / `recorder.microphone_device` | `false` / `null`，是否开启双轨及麦克风索引，`null` 使用默认 WASAPI 输入 |
 | `recorder.silence_threshold` | `0.003`，连续低电平告警阈值，允许 0–1 |

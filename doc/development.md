@@ -41,6 +41,8 @@ python scripts/build_desktop.py
 
 双击 `dist/desktop/MeetMin/MeetMin.exe` 启动，复制到另一台电脑时请携带整个 `MeetMin` 文件夹。便携版包含 Python 和 Qt 运行时，Whisper 权重在首次使用时下载或读取已有缓存。便携版采用单说话人分组，双轨录音中的麦克风发言仍标记为「我」。
 
+从工程内启动便携版时，它和源码版共用工程的 `.cache/huggingface/hub`。独立运行时默认使用 `MeetMin.exe` 所在目录下的同名缓存路径。[模型缓存及路径配置](technical-reference.md#cpu--gpu-与模型缓存)
+
 ## 检查与 CI
 
 ### 用人工标注评估转写

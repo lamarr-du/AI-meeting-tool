@@ -1022,9 +1022,6 @@ def run(config: Path | None) -> int:
             )
             cfg = load_config(config)
             output = config.parent / Path(cfg["output_dir"]).expanduser()
-            model = cfg["asr"].get("model_size")
-            if isinstance(model, str) and (config.parent / Path(model).expanduser()).is_dir():
-                cfg["asr"]["model_size"] = str(config.parent / Path(model).expanduser())
         else:
             data = QStandardPaths.writableLocation(
                 QStandardPaths.StandardLocation.AppLocalDataLocation
