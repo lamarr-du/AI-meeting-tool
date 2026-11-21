@@ -14,6 +14,7 @@ import math
 import os
 import secrets
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -252,7 +253,13 @@ def _merge_non_overlapping(
 class EcapaSpeechbrainDiarizer(Diarizer):
     name = "ecapa_speechbrain"
 
-    def __init__(self, dcfg: dict, *, model_cache_dir: str | Path | None = None):
+    def __init__(
+        self,
+        dcfg: dict,
+        *,
+        model_cache_dir: str | Path | None = None,
+        on_model_download: Callable[[bool], None] | None = None,
+    ):
         configure_xet_cache(model_cache_dir)
         self._hub_cache = hub_cache_dir(model_cache_dir)
         try:
@@ -264,6 +271,7 @@ class EcapaSpeechbrainDiarizer(Diarizer):
                 "需要 speechbrain + scikit-learn（会引入 torch）：pip install -r requirements-optional.txt"
             ) from e
         self.dcfg = dcfg
+        self._on_model_download = on_model_download
         self._torch = torch
         self._classifier = EncoderClassifier
         self._strategy = LocalStrategy.NO_LINK
@@ -278,11 +286,15 @@ class EcapaSpeechbrainDiarizer(Diarizer):
             )
             source = Path(cached).parent if isinstance(cached, str) else None
             if source is None or not all((source / name).is_file() for name in ECAPA_FILES):
+                if self._on_model_download is not None:
+                    self._on_model_download(True)
                 source = Path(
                     snapshot_download(
                         ECAPA_REPO, cache_dir=self._hub_cache, allow_patterns=ECAPA_FILES
                     )
                 )
+                if self._on_model_download is not None:
+                    self._on_model_download(False)
             self.encoder = self._classifier.from_hparams(
                 source=str(source),
                 overrides={"pretrained_path": str(source)},

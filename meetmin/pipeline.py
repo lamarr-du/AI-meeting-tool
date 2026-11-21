@@ -233,7 +233,9 @@ class Pipeline:
         self.progress(f"  ✓ 原始转写已保存：{session.root / 'asr_raw.json'}")
         return raw
 
-    def diarize(self, session: Session) -> dict:
+    def diarize(
+        self, session: Session, *, on_model_download: Callable[[bool], None] | None = None
+    ) -> dict:
         """从原始转写重建精简转写；绝不调用 ASR。"""
         import json
 
@@ -255,7 +257,9 @@ class Pipeline:
                 if not source.is_file():
                     raise FileNotFoundError(f"分离需要原始本地音频：{source}")
                 audio16k = to_mono_16k(source)
-            speakers = self._diarize(result, utterances, audio16k, session=session)
+            speakers = self._diarize(
+                result, utterances, audio16k, session=session, on_model_download=on_model_download
+            )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.progress(f"  ! 说话人分离失败（{error}），已降级为单说话人；可稍后重跑 diarize。")
@@ -321,7 +325,13 @@ class Pipeline:
                 self._save_corrected_transcript(session, corrected)
 
     def _diarize(
-        self, result: ASRResult, utterances: list[Utterance], audio16k, *, session: Session
+        self,
+        result: ASRResult,
+        utterances: list[Utterance],
+        audio16k,
+        *,
+        session: Session,
+        on_model_download: Callable[[bool], None] | None = None,
     ) -> list[str]:
         """云端自带 speaker 时仅做名单映射；本地 ASR 按配置跑分离。"""
         dcfg = self.cfg.get("diarization", {}) or {}
@@ -346,7 +356,11 @@ class Pipeline:
         self.progress("[2b] 说话人分离中…")
         from .diarization import get_diarizer
 
-        diarizer = get_diarizer(self.cfg)
+        diarizer = (
+            get_diarizer(self.cfg, on_model_download=on_model_download)
+            if on_model_download is not None
+            else get_diarizer(self.cfg)
+        )
         options: dict[str, Any] = {"speech_spans": [(u.start, u.end) for u in utterances]}
         if diarizer.name == "ecapa_speechbrain":
             options["cache_path"] = session.root / "embeddings.npz"

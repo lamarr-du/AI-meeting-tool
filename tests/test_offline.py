@@ -93,7 +93,7 @@ def test_speechbrain_model_downloads_directly_to_configured_cache(monkeypatch):
 
     import huggingface_hub
 
-    from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
+    from meetmin.diarization.ecapa_speechbrain import ECAPA_FILES, EcapaSpeechbrainDiarizer
 
     calls = []
     no_link = object()
@@ -122,13 +122,31 @@ def test_speechbrain_model_downloads_directly_to_configured_cache(monkeypatch):
             return str(snapshot)
 
         monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_download)
-        EcapaSpeechbrainDiarizer({}, model_cache_dir=td)._load_encoder()
+        events = []
+        EcapaSpeechbrainDiarizer(
+            {}, model_cache_dir=td, on_model_download=events.append
+        )._load_encoder()
+        assert events == [True, False]
         assert requests[0][0] == "speechbrain/spkrec-ecapa-voxceleb"
         assert requests[0][1] == Path(td).resolve() / "huggingface" / "hub"
         assert "embedding_model.ckpt" in requests[0][2]
         assert calls[0]["local_strategy"] is no_link
         assert calls[0]["source"] == str(snapshot)
         assert calls[0]["overrides"] == {"pretrained_path": str(snapshot)}
+        snapshot.mkdir()
+        for name in ECAPA_FILES:
+            (snapshot / name).touch()
+        monkeypatch.setattr(
+            huggingface_hub,
+            "try_to_load_from_cache",
+            lambda *_, **kwargs: str(snapshot / ECAPA_FILES[0]),
+        )
+        events.clear()
+        EcapaSpeechbrainDiarizer(
+            {}, model_cache_dir=td, on_model_download=events.append
+        )._load_encoder()
+        assert events == []
+        assert len(requests) == 1
 
 
 def test_whisper_gpu_oom_retries_cpu():
