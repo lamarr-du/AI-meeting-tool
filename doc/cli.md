@@ -13,7 +13,7 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -c requirements-win-py312.lock .
 
-# 可选：本地说话人分离；使用约束文件保持核心依赖版本
+# 可选：旧版 SpeechBrain ECAPA 说话人分离（默认 CAM++ ONNX 已开箱可用，无需此依赖）
 python -m pip install -c requirements-win-py312.lock ".[diar]"
 ```
 
@@ -23,7 +23,7 @@ macOS / Linux，使用兼容版本范围：
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install .
-# 可选：本地说话人分离
+# 可选：旧版 SpeechBrain ECAPA 说话人分离（默认 CAM++ ONNX 已开箱可用）
 python -m pip install ".[diar]"
 ```
 

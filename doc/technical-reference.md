@@ -37,7 +37,7 @@ Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装
 | 录音设备 | 解析配置的设备；默认先寻找系统默认输出对应的 loopback，找不到时回退到首个 loopback；失败则退出 |
 | 本地 ASR 依赖 | 检查能否找到 `faster_whisper`、`av` 模块；缺失则退出，不验证其完整运行能力 |
 | Whisper 缓存 | 显示下载目录，并检查显式指定的本地模型目录或缓存快照中的 `model.bin` |
-| 声纹模型及可选依赖 | 检查 ECAPA 缓存快照中的 `embedding_model.ckpt` 以及 `torch`、`speechbrain`、`sklearn` 是否可用 |
+| 声纹模型及依赖 | 默认 `campplus_onnx` 检查 `onnxruntime` 及缓存快照中的 CAM++ ONNX 模型（约 27 MB，或显式 `model_path`）；若切到 `ecapa_speechbrain` 则检查 `torch`、`speechbrain` 及 ECAPA 缓存快照中的 `embedding_model.ckpt` |
 | API Key | 检查指定环境变量是否存在；LLM Key 缺失只提示，DashScope ASR Key 或音频 URL 缺失则退出 |
 | GPU | 通过 CTranslate2 检查 CUDA 设备和计算类型，尝试加载 CUDA/cuDNN 库，并在可对应到当前设备时用 `nvidia-smi` 查询空闲显存 |
 | 磁盘 | 报告输出目录所在磁盘的剩余空间，不做容量预算或写入测试 |
@@ -56,17 +56,17 @@ Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装
 
 可用 `profile: cpu_light` 固定省内存的 CPU 档，或用 `profile: cpu_standard` 固定精度优先的 CPU 档。显式 `device: cuda` 直接尝试指定档位。自动档可用 `cuda_peak_mib` 预判显存，填入目标模型从加载到完成转写相对启动前的显存峰值增量。未配置峰值或无法读取空闲显存时直接尝试首选档位。
 
-自动搭配模型时，如果 Turbo 的实测峰值超出当前显存预算，或加载、转写时遇到显存不足，则尝试 Small CUDA。Small 也遇到显存不足，或 CUDA 运行库、设备无法使用时，自动档切换到 CPU int8。显式指定模型时 CPU 回退沿用该模型。桌面处理日志和 `asr_raw.json` 按音轨记录实际模型、设备、精度和降级原因。单轨或双轨转写结束后释放 Whisper，ECAPA 分离在 CPU 上执行。
+自动搭配模型时，如果 Turbo 的实测峰值超出当前显存预算，或加载、转写时遇到显存不足，则尝试 Small CUDA。Small 也遇到显存不足，或 CUDA 运行库、设备无法使用时，自动档切换到 CPU int8。显式指定模型时 CPU 回退沿用该模型。桌面处理日志和 `asr_raw.json` 按音轨记录实际模型、设备、精度和降级原因。单轨或双轨转写结束后释放 Whisper，本地声纹分离（默认 `campplus_onnx`）在 CPU 上执行。
 
 Windows 的当前 CUDA 路径需要可加载的 CUDA 12 cuBLAS 和 cuDNN 9 库，预检会列出缺失项。[faster-whisper 安装说明](https://github.com/SYSTRAN/faster-whisper#gpu)
 
-Whisper 和 SpeechBrain ECAPA 的自动下载共用 Hugging Face Hub 缓存。源码版和工程内构建的便携版默认使用工程目录下的 `.cache/huggingface/hub`，独立便携版使用程序目录下的同名路径。从已安装的 Python 包在工程外运行时，默认以当前工作目录为基准。
+Whisper 与本地声纹模型（默认 3D-Speaker CAM++ ONNX、可选 SpeechBrain ECAPA）的自动下载共用 Hugging Face Hub 缓存。源码版和工程内构建的便携版默认使用工程目录下的 `.cache/huggingface/hub`，独立便携版使用程序目录下的同名路径。从已安装的 Python 包在工程外运行时，默认以当前工作目录为基准。
 
-可设置 `model_cache_dir` 自定义缓存根目录，Hub 权重存放在其 `huggingface/hub` 子目录。相对路径以配置文件所在目录为基准。未配置时，依次采用已设置的 `HF_HUB_CACHE`、`HUGGINGFACE_HUB_CACHE` 或 `HF_HOME/hub`。将 `asr.model_size` 指向已有 CTranslate2 模型目录时，Whisper 直接加载该目录。迁移已有 Hub 缓存时，请保留模型仓库目录内部的结构，包括 `refs`、`snapshots` 和已有的 `blobs`。
+可设置 `model_cache_dir` 自定义缓存根目录，Hub 权重存放在其 `huggingface/hub` 子目录。相对路径以配置文件所在目录为基准。未配置时，依次采用已设置的 `HF_HUB_CACHE`、`HUGGINGFACE_HUB_CACHE` 或 `HF_HOME/hub`。将 `asr.model_size` 指向已有 CTranslate2 模型目录时，Whisper 直接加载该目录；设置 `diarization.model_path` 可直接指定本地 CAM++ ONNX 文件。迁移已有 Hub 缓存时，请保留模型仓库目录内部的结构，包括 `refs`、`snapshots` 和已有的 `blobs`。
 
-`asr.hf_endpoint` 用于配置 Whisper 下载端点，默认设置 `HF_HUB_DISABLE_XET=1`。启用 Xet 时，其缓存默认位于模型缓存根目录下的 `huggingface/xet`，可用 `HF_XET_CACHE` 指定。
+`asr.hf_endpoint` 用于配置 Whisper 与声纹模型的下载端点，默认设置 `HF_HUB_DISABLE_XET=1`。启用 Xet 时，其缓存默认位于模型缓存根目录下的 `huggingface/xet`，可用 `HF_XET_CACHE` 指定。
 
-ECAPA 仍需安装可选依赖。它从 Hub 缓存快照直接加载配置和权重。已有会话的声纹嵌入缓存命中时，可以复用嵌入重跑聚类。
+默认声纹模型 `campplus_onnx` 直接复用 `onnxruntime` 与 `numpy`，无需额外安装 `torch`、`speechbrain` 或 `scikit-learn`；仅切换为 `provider: ecapa_speechbrain` 时需安装 `[diar]` 可选依赖。已有会话的声纹嵌入缓存命中时，可以复用嵌入重跑聚类；切换声纹模型会自动刷新缓存。
 
 ## 会话产物与失败恢复
 
@@ -77,7 +77,7 @@ ECAPA 仍需安装可选依赖。它从 Hub 缓存快照直接加载配置和权
 | `audio.wav` | 单轨模式的 Windows 内录音频，格式为 16 kHz 单声道 16-bit PCM；外部音频模式沿用原文件 |
 | `recording.json` | 双轨模式的当前录音批次，指向同批次的 `audio.wav` 与 `microphone.wav`（均为 16 kHz 单声道 16-bit PCM）；切回单轨后使用会话根目录的 `audio.wav` |
 | `asr_raw.json` | 转写完成后、分离前原子写入；包含原始句子、可用的词级时间戳、模型信息和转写参数。双轨的麦克风转写保存在 `microphone.utterances` |
-| `embeddings.npz` | 本地 ECAPA 窗口嵌入，提取完成后、聚类前原子写入；单说话人和云端自带分离不生成新嵌入，短音频也可能不生成 |
+| `embeddings.npz` | 本地声纹模型（`campplus_onnx` / `ecapa_speechbrain`）的 192 维窗口嵌入，提取完成后、聚类前原子写入；单说话人和云端自带分离不生成新嵌入，短音频也可能不生成 |
 | `transcript.json` | 分离/对齐后的句级时间戳、文本和说话人，不含词级数据 |
 | `transcript.md` | 供人工查看的转写文本 |
 | `transcript_corrected.json` / `transcript_corrected.md` | 启用术语纠错后生成的独立副本，JSON 包含替换记录和待核对项 |
@@ -93,9 +93,9 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 
 修改 `config.yaml` 中的 `cluster_threshold`、`num_speakers`、`cluster_method`、`min_active_ratio`、`min_cluster_size`、`min_cluster_sec` 或 `min_group_sec` 后，同样只需重跑分离和纪要。原始转写不会被分离过程修改；失败的重跑不会自动清除上次已有的输出，须确认命令成功后再使用结果。
 
-`embeddings.npz` 包含归一化的 `embeddings`、窗口起止采样点 `starts` / `ends` 和 JSON 字符串 `metadata`（采样率、模型、切窗模式、窗口参数、语音区间与音频指纹）。可用 `numpy.load(path, allow_pickle=False)` 读取，作为后续声纹注册的数据基础；当前尚无声纹注册命令。音频、语音区间、切窗模式、窗口参数及最低能量阈值一致时复用嵌入；改变这些输入或删除文件会重新提取。仅改活跃度筛选、聚类或对齐参数不会重新提取。
+`embeddings.npz` 包含归一化的 `embeddings`、窗口起止采样点 `starts` / `ends` 和 JSON 字符串 `metadata`（采样率、模型、切窗模式、窗口参数、语音区间与音频指纹）。可用 `numpy.load(path, allow_pickle=False)` 读取，作为后续声纹注册的数据基础；当前尚无声纹注册命令。音频、声纹模型、语音区间、切窗模式、窗口参数及最低能量阈值一致时复用嵌入；改变这些输入或删除文件会重新提取。仅改活跃度筛选、聚类或对齐参数不会重新提取。
 
-本地 ECAPA 重跑仍需要原始音频，外部音频请保留在记录的绝对路径。Whisper 保留 `asr.word_timestamps: true` 才会请求词级数据；当前 DashScope 实现只解析句级数据。旧会话没有 `asr_raw.json` 时，需重新转写一次才能独立分离；已有 `transcript.json` 仍可用于生成纪要。
+本地声纹重跑仍需要原始音频，外部音频请保留在记录的绝对路径。Whisper 保留 `asr.word_timestamps: true` 才会请求词级数据；当前 DashScope 实现只解析句级数据。旧会话没有 `asr_raw.json` 时，需重新转写一次才能独立分离；已有 `transcript.json` 仍可用于生成纪要。
 
 对于本地 Whisper 的中文转写，`diarize` 会统一中文上下文中的半角逗号，并在至少 0.8 秒的段间停顿或音轨结束处为以文字或数字收尾的片段补句号。双轨会话按各自的时间轴处理。可对已有的 `asr_raw.json` 直接重跑 `diarize` 应用标点整理，原始转写保留模型文本和词级时间戳。
 
@@ -140,13 +140,14 @@ asr:
 | `asr.punctuation_prompt` / `asr.hotwords` | 均为 `null`，可填带标点的中文示例和术语文本 |
 | `asr.glossary` | `path` 启用识别前提示，可用 `terms` 指定优先词条。`correction_path` 启用识别后纠错。两个路径默认均为 `null` |
 | `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
-| `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
+| `diarization.enabled` / `provider` | `true` / `campplus_onnx`（纯 ONNX 零 Torch，开箱可用）；也可选 `ecapa_speechbrain`（需 `[diar]`）或 `single`（单说话人）；本地转写时设 `enabled: false` 标记为“全体”；云端已有说话人时优先保留并映射名称 |
+| `diarization.model_path` | `null`；可选，为 `campplus_onnx` 指定本地 ONNX 模型文件路径，为空时自动下载并缓存到 Hub 缓存目录 |
 | `diarization.window_mode` | `speech_spans`（默认，合并短停顿的 ASR 语音段并均分超长段，无 `speech_spans` 时自动退化为 `sliding`）；也可显式设为 `sliding` |
 | `diarization.window_sec` / `hop_sec` | `2.5` / `1.25`；`speech_spans` 模式下 `window_sec` 为长段切分上限，`sliding` 模式下为窗长与步长 |
 | `diarization.min_window_rms` / `min_active_ratio` | `0.003` / `0.45`；过滤近静音窗口，并将 20ms 帧活跃占比不足的窗口排除出主聚类（仅参与质心重分配） |
 | `diarization.min_cluster_size` / `min_cluster_sec` | `2` / `4.0`；自动人数模式下主簇最少核心段数与累计时长（秒），不达标小簇将重分配到最近主簇 |
 | `diarization.num_speakers` | `null`；非空时按指定人数聚类（默认 kNN 离群预筛 + Ward），不使用距离阈值选人数 |
-| `diarization.cluster_method` / `cluster_threshold` | `auto` / `0.64`；`auto` 在自动人数时用 `average`、指定人数时用 `ward`，也可选 `average` / `ward` / `spectral`；阈值调大倾向合并、调小倾向拆分 |
+| `diarization.cluster_method` / `cluster_threshold` | `auto` / `null`；`auto` 在自动人数时用 `average`、指定人数时用 `ward`，也可选 `average` / `ward` / `spectral`；阈值留空随模型自动取值（`campplus_onnx: 0.54`、`ecapa_speechbrain: 0.64`），调大倾向合并、调小倾向拆分 |
 | `diarization.min_group_sec` | `0.4`，对齐阶段平滑过短换人片段 |
 | `llm.base_url` / `model` | DashScope 兼容端点 / `qwen-3.8-flash`，应按实际服务修改 |
 | `llm.api_key_env` | `DASHSCOPE_API_KEY`，从环境变量读取密钥 |
@@ -171,7 +172,7 @@ DashScope ASR 需设置 `asr.provider: dashscope`、有效的 `dashscope_asr.api
 meetmin run --audio "recordings/meeting.wav" --file-url "https://example.com/meeting.wav" -n cloud
 ```
 
-该模式实际转写的是 URL 指向的音频，须保证与本地文件相对应。云端结果已含说话人时，`diarize` 仅映射说话人名称，不提取本地 ECAPA 嵌入。
+该模式实际转写的是 URL 指向的音频，须保证与本地文件相对应。云端结果已含说话人时，`diarize` 仅映射说话人名称，不提取本地声纹嵌入。
 
 ## 已知限制
 

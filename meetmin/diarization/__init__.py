@@ -9,15 +9,23 @@ from .base import Diarizer  # noqa: F401
 
 def get_diarizer(cfg: dict, *, on_model_download: Callable[[bool], None] | None = None) -> Diarizer:
     d = cfg.get("diarization", {}) or {}
-    provider = str(d.get("provider", "ecapa_speechbrain")).lower()
+    provider = str(d.get("provider", "campplus_onnx")).lower()
     if not d.get("enabled", True) or provider == "single":
         from .single_speaker import SingleSpeakerDiarizer
 
         return SingleSpeakerDiarizer()
+    if provider in ("campplus_onnx", "campplus", "onnx", "3dspeaker"):
+        from .campplus_onnx import CampplusOnnxDiarizer
+
+        return CampplusOnnxDiarizer(
+            d, model_cache_dir=cfg.get("model_cache_dir"), on_model_download=on_model_download
+        )
     if provider in ("ecapa_speechbrain", "ecapa", "speechbrain"):
         from .ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
         return EcapaSpeechbrainDiarizer(
             d, model_cache_dir=cfg.get("model_cache_dir"), on_model_download=on_model_download
         )
-    raise ValueError(f"未知 diarization provider: {provider}（可选 ecapa_speechbrain | single）")
+    raise ValueError(
+        f"未知 diarization provider: {provider}（可选 campplus_onnx | ecapa_speechbrain | single）"
+    )

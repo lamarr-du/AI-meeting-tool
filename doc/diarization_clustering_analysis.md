@@ -85,10 +85,10 @@
 - [x] 已在基准集上完成 `raw`（0–8000 Hz）、`300–3400 Hz` 电话带通、`100–3800 Hz` 保留基频带通与 `3600 Hz` 低通四组受控消融对照（详见第 6 节）。
 - **结论**：在第一阶段修复切窗与聚类后，三组滤波对单次会议说话人聚类均呈**负收益**（4 人 AER 从 `1.32%` 退化至 `1.61%`、全体与窄带内部轮廓系数均下降、24 场景满分阈值平台缩窄 40%–60%），故**不在当前分离管线中启用带通/低通滤波**；实验同时量化了同人宽带/窄带跨通道质心偏移（`0.266`），为后续 E8 跨会议声纹库按通道分存提供数据依据。
 
-### 第三阶段：中长期模型与管线升级（兼顾纯 CPU 与安装包体积）— ⏳ 未开始
+### 第三阶段：中长期模型与管线升级（兼顾纯 CPU 与安装包体积）— ✅ 已完成（2026-11-21）
 
-- 将纯英文 VoxCeleb 预训练的 `spkrec-ecapa-voxceleb` 替换为面向中英双语优化的 **3D-Speaker CAM++** 声纹模型；
-- 若希望同时去掉 `torch + speechbrain` 的大体积依赖并保持纯 CPU 高效运行，可评估基于 `sherpa-onnx` 的本地 ONNX 组合方案（`pyannote-segmentation-3.0` 分割 + [3D-Speaker CAM++ ONNX](https://huggingface.co/Luigi/campplus-zh-en-onnx) 声纹嵌入）。
+- [x] 已完成四条候选路线的系统实测评估（详见第 7.1–7.4 节）：`ECAPA-VoxCeleb (SpeechBrain)` 基线、`sherpa-onnx + CAM++` 提取器、`sherpa-onnx` 完整管线（`pyannote-segmentation-3.0 + CAM++`）、以及 **纯 `onnxruntime` + 纯 NumPy 80 维 Kaldi FBank + 纯 NumPy 稳健聚类 + 3D-Speaker CAM++ zh-en ONNX**（零新增依赖方案）。
+- [x] 已完成 **方案 3C（`campplus_onnx`）** 工程落地并设为默认 provider（详见第 7.5 节）：抽离零依赖纯 NumPy 共享聚类模块 `meetmin/diarization/clustering.py`，新增 `meetmin/diarization/campplus_onnx.py`（默认阈值 `0.54`），保留 `ecapa_speechbrain`（默认阈值 `0.64`）向后兼容并同步更新 `doctor.py`、`config.yaml` 与全套单测/实测。
 
 ## 5. 第一阶段实施记录与实测结果（2026-11-21）
 
@@ -175,3 +175,64 @@
 1. **单次会议说话人分离保持无滤波（`raw`）**：在第一阶段修复切窗与聚类后，`raw` 在 AER（`1.32%`）、轮廓系数（`0.3697` / `0.3190`）与阈值平台宽度（`0.10`）上全面胜出，且即便发生“同一人中途从宽带麦切到窄带麦”的极端情况也不会误拆（`k=1`），因此**不向 `ecapa_speechbrain.py` 引入带通/低通滤波**。
 2. **保留跨通道数据供 E8 声纹注册参考**：同人宽带 vs 窄带存在 `+0.169` 的跨通道余弦偏移（质心距离 `0.266`），验证了 `improvement-plan.md` E8 中“本地麦克风与远端通道声纹分开存储多条中心向量”的必要性；若 E8 后续需要跨通道直配，应优先评估保留基频的 `100–3800 Hz` / `3600 Hz` 低通而非 `300–3400 Hz`。
 
+## 7. 第三阶段模型与管线升级评估报告（2026-11-21）
+
+### 7.1 候选方案与依赖/模型体积对比
+
+在 `data/sessions/example/audio.wav`（5 分钟、4 人）上同台对比四条本地 CPU 路线，模型源均采用公开免 token 仓库（[csukuangfj/speaker-embedding-models](https://huggingface.co/csukuangfj/speaker-embedding-models) Apache-2.0 与 [csukuangfj/sherpa-onnx-pyannote-segmentation-3-0](https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0) MIT）：
+
+| 方案 | 核心依赖变化（相对现有 `requirements.txt`） | 依赖包磁盘体积 | 模型权重大小 | 桌面便携版（`build_desktop.py`）兼容性 |
+|---|---|---:|---:|---|
+| **现役基线**：`ECAPA-VoxCeleb (SpeechBrain)` | 需额外装 `torch + torchaudio + speechbrain + scikit-learn` | **~775 MB**（CPU 版）/ **2.5+ GB**（CUDA） | ~80 MB | ❌ 被 `--exclude-module` 剔除，降级单人 |
+| **3A**：`sherpa-onnx` 提取器 + `CAM++` + 第一阶段聚类 | 去掉 `torch/speechbrain`，新增 `sherpa-onnx`（仍需 `sklearn`） | ~44 MB（`sherpa-onnx`）+ `sklearn` | **26.97 MB** | ⚠️ 需打包 `sherpa-onnx` + `sklearn` |
+| **3B**：`sherpa-onnx` 完整管线（`pyannote-seg-3.0 + CAM++`） | 去掉 `torch/speechbrain/sklearn`，新增 `sherpa-onnx` | ~44 MB | 26.97 + 5.72 MB（int8 1.47 MB） | ⚠️ 需打包 `sherpa-onnx` |
+| **3C（推荐）**：**纯 `onnxruntime` + 纯 NumPy Kaldi FBank + 纯 NumPy 稳健聚类 + `CAM++ zh-en`** | **零新增依赖**（直接复用 `faster-whisper` 自带的 `onnxruntime` 与 `numpy`） | **0 MB** | **26.97 MB**（单文件） | ✅ **无需改打包依赖即可原生开箱支持** |
+
+### 7.2 声纹空间几何质量对比（同一批 103 个核心语音段）
+
+| 声纹模型 | 全体 4 人轮廓系数 | 3 位窄带轮廓系数 | 最大类内距离 | 最小类间距离 | 安全鸿沟（`GAP`） | 同人宽/窄带跨通道质心偏移 |
+|---|---:|---:|---:|---:|---:|---:|
+| `ECAPA-VoxCeleb`（英文，基线） | 0.3697 | 0.3190 | 0.519 | 0.693 | 0.174 | 0.266（`+0.169`） |
+| `CAM++ zh-cn common`（`sherpa-onnx`） | 0.5045 | 0.4449 | 0.412 | 0.679 | 0.268 | 0.228（`+0.171`） |
+| `CAM++ zh-en advanced`（`sherpa-onnx`） | 0.5282 | 0.4828 | 0.367 | 0.672 | 0.305 | **0.203**（`+0.151`） |
+| **`CAM++ zh-en advanced`（3C 纯 `onnxruntime`）** | **0.5327（+44.1%）** | **0.4850（+52.0%）** | **0.356** | **0.660** | **0.304（+74.7%）** | **~0.20** |
+
+中英双语高级版 `CAM++ zh-en advanced` 全面优于英文 `ECAPA-VoxCeleb` 与纯中文版 `CAM++ zh-cn`，在三位窄带中文男声上的区分度提升尤为显著（轮廓系数 `+52%`），类间-类内安全鸿沟几乎翻倍。
+
+### 7.3 端到端性能、精度与 24 场景泛化对比
+
+| 方案 | 5 分钟 CPU 冷启动耗时 | 进程峰值内存 RSS | 4 人最优 AER4（auto / fixed k=4） | 15 常规场景平均 AER | 24/24 全满分阈值平台（宽度） |
+|---|---:|---:|---:|---:|---|
+| 现役 `ECAPA-VoxCeleb`（第一阶段） | 37.4s | 1331.4 MB | 1.32% / 1.32% | 0.77% | `0.56–0.66`（宽 `0.10`） |
+| **3A**（`sherpa-onnx` + `CAM++ zh-en`） | 7.13s（5.2×） | 222.0 MB（-83%） | 1.32% / 1.32% | **0.51%** | **`0.46–0.66`（宽 `0.20`）** |
+| **3B**（`pyannote-fp32 + CAM++`, `shift=0.1`） | 43.8–51.7s | 389.4 MB | 16.41%（auto 0.5）/ 27.84%（k=4） | — | 内置聚类易被离群段占坑 |
+| **3B**（`pyannote-fp32 + CAM++`, `shift=0.5`） | 7.3–8.4s | 389.4 MB | 4.18%（auto 0.80–0.85）/ 19.32%（k=4） | — | 平台窄且固定 k=4 仅出 3 人 |
+| **3B**（`pyannote-int8 + CAM++`, `shift=0.5`） | 9.2–9.4s | 389.4 MB | 5.28%（auto 0.85）/ 4.83%（k=4） | — | Pual 有 9.6s 误判给 Sam |
+| **3C（纯 `onnxruntime` + 纯 NumPy + `CAM++ zh-en`）** | **4.99s（7.5×）** | **172.1 MB（-87.1%）** | **1.32% / 1.32%** | **0.51%** | **`0.44–0.64`（宽 `0.20`）** |
+
+### 7.4 评估结论与推荐落地路径
+
+1. **不推荐 3B（`sherpa-onnx` 完整 `pyannote-segmentation-3.0` 管线）**：
+   - 默认 `window_shift_ratio=0.1` 在纯 CPU 上比现有 ECAPA 还慢（44–52s）；提速到 `shift=0.5` 后虽然降到 7.5s，但 4 人 AER4 仅 `4.18%`（远差于 3A/3C 的 `1.32%`），且内置 `FastClustering` 在固定 `k=4` 下仍存在离群段占坑导致崩盘（`19.32%–27.84%`）的问题，同时还额外引入 44 MB C++ 依赖。
+2. **强烈推荐 3C（纯 `onnxruntime` + 纯 NumPy Kaldi FBank + 纯 NumPy 稳健聚类 + `3D-Speaker CAM++ zh-en ONNX`）**：
+   - **效果最好**：轮廓系数 `+44%–52%`，15 常规场景平均 AER 从 `0.77%` 再降到 `0.51%`，24/24 全满分阈值平台宽达 `0.44–0.64`（中点 `0.54`，上下各留 `±0.10` 余量），4 人 auto 与 fixed `k=4` 均为 `1.32%`。
+   - **极速且极省内存**：纯 CPU 冷启动仅 **`4.99s`**（提速 **7.5×**，折算 1 小时会议仅需 ~1 分钟），峰值内存仅 **`172.1 MB`**（下降 **87.1%**），彻底适配低配办公本。
+   - **零新增依赖体积**：直接复用项目已有 `onnxruntime` + `numpy`，单文件模型权重仅 **`26.97 MB`**，自动走现有 `hub_cache_dir` / `HF_ENDPOINT` 下载缓存；Windows 桌面便携版（`scripts/build_desktop.py`）无需打包 `torch` / `speechbrain` / `sklearn` / `sherpa-onnx` 即可开箱支持高精度说话人分离。
+   - **平滑演进**：保留 `ecapa_speechbrain` 作为兼容 provider，新增 `campplus_onnx` 并设为默认 provider（默认 `cluster_threshold: 0.54`），`embeddings.npz` 保持 192 维归一化向量格式不变，无缝衔接后续 E8 声纹注册。
+
+### 7.5 工程落地与生产代码端到端实测（2026-11-21）
+
+- **代码落地摘要**：
+  - `meetmin/diarization/clustering.py`：抽离共享切窗（`speech_spans`/`sliding`）、`embeddings.npz` 读写与指纹校验、以及零 `sklearn`/`scipy`/`torch` 的纯 NumPy 稳健聚类实现（余弦平均链接层次聚类、Ward 层次聚类、带 p-pruning 的谱聚类、kNN 离群预筛、主簇筛选与质心二次重分配、非重叠中点边界合并）。
+  - `meetmin/diarization/campplus_onnx.py`：实现 `CampplusOnnxDiarizer`，内置纯 NumPy 80 维 Kaldi FBank（去直流、0.97 预加重、Povey 窗、512 点 rFFT、20–8000 Hz Mel 滤波、逐段 CMN）与 `onnxruntime` CPU 推理；默认自动下载并缓存 `csukuangfj/speaker-embedding-models` 下的 `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`（`26.97 MB`），支持 `diarization.model_path` 指定本地模型及下载状态回调通知。
+  - `meetmin/diarization/ecapa_speechbrain.py` / `__init__.py` / `config.py` / `config.yaml` / `pipeline.py` / `doctor.py`：默认 `provider` 切为 `campplus_onnx`，`cluster_threshold: null` 时随模型自动取最优默认值（`campplus_onnx: 0.54`、`ecapa_speechbrain: 0.64`）；`meetmin doctor` 按当前 provider 检查 `onnxruntime` 与 CAM++ 缓存状态；`ecapa_speechbrain` 完整保留并复用 `clustering.py`。
+- **生产命令实测结果（`data/sessions/example/audio.wav`，5 分钟、4 位真实发言人、纯 CPU）**：
+
+| 实测项 | 输出人数 | 4 人基准 AER | 原始 5 标签 AER | 耗时 / 内存 | 说明 |
+|---|---:|---:|---:|---:|---|
+| `meetmin diarize -n example`（首次含下载 27 MB 模型） | **4** | **1.32%** | **2.94%** | 12.1s（含网络下载） | 自动下载至 `.cache/huggingface/hub` 并生成 `(111, 192)` `embeddings.npz` |
+| `meetmin diarize -n example`（冷提取，已缓存模型） | **4** | **1.32%** | **2.94%** | **6.68s** / **180.3 MB RSS** | CLI 全进程端到端指标，较 ECAPA（44.1s / 1331 MB）提速 6.6×、省内存 86.5% |
+| `meetmin diarize -n example`（热缓存复用） | **4** | **1.32%** | **2.94%** | **0.49s**（进程内 `0.31s`） | 仅改聚类/对齐参数时秒级重算 |
+| `campplus_onnx` 指定 `num_speakers=4` | **4** | **1.32%** | — | **0.31s**（复用缓存） | 与自动人数一致，精准 4 人 |
+| `ecapa_speechbrain` 向后兼容回退 | **4** | **1.32%** | — | 44.1s | 切换 provider 时自动识别缓存指纹变更并重提取 `(111, 192)` |
+| 离线无 `[diar]` 依赖测试（屏蔽 `torch`/`speechbrain`/`sklearn`/`scipy`） | — | — | — | **62/62 通过（0.75s）** | 验证零额外可选依赖即可完整运行聚类与 CAM++ 分离 |

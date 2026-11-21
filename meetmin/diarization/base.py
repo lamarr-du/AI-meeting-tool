@@ -9,6 +9,7 @@ import numpy as np
 
 class Diarizer(ABC):
     name = "base"
+    supports_cache = False
 
     @abstractmethod
     def diarize(

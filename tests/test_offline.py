@@ -864,7 +864,6 @@ def test_ecapa_centroid_reassignment_and_knn_outlier_filter_without_sklearn():
 
 
 def test_ecapa_min_cluster_filter_and_centroid_reassignment():
-    pytest.importorskip("sklearn")
     from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
     diarizer = object.__new__(EcapaSpeechbrainDiarizer)
@@ -893,7 +892,6 @@ def test_ecapa_min_cluster_filter_and_centroid_reassignment():
 
 
 def test_ecapa_fixed_num_speakers_resists_outliers():
-    pytest.importorskip("sklearn")
     from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
     diarizer = object.__new__(EcapaSpeechbrainDiarizer)
@@ -921,7 +919,6 @@ def test_ecapa_fixed_num_speakers_resists_outliers():
 
 
 def test_ecapa_spectral_clustering_auto_and_fixed():
-    pytest.importorskip("sklearn")
     from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
     rng = np.random.default_rng(11)
@@ -966,6 +963,131 @@ def test_ecapa_non_overlapping_midpoint_boundary():
     assert segs[1]["start"] == 1.125
     assert segs[1]["end"] == 3.0
     assert segs[0]["end"] <= segs[1]["start"]
+
+
+def test_campplus_onnx_kaldi_fbank_shape_and_cmn():
+    from meetmin.diarization.campplus_onnx import kaldi_fbank
+
+    rng = np.random.default_rng(3)
+    wav = (rng.normal(scale=0.1, size=16000)).astype(np.float32)
+    feat = kaldi_fbank(wav)
+    assert feat.ndim == 2 and feat.shape[1] == 80
+    assert feat.shape[0] == 98
+    assert np.isfinite(feat).all()
+    assert np.allclose(feat.mean(axis=0), 0.0, atol=1e-5)
+
+    short_feat = kaldi_fbank(np.zeros(100, dtype=np.float32))
+    assert short_feat.shape == (1, 80)
+
+
+def test_campplus_onnx_downloads_to_configured_cache_and_notifies(monkeypatch):
+    from types import ModuleType, SimpleNamespace
+
+    from meetmin.diarization.campplus_onnx import (
+        CAMPPLUS_FILE,
+        CAMPPLUS_REPO,
+        CampplusOnnxDiarizer,
+    )
+
+    with _TmpDir() as td:
+        cache_root = Path(td) / "model-cache"
+        expected_hub = cache_root / "huggingface" / "hub"
+        cached_file = expected_hub / "downloaded.onnx"
+        requests: list[tuple[str, str, str]] = []
+        states: list[bool] = []
+        hub = ModuleType("huggingface_hub")
+
+        def try_cache(repo_id, filename, *, cache_dir):
+            return str(cached_file) if cached_file.is_file() else None
+
+        def download(repo_id, *, filename, cache_dir):
+            requests.append((repo_id, filename, str(cache_dir)))
+            cached_file.parent.mkdir(parents=True, exist_ok=True)
+            cached_file.write_bytes(b"fake-onnx")
+            return str(cached_file)
+
+        hub.try_to_load_from_cache = try_cache  # type: ignore[attr-defined]
+        hub.hf_hub_download = download  # type: ignore[attr-defined]
+
+        fake_ort = SimpleNamespace(
+            SessionOptions=lambda: SimpleNamespace(intra_op_num_threads=1, inter_op_num_threads=1),
+            InferenceSession=lambda path, **kwargs: SimpleNamespace(
+                get_inputs=lambda: [SimpleNamespace(name="x")],
+                path=path,
+            ),
+        )
+        monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+        monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+        diarizer = CampplusOnnxDiarizer(
+            {}, model_cache_dir=cache_root, on_model_download=states.append
+        )
+        diarizer._load_session()
+        assert requests == [(CAMPPLUS_REPO, CAMPPLUS_FILE, str(expected_hub))]
+        assert states == [True, False]
+        assert diarizer.session.path == str(cached_file)
+
+        # 第二次命中缓存，不再触发下载或通知
+        diarizer2 = CampplusOnnxDiarizer(
+            {}, model_cache_dir=cache_root, on_model_download=states.append
+        )
+        diarizer2._load_session()
+        assert len(requests) == 1
+        assert states == [True, False]
+
+
+def test_campplus_onnx_diarize_caches_embeddings_and_clusters():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from meetmin.diarization.campplus_onnx import CampplusOnnxDiarizer
+
+    diarizer = object.__new__(CampplusOnnxDiarizer)
+    diarizer.dcfg = {"window_mode": "speech_spans", "window_sec": 2.5}
+    diarizer._input_name = "x"
+    call_count = {"n": 0}
+
+    def fake_run(_outputs, feed):
+        call_count["n"] += 1
+        assert feed["x"].ndim == 3 and feed["x"].shape[2] == 80
+        # 前 3 段给说话人 A，后 3 段给说话人 B
+        vec = (
+            np.array([[2.0, 0.0, 0.0]], dtype=np.float32)
+            if call_count["n"] <= 3
+            else np.array([[0.0, 3.0, 0.0]], dtype=np.float32)
+        )
+        return [vec]
+
+    diarizer.session = SimpleNamespace(run=Mock(side_effect=fake_run))
+    audio = np.ones(16000 * 14, dtype=np.float32) * 0.1
+    spans = [(0.0, 6.0), (8.0, 14.0)]  # 各均分为 3 段 2.0s
+    with _TmpDir() as td:
+        cache = Path(td) / "embeddings.npz"
+        segs = diarizer.diarize(audio, speech_spans=spans, cache_path=cache)
+        assert len(segs) == 2
+        assert segs[0]["label"] != segs[1]["label"]
+        assert call_count["n"] == 6
+        with np.load(cache, allow_pickle=False) as stored:
+            assert stored["embeddings"].shape == (6, 3)
+            assert np.allclose(np.linalg.norm(stored["embeddings"], axis=1), 1.0)
+        # 改聚类阈值必须复用缓存
+        diarizer.dcfg["cluster_threshold"] = 0.6
+        segs2 = diarizer.diarize(audio, speech_spans=spans, cache_path=cache)
+        assert len(segs2) == 2
+        assert call_count["n"] == 6
+
+
+def test_get_diarizer_defaults_to_campplus_onnx(monkeypatch):
+    from types import SimpleNamespace
+
+    from meetmin.diarization import get_diarizer
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", SimpleNamespace())
+    cb = lambda active: None  # noqa: E731
+    diarizer = get_diarizer({"diarization": {}}, on_model_download=cb)
+    assert diarizer.name == "campplus_onnx"
+    assert diarizer.supports_cache is True
+    assert diarizer._on_model_download is cb
 
 
 def test_align_speaker_at_point_prefers_nearest_center_on_overlap():

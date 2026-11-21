@@ -247,7 +247,7 @@ class Pipeline:
         dcfg = self.cfg.get("diarization", {}) or {}
         needs_audio = (
             dcfg.get("enabled", True)
-            and dcfg.get("provider", "ecapa_speechbrain") != "single"
+            and dcfg.get("provider", "campplus_onnx") != "single"
             and not any(u.speaker is not None for u in utterances)
             and bool(utterances)
         )
@@ -364,7 +364,10 @@ class Pipeline:
             else get_diarizer(self.cfg)
         )
         options: dict[str, Any] = {"speech_spans": [(u.start, u.end) for u in utterances]}
-        if diarizer.name == "ecapa_speechbrain":
+        if getattr(diarizer, "supports_cache", False) or diarizer.name in (
+            "campplus_onnx",
+            "ecapa_speechbrain",
+        ):
             options["cache_path"] = session.root / "embeddings.npz"
         segments = diarizer.diarize(audio16k, **options)
         reassigned = assign_speakers(

@@ -102,17 +102,37 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
             print(f"  错误：未设置 {key}")
             ok = False
     d = cfg.get("diarization", {}) or {}
-    if d.get("enabled", True) and d.get("provider", "ecapa_speechbrain") not in ("single",):
-        missing = [
-            m for m in ("torch", "speechbrain", "sklearn") if importlib.util.find_spec(m) is None
-        ]
-        if missing:
-            print("  可选说话人分离依赖缺失：" + ", ".join(missing) + "；将降级为单说话人")
-        cache = hub_cache_dir(configured_cache) / "models--speechbrain--spkrec-ecapa-voxceleb"
-        cached = any(cache.glob("snapshots/*/embedding_model.ckpt"))
-        print(
-            f"  声纹模型：{'缓存目录存在，请确认文件完整' if cached else '未检测到缓存，请提前下载'} ({cache})"
-        )
+    diar_provider = str(d.get("provider", "campplus_onnx")).lower()
+    if d.get("enabled", True) and diar_provider not in ("single",):
+        if diar_provider in ("campplus_onnx", "campplus", "onnx", "3dspeaker"):
+            if importlib.util.find_spec("onnxruntime") is None:
+                print("  说话人分离依赖缺失：onnxruntime；将降级为单说话人")
+            if d.get("model_path"):
+                model_file = Path(str(d["model_path"])).expanduser()
+                print(
+                    f"  声纹模型：{'本地文件存在' if model_file.is_file() else '未找到本地模型文件'} ({model_file})"
+                )
+            else:
+                cache = (
+                    hub_cache_dir(configured_cache) / "models--csukuangfj--speaker-embedding-models"
+                )
+                cached = any(
+                    cache.glob(
+                        "snapshots/*/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+                    )
+                )
+                print(
+                    f"  声纹模型(CAM++ ONNX)：{'已缓存' if cached else '未检测到缓存，首次运行将自动下载（约 27 MB）'} ({cache})"
+                )
+        else:
+            missing = [m for m in ("torch", "speechbrain") if importlib.util.find_spec(m) is None]
+            if missing:
+                print("  可选说话人分离依赖缺失：" + ", ".join(missing) + "；将降级为单说话人")
+            cache = hub_cache_dir(configured_cache) / "models--speechbrain--spkrec-ecapa-voxceleb"
+            cached = any(cache.glob("snapshots/*/embedding_model.ckpt"))
+            print(
+                f"  声纹模型(ECAPA)：{'缓存目录存在，请确认文件完整' if cached else '未检测到缓存，请提前下载'} ({cache})"
+            )
     llm = cfg.get("llm", {}) or {}
     if llm.get("provider", "openai_compatible") not in ("mock", "none", "offline", ""):
         key = llm.get("api_key_env", "LLM_API_KEY")
