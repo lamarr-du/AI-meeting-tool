@@ -1,429 +1,47 @@
-# AI 会议纪要小工具（meetmin）
+# MeetMin 会议纪要
 
-命令行流程：**录音 → 转写 → 说话人分离/对齐 → AI 纪要**。
+MeetMin 可以录制会议或导入已有音频，在本机转成文字，再用 AI 生成会议纪要。
 
-- **录音**：Windows WASAPI 录制电脑输出，保存为 `audio.wav`。加 `--mic` 可同时录制麦克风，另存 `microphone.wav`。macOS 和 Linux 可使用已有音频。
-- **转写**：默认使用本地 faster-whisper，完成后先保存 `asr_raw.json`，保留可用的词级时间戳、模型信息和转写参数。
-- **分离**：可选 SpeechBrain ECAPA 声纹聚类，生成精简的 `transcript.json` 和可读的 `transcript.md`；可从原始转写独立重跑。
-- **纪要**：通过 OpenAI 兼容的 `/chat/completions` 调用大模型，生成 `minutes.md`。默认配置指向 DashScope，示例模型名为 `qwen-3.8-flash`，使用前须改成账户实际可用的模型。
+## 快速上手｜桌面版（推荐）
 
-本地 ASR 和 ECAPA 在模型下载完成后可离线处理，不消耗云端 token。纪要默认使用云端服务，会发送转写文本；另提供 DashScope Paraformer 云端 ASR，会使用服务端可访问的音频 URL。
+如果手上已有 Windows 便携包，解压后双击 `MeetMin.exe`，保留同目录下的文件。
 
-## 安装
-
-建议使用 **64 位 Python 3.12**。其他 Python 版本的安装情况取决于各依赖提供的版本和平台包。
-
-Windows PowerShell，使用固定的核心依赖组合：
+从源码安装时，准备 **64 位 Python 3.12**，安装时选择将 Python 加入 PATH。通过仓库页面的 **Code → Download ZIP** 下载源码，解压后在项目目录打开 PowerShell。
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -c requirements-win-py312.lock .
-
-# 可选：本地说话人分离；使用约束文件保持核心依赖版本
-python -m pip install -c requirements-win-py312.lock ".[diar]"
+.\.venv\Scripts\python.exe -m pip install -c requirements-win-py312.lock ".[gui]"
+.\.venv\Scripts\python.exe -m meetmin.gui
 ```
 
-macOS / Linux，使用兼容版本范围：
+1. 点击 **新建会议**，选择 **开始录音** 或 **导入音频**。Windows 可以录制电脑声音，勾选 **同时录制麦克风** 可录下自己的发言，建议佩戴耳机。macOS 和 Linux 可导入已有音频。
+2. 停止录音或导入音频后，应用会自动转写。首次使用需要联网下载 Whisper 模型，之后可离线转写。
+3. 检查转写后，选择一种方式生成纪要。
+   - **使用纪要 API**。在 **设置** 填写服务商提供的 API 地址、模型和 API Key，再点击 **生成纪要**。转写文本会发送给该服务。
+   - **使用 AI 网页**。在 **更多操作** 中选择 **导出 AI 网页提示词**，将内容提交到你使用的 AI 网页。把回复保存为文本文件，再用 **导入 AI 网页纪要** 导入。
+4. 在 **更多操作** 中选择 **导出转写** 或 **导出纪要**，保存为 Markdown。
+
+<details>
+<summary>macOS / Linux 安装方式</summary>
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install .
-# 可选：本地说话人分离
-python -m pip install ".[diar]"
+.venv/bin/python -m pip install ".[gui]"
+.venv/bin/python -m meetmin.gui
 ```
 
-以上命令从仓库根目录安装本地项目。Windows 其他 Python 版本可用 `python -m pip install .` 按范围安装。核心版本范围保存在 `requirements.txt`，由 `pyproject.toml` 读取；`diar` extra 统一定义在 `pyproject.toml`。`requirements-optional.txt` 保留旧命令入口，内容引用本地 `.[diar]`，也须从仓库根目录安装。`pyaudiowpatch` 带 Windows 平台条件，macOS/Linux 会跳过。PyAV 限制为 `>=16.1.0,<17`，避免与 faster-whisper 的解码接口不兼容；SpeechBrain 要求 `>=1.0.2`，以支持当前的导入路径和复制下载策略。可选依赖会引入 PyTorch，安装体积取决于平台和所选版本。
+</details>
 
-`requirements-win-py312.lock` 针对 Windows / Python 3.12 固定核心及传递依赖，**不包含可选分离依赖**。其中除 Windows 专用组件外的对应版本已在 Linux Python 3.12 验证解码和离线测试；Windows 内录、真实 GPU 推理和真实 ECAPA 提取尚未实机验证。锁文件不代表所有平台和 Python 版本都已验证。
+## 命令行（备选）
 
-维护者安装 `uv` 后可更新锁文件：
-
-```bash
-uv pip compile requirements.txt --python-platform windows --python-version 3.12 -o requirements-win-py312.lock
-```
-
-受限 DSH 沙箱若出现带 `pip-unpack-*` 路径的权限错误，可尝试在 PowerShell 设置 `$env:PYTHONPATH="$PWD\scripts\sandbox_fix"` 后重新安装；普通环境无需设置。
-
-## Windows 桌面版
-
-从源码试用时，在仓库根目录执行：
+从源码安装桌面版后即可使用 CLI。以下 Windows 示例会转写已有音频并导出 AI 网页提示词，无需纪要 API Key。
 
 ```powershell
-python -m pip install ".[gui]"
-meetmin-gui
-# 或指定现有 YAML，同时访问配置所指向的 CLI 会话
-python -m meetmin.gui --config config.yaml
+.\.venv\Scripts\python.exe -m meetmin run --audio "meeting.m4a" -n meeting --export-web
 ```
 
-在「新建会议」中选择「开始录音」或「导入音频」。录音可同时采集电脑声音和麦克风，并显示两轨电平。点击停止后，桌面版会先保存录音，再开始本地 Whisper 转写和说话人整理。首次下载 Whisper 模型时，界面显示下载百分比、已下载量、总大小和预计剩余时间。导入音频时，桌面版会将音频复制到会话目录，便于后续重试。
+单独安装 CLI、录音和导入网页纪要见 [CLI 使用手册](doc/cli.md)。
 
-转写完成后可以预览、生成纪要，或从「更多操作」导出 Markdown。调用纪要 API 前会显示接收转写的 API 地址和模型。「设置」中可配置 API 地址和模型，以及本次运行使用的 API Key。Key 留空时沿用 YAML 指定的环境变量。还可以从「更多操作」导出 AI 网页提示词，使用自己选的 AI 网页，再导入得到的纪要文本。
+## 开发文档
 
-默认会话位置由 Windows 用户应用数据目录提供，可在「设置」中修改。指定 `--config` 时，相对的 `output_dir` 以该 YAML 所在目录为基准。想要本地多说话人分离时，可在源码版本中安装 `.[gui,diar]`。Windows 以外的桌面版可导入已有音频。
-
-### 构建 Windows 便携版
-
-在 Windows Python 环境中构建：
-
-```powershell
-python -m pip install ".[gui]" "PyInstaller>=6,<7"
-python scripts/build_desktop.py
-```
-
-构建默认包含 CUDA 12 和 cuDNN 9 运行库。脚本可从当前 Python 环境的 CUDA 版 PyTorch 中取 DLL，也支持通过 `--cuda-dir <目录>` 提供同一套运行库。从源码运行时，可用环境变量 `MEETMIN_CUDA_DLL_DIR` 指定 DLL 目录。仅构建 CPU 便携包时使用 `--cpu-only`。CUDA 仍需要机器上的 NVIDIA 驱动。
-
-双击 `dist/desktop/MeetMin/MeetMin.exe` 启动，复制到另一台电脑时请携带整个 `MeetMin` 文件夹。便携版包含 Python 和 Qt 运行时，Whisper 权重在首次使用时下载或读取已有缓存。便携版采用单说话人分组，双轨录音中的麦克风发言仍标记为「我」。
-
-## 快速开始
-
-安装后可使用 `meetmin` 或 `python -m meetmin`；从源码运行的 `python main.py` 仍保留。以下示例在仓库根目录执行，以便读取仓库中的配置。配置默认读取当前目录的 `config.yaml`，缺项使用内置默认值；自定义配置使用 `meetmin --config my-config.yaml <子命令>`，`--config` 放在子命令之前。
-
-Windows 分步处理：
-
-```powershell
-# 预检及设备列表
-meetmin doctor
-meetmin devices
-
-# 1. 录音，Ctrl+C 结束；也可加 --device 设备索引
-meetmin record -n weekly
-
-# 2a. 只转写，保存 asr_raw.json
-meetmin transcribe -n weekly
-
-# 2b. 分离/对齐，保存 transcript.json 和 transcript.md
-meetmin diarize -n weekly
-
-# 3. 按 config.yaml 中 llm.api_key_env 配置密钥，并确认 llm.model 可用
-$env:DASHSCOPE_API_KEY = "sk-..."
-meetmin summarize -n weekly
-
-# 或自动执行录音 → 转写 → 分离 → 纪要
-meetmin run -n weekly
-```
-
-已有音频（Windows / macOS / Linux 均可使用，路径按实际修改）：
-
-```bash
-meetmin doctor --no-record
-meetmin run --audio "recordings/meeting.m4a" -n review
-```
-
-也可将已有音频分步处理：`meetmin transcribe --audio "recordings/meeting.m4a" -n review`，随后执行 `diarize -n review`、`summarize -n review`。`transcribe` 只保存原始转写，完成分离后才能生成新的纪要。
-
-## 命令与会话选择
-
-| 命令 | 作用与主要参数 |
-|---|---|
-| `doctor` | 预检；`--mic` 同时检查麦克风，`--no-record` 跳过设备检查，云端 ASR 可传 `--file-url` |
-| `devices` | 列出 Windows 内录、麦克风设备及索引 |
-| `record` | 新建会话并录音；`-n` 名称前缀、`--device` 内录索引、`--mic` 双轨、`--mic-device` 麦克风索引、`--max-seconds` 最长秒数 |
-| `recover` | 从录音分段恢复；`-n` 必须是完整会话 ID，可用 `--take` 选择某次录音，`--output` 指定新文件（单轨）或新目录（双轨） |
-| `transcribe` | 保存原始转写；`-n` 会话 ID/前缀、`--audio` 本地音频、`--file-url` 云端音频 URL |
-| `diarize` | 从 `asr_raw.json` 重跑分离/对齐；必须提供 `-n` 会话 ID/前缀 |
-| `speakers` | 用 `list <会话>` 核对发言样本，或用 `rename <会话> A=姓名 B=姓名` 批量改名 |
-| `summarize` | 从 `transcript.json` 生成纪要；`--export-web` 导出网页版提示词，`--import-web` 导入网页版结果 |
-| `run` | 自动完成全部流程；支持 `record` 的录音选项，也可用 `--audio` 处理已有音频 |
-
-每次普通 `record -n weekly` 或 `run -n weekly` 都新建目录，形如 `data/sessions/weekly-20261113-090000123456-ab12/`。名称作为前缀，非法字符和连续的点会被替换，前缀最长 100 个字符；日期时间由运行机器的本地时钟生成。未提供名称时使用时间戳和随机后缀。
-
-`transcribe`、`diarize`、`summarize` 按名称查找时，优先匹配完整目录名，否则选择 `名称-` 前缀下最新的一个，并打印所选 ID。新格式按目录名中的创建时间排序，旧格式回退到目录修改时间；旧的精确目录名（例如 `weekly`）仍优先。若最新的多个会话时间相同，程序会列出候选并要求指定完整 ID，避免选错会话。需要处理某次会议时，建议复制程序打印的完整 ID。
-
-- `transcribe` 未找到会话时，只有提供 `--audio` 才会新建；仅传 `--file-url` 不会创建会话。
-- `diarize` 不会新建会话，且必须已有 `asr_raw.json`。
-- `summarize` 省略 `-n` 时，按目录修改时间选择含 `audio.wav`、`recording.json` 或 `transcript.json` 的最近会话，再检查其中是否有转写结果。
-- `run --audio` 新建会话并引用外部音频，不会把它复制为会话内的 `audio.wav`。
-
-录音默认拒绝覆盖已有文件。确需重新录制时，必须指定完整现有会话 ID 和 `--overwrite`：
-
-```bash
-meetmin record -n weekly-20261113-090000123456-ab12 --overwrite
-```
-
-`run` 也支持相同用法；`--overwrite` 不能与 `--audio` 同用。覆盖录音不会删除旧转写、嵌入缓存或纪要，后续应重新执行转写、分离和纪要。`transcribe`、`diarize`、普通 API 模式的 `summarize` 在同一会话重跑时会替换各自的输出，不需要 `--overwrite`；网页版导出和导入默认不覆盖。
-
-## 同时录制麦克风与电脑声音
-
-```powershell
-meetmin devices
-meetmin doctor --mic
-meetmin record --mic -n weekly
-meetmin transcribe -n weekly
-meetmin diarize -n weekly
-# 或由一条命令完成录音、转写、分离和纪要
-meetmin run --mic -n weekly
-```
-
-`--mic` 使用默认 WASAPI 麦克风。`--mic-device <索引>` 会启用双轨并选择指定输入，也可在配置中设置 `recorder.microphone: true` 和 `recorder.microphone_device`。`--no-mic` 可临时切回仅内录。
-
-电脑内录和本机麦克风会分别根据各自采集到的电平自动调整增益。有声时持续调整，停顿后按新声音的电平重新估算。麦克风最多补偿约 24 dB，并减少对极低电平底噪的放大。增益作用于保存的录音，播放音量和麦克风输入音量仍由 Windows 控制。若静音导致设备只返回静音或停止送帧，录音中仍是静音。
-
-双轨共享录音起止时间，分别补齐采集缺口并保存原始 WAV。本地 faster-whisper 分别转写两轨，`diarize` 对内录分配说话人、把麦克风发言标为“我”，最后按起始时间合并，两边同时说话时会保留双方的发言。双轨会话的自动转写使用本地 faster-whisper。
-
-录音时建议佩戴耳机，并关闭 Windows 的麦克风“侦听此设备”。扬声器的声音可能被麦克风重复采集，转写时会出现重复发言或误标为“我”。自动串音抑制列在改进计划中。
-
-## 使用 AI 网页生成纪要
-
-完成转写和说话人分离后，也可不配置 LLM API Key，手动使用自己选择的 AI 网页：
-
-```powershell
-meetmin summarize -n weekly --export-web
-# 将生成的 minutes_web_prompt.txt 内容复制或上传到 AI 网页，
-# 把网页回复保存为 UTF-8 文本，例如 web-answer.md，然后导入：
-meetmin summarize -n weekly --import-web web-answer.md
-```
-
-导出文件包含完整转写、会议元信息和输出要求；它可能包含敏感会议内容，发送给第三方前请确认允许上传。工具不会自动打开网页、登录、上传或读取账号。导入文件为空或编码不是 UTF-8 时会报错，不改变已有纪要。导出和导入分别在目标文件已存在时拒绝覆盖；确需替换，可在相应命令末尾加 `--overwrite`。导入后保存为会话中的 `minutes.md`，并标记来源；需人工核对行动项、数字和遗漏。
-
-完整转写可能超过所选网页的输入或文件限制，上传成功也不保证全文被模型准确处理；需要时请手动分段、汇总并核对原文。各服务的免费额度和数据处理方式不同，请按所选服务的规则使用。
-
-也可在开始时选择 `meetmin run -n weekly --export-web`，转写和分离完成后直接导出提示词，不调用纪要 API；如使用云端转写，仍需按其要求配置服务。`run` 或普通 `summarize` 未检测到 LLM Key 时会提示网页版入口，但仍尝试已配置的接口（例如无需 Key 的本地服务）。接口调用失败时，已有转写会保留，命令会提示导出步骤；网页版操作需要用户手动完成。`mock` 只用于离线联调，不生成真实纪要。
-
-## 录音反馈和预检
-
-录音时每秒显示经过时长、已写入 WAV 的时长（含时间轴补零）、RMS 电平和电平条；交互终端刷新同一行，重定向输出时逐行记录。连续低于 `recorder.silence_threshold`（默认 0.003）的音频达到 30 秒时告警，同一段静音只提示一次，声音恢复后重新计时。阈值为归一化 RMS，电平条用于观察声音活动。
-
-两秒未收到新数据时不再显示旧电平；连续 10 秒未收到数据时提示检查，恢复接收后会提示并重新计时。某些 WASAPI 设备在输出静音时本来就不发送数据，因此告警本身不一定代表故障；如果会议声音正在播放，应检查输出设备。录音器按采集时间戳在恢复时补齐中间缺口、停止时补齐末尾缺口，因此无数据期间已写时长暂时不会增长。补入的零帧不会重置无数据告警，也不能恢复设备未采集到的声音；结束时报告补零时长。设备缺少有效时间戳时会提示使用到达时间估算、精度降低。录音器不会自动切换设备。
-
-录音使用约 5 秒容量的队列缓冲写盘。采集异常、队列满、写盘失败或流意外停止时，会保留分段、报告错误，并以非零状态退出；`run` 不再自动进入转写。正常停止会排空队列并关闭分段，再拼接生成 `audio.wav`；若写线程超时，不会抢先关闭它正在使用的文件，未清理完的录音器不能复用。原生驱动永久挂起仍无法保证强制退出。
-
-录音默认每 300 秒分段，活动分段每 10 秒刷新并同步到磁盘，可用 `recorder.segment_seconds` 和 `recorder.sync_seconds` 调整。每次录音使用独立的 `audio_parts-*` 目录，即使覆盖录音也不混用旧分段。正常完成后分段保留，可在确认无需恢复后自行清理。48 kHz 双声道 16 位录音每小时约 691 MB；合并时成品和分段并存，需要至少两倍空间。标准 WAV 约 4 GiB 上限，超限时合并失败并保留分段。
-
-异常退出后，用完整会话 ID 恢复：
-
-```powershell
-meetmin recover -n weekly-20261113-090000123456-ab12
-```
-
-如果有多次录音，命令会列出分段目录，用 `--take audio_parts-...` 选择；若 `audio.wav` 已存在，可用 `--output 路径` 恢复到另一个新文件。恢复不会覆盖现有文件，也不会删除分段。恢复时检查分段顺序和格式，并从最后一个未完成分段的文件长度修复 WAV；不完整的末尾帧会被丢弃并报告。录音或恢复正在进行时，同一会话不能同时恢复。
-
-双轨分段在同一个 `audio_parts-*` 批次下的 `loopback/` 和 `microphone/` 子目录。两轨都恢复后才发布会话录音，异常中断时两轨的尾部长度可能不同。已有录音时用 `--output <新目录>` 导出两份 WAV。清理时可删除已确认无需恢复的分段子目录，保留当前批次中的两个 WAV。
-
-同步只能尽量减少断电时的损失，无法保证存储设备上的数据一定持久化。写线程尚未处理的队列和最后一个待处理音频块可能丢失；长时间没有设备回调时，尚未写入的末尾无数据区间也可能缺失，恢复不会猜测补齐。恢复结果需要检查时长和内容。
-
-Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装项目）。脚本先录制全静音，再复用录音器播放两段 10 秒测试音，中间间隔 20 秒，检查时长、声音位置与停止耗时；请关闭其他播放声音的应用，并解除系统静音、设置合适的播放音量。脚本不会更改音量设置。WAV 和 JSON 结果写入 `.tmp/b2-check-*`，不会调用转写或云端服务。可通过 `--tone-seconds` 和 `--gap-seconds` 调整测试时长。
-
-录音结束后，本地 Silero VAD 估算有效语音占比；检测失败时报告基于 RMS 阈值的有声占比。两者均为估算，音乐和噪声可能影响结果。VAD 在录音结束后执行，需要额外解码和处理时间。
-
-`doctor` 以及 `record`、`run` 开始前的自动预检均不联网、不下载模型：
-
-| 检查 | 当前行为 |
-|---|---|
-| 录音设备 | 解析配置的设备；默认先寻找系统默认输出对应的 loopback，找不到时回退到首个 loopback；失败则退出 |
-| 本地 ASR 依赖 | 检查能否找到 `faster_whisper`、`av` 模块；缺失则退出，不验证其完整运行能力 |
-| Whisper 缓存 | 检查本地目录或推测的 Hugging Face 缓存中的 `model.bin`；未找到仅提示，不能保证模型完整 |
-| 声纹模型及可选依赖 | 检查缓存目录是否非空及能否找到 `torch`、`speechbrain`、`sklearn`；给出提示，不试加载模型 |
-| API Key | 检查指定环境变量是否存在；LLM Key 缺失只提示，DashScope ASR Key 或音频 URL 缺失则退出 |
-| GPU | 通过 CTranslate2 检查 CUDA 设备和计算类型，尝试加载 CUDA/cuDNN 库，并在可对应到当前设备时用 `nvidia-smi` 查询空闲显存 |
-| 磁盘 | 报告输出目录所在磁盘的剩余空间，不做容量预算或写入测试 |
-
-预检不会验证 API Key 有效性、云端模型名或 URL 可达性。未缓存的模型仍可能在录音结束后才开始下载；建议会前用短音频完成一次 `transcribe` 和 `diarize`。`transcribe`、`diarize`、`summarize` 单独运行时不自动执行 doctor。
-
-## CPU / GPU 与模型缓存
-
-默认 `asr.profile: auto`，`model_size` 和 `compute_type` 为 `null` 时由档位决定。`meetmin doctor --no-record` 会用同一套逻辑显示所选档位和模型缓存情况。
-
-| 档位 | 默认模型 / 计算类型 | 何时选择 |
-|---|---|---|
-| `cpu_light` | `small` / int8 | 自动分配时，总内存不足 15 GiB、可用内存不足 6 GiB，或内存探测不可用 |
-| `cpu_standard` | `large-v3-turbo` / int8 | 自动分配时总内存至少 15 GiB 且可用内存至少 6 GiB |
-| `gpu_standard` | `large-v3-turbo` / int8_float16 | CUDA 检查通过时优先尝试；配置了 `cuda_peak_mib` 且能读取空闲显存时，预留 256 MiB 余量 |
-
-可用 `profile: cpu_light` 固定省内存的 CPU 档，或用 `profile: cpu_standard` 固定精度优先的 CPU 档。显式 `device: cuda` 直接尝试指定档位。自动档可用 `cuda_peak_mib` 预判显存，填入目标模型从加载到完成转写相对启动前的显存峰值增量。未配置峰值或无法读取空闲显存时直接尝试首选档位。
-
-自动搭配模型时，如果 Turbo 的实测峰值超出当前显存预算，或加载、转写时遇到显存不足，则尝试 Small CUDA。Small 也遇到显存不足，或 CUDA 运行库、设备无法使用时，自动档切换到 CPU int8。显式指定模型时 CPU 回退沿用该模型。桌面处理日志和 `asr_raw.json` 按音轨记录实际模型、设备、精度和降级原因。单轨或双轨转写结束后释放 Whisper，ECAPA 分离在 CPU 上执行。
-
-Windows 的当前 CUDA 路径需要可加载的 CUDA 12 cuBLAS 和 cuDNN 9 库，预检会列出缺失项。[faster-whisper 安装说明](https://github.com/SYSTRAN/faster-whisper#gpu)
-
-Whisper 默认使用 Hugging Face 缓存（通常在 `~/.cache/huggingface/hub`，也受 `HF_HOME` / `HF_HUB_CACHE` 影响）。可把 `asr.model_size` 指向已下载的 CTranslate2 模型目录。`asr.hf_endpoint` 用于配置下载端点，默认设置 `HF_HUB_DISABLE_XET=1`；已有相关环境变量优先，不会被配置强行覆盖。
-
-ECAPA 模型按需加载到用户目录 `~/.cache/meetmin/speechbrain`，使用 `LocalStrategy.COPY`，避免在该目录使用 SpeechBrain 默认的软链接策略。缓存命中并仅重跑聚类时不会加载 ECAPA 编码器；仍需安装可选依赖。
-
-## 会话产物与失败恢复
-
-产物位于 `<output_dir>/sessions/<session_id>/`，默认 `output_dir: data`：
-
-| 文件 | 内容和生成时机 |
-|---|---|
-| `audio.wav` | 单轨模式的 Windows 内录音频，格式为 16-bit PCM；外部音频模式沿用原文件 |
-| `recording.json` | 双轨模式的当前录音批次，指向同批次的 `audio.wav` 与 `microphone.wav`；切回单轨后使用会话根目录的 `audio.wav` |
-| `asr_raw.json` | 转写完成后、分离前原子写入；包含原始句子、可用的词级时间戳、模型信息和转写参数。双轨的麦克风转写保存在 `microphone.utterances` |
-| `embeddings.npz` | 本地 ECAPA 窗口嵌入，提取完成后、聚类前原子写入；单说话人和云端自带分离不生成新嵌入，短音频也可能不生成 |
-| `transcript.json` | 分离/对齐后的句级时间戳、文本和说话人，不含词级数据 |
-| `transcript.md` | 供人工查看的转写文本 |
-| `transcript_corrected.json` / `transcript_corrected.md` | 启用术语纠错后生成的独立副本，JSON 包含替换记录和待核对项 |
-| `minutes_web_prompt.txt` | 可手动提交给 AI 网页的完整提示词和转写（仅执行导出时生成） |
-| `minutes.md` | 由 API 生成或由用户从 AI 网页导入的纪要；API 模式附用量及可选费用估算 |
-
-分离失败时，已完成的原始转写仍在，可直接重跑：
-
-```bash
-meetmin diarize -n weekly-20261113-090000123456-ab12
-meetmin summarize -n weekly-20261113-090000123456-ab12
-```
-
-修改 `config.yaml` 中的 `cluster_threshold`、`num_speakers` 或 `min_group_sec` 后，同样只需重跑分离和纪要。原始转写不会被分离过程修改；失败的重跑不会自动清除上次已有的输出，须确认命令成功后再使用结果。
-
-`embeddings.npz` 包含归一化的 `embeddings`、窗口起止采样点 `starts` / `ends` 和 JSON 字符串 `metadata`（采样率、模型、窗口参数、语音区间与音频指纹）。可用 `numpy.load(path, allow_pickle=False)` 读取，作为后续声纹注册的数据基础；当前尚无声纹注册命令。音频、语音区间、窗口及能量阈值一致时复用嵌入；改变这些输入或删除文件会重新提取。仅改聚类/对齐参数不会重新提取。
-
-本地 ECAPA 重跑仍需要原始音频，外部音频请保留在记录的绝对路径。Whisper 保留 `asr.word_timestamps: true` 才会请求词级数据；当前 DashScope 实现只解析句级数据。旧会话没有 `asr_raw.json` 时，需重新转写一次才能独立分离；已有 `transcript.json` 仍可用于生成纪要。
-
-对于本地 Whisper 的中文转写，`diarize` 会统一中文上下文中的半角逗号，并在至少 0.8 秒的段间停顿或音轨结束处为以文字或数字收尾的片段补句号。双轨会话按各自的时间轴处理。可对已有的 `asr_raw.json` 直接重跑 `diarize` 应用标点整理，原始转写保留模型文本和词级时间戳。
-
-如需让模型直接输出更多标点，可在 `asr.language: zh` 时设置 `asr.punctuation_prompt: "好的，我们继续。"`，也可用 `asr.hotwords` 填写少量确认过的术语。两项内容会合并传给 Whisper 的 `hotwords`，实际使用值记录在 `asr_raw.json`。标点提示可能影响识别与词级时间戳，默认关闭。
-
-要从项目术语表生成识别提示，在配置中指定术语表文件。可把本次会议最重要的标准写法按优先顺序列在 `terms` 里，省略时使用术语表顺序：
-
-```yaml
-asr:
-  glossary:
-    path: glossary.yaml
-    terms: [DRC Stat, demosaic, "@"]
-```
-
-路径相对于配置文件。术语提示只取 `term`，附在现有标点示例和手工热词之后，再一起传给本地 Whisper 的 `hotwords`。提示按模型的 token 上限和 `max_terms`（默认 20）选入整条术语。实际词条可在 `asr_raw.json` 的 `asr.parameters.glossary` 中核对。默认 `path: null`，适合不同主题的会议按需启用。
-
-设置 `asr.glossary.correction_path: glossary.yaml` 可独立启用转写后纠错。规则优先替换较长的误听，按标准术语和已确认别名规范英文大小写。含汉字且只有三个或更少字母数字字符的误听，以及词条中标记 `needs_context: true` 的误听，仅记入待核对项。
-
-`diarize` 会另存纠错 JSON 和 Markdown。JSON 的 `glossary_correction.changes` 记录每次替换的句子索引、时间、原文、新文和字符范围，`context_review` 列出待核对项。启用时，生成纪要或导出网页版提示词会从当前 `transcript.json` 重新应用纠错。将 `correction_path` 设回 `null` 即可使用原转写。
-
-本地 Whisper 默认体检相邻重复句、异常压缩比和 VAD 检出的连续有声缺口。体检只记录疑点，结果在 `asr_raw.json` 的 `asr.quality` 中，双轨的麦克风报告在 `microphone.asr.quality`。可以按其中的起止时间回听。
-
-设 `asr.quality.mode: retry` 可重跑疑点音频，单片最多 20 秒，每轨默认最多 6 次。只有在置信度、时间边界和邻近重复等检查通过后才更新转写。每次重试都会记录结果，替换已有片段时同时保留原文与词级时间戳。设 `mode: "off"` 可关闭体检。
-
-### 核对并修改说话人姓名
-
-```powershell
-meetmin speakers list weekly
-meetmin speakers rename weekly A=张三 B=李四
-meetmin summarize -n weekly
-```
-
-查看和改名前均会显示每人的最多三条最长发言及起始时间。改名会同步更新转写 JSON 和 Markdown，启用术语纠错时也会刷新纠错副本。连续改名可继续使用原标签如 `A`。重跑 `diarize` 会重新生成说话人标签，需根据新的发言样本核对姓名。
-
-## 配置要点
-
-| 配置 | 当前默认值与作用 |
-|---|---|
-| `recorder.device` | `null`，自动选择；配置中可填索引或名称片段，CLI `--device` 只接受整数索引 |
-| `recorder.microphone` / `recorder.microphone_device` | `false` / `null`，是否开启双轨及麦克风索引，`null` 使用默认 WASAPI 输入 |
-| `recorder.silence_threshold` | `0.003`，连续低电平告警阈值，允许 0–1 |
-| `recorder.segment_seconds` / `recorder.sync_seconds` | `300` / `10`，分段时长与磁盘同步间隔，单位为秒 |
-| `asr.provider` | `faster_whisper`；也可用 `dashscope` |
-| `asr.profile` / `asr.cuda_peak_mib` | `auto` / `null`，见 CPU / GPU 档位说明 |
-| `asr.model_size` / `language` | `null` 跟随档位 / `zh`，语言填 `null` 自动检测 |
-| `asr.device` / `compute_type` | `auto` / `null`，默认 CPU int8、CUDA int8_float16 |
-| `asr.beam_size` / `word_timestamps` | `1` / `true` |
-| `asr.condition_on_previous_text` | `false`；关闭前文条件以减少重复和幻觉，设为 `true` 可恢复原行为，实际值记录在 `asr_raw.json` |
-| `asr.quality` | 默认 `mode: detect`，连续有声缺口至少 1.5 秒，压缩比阈值 2.4，重试模式每轨最多 6 次 |
-| `asr.no_repeat_ngram_size` / `asr.repetition_penalty` / `asr.hallucination_silence_threshold` | `0` / `1.0` / `null`。均为可选的全局解码限制，静音阈值单位为秒且需要词级时间戳 |
-| `asr.punctuation_prompt` / `asr.hotwords` | 均为 `null`，可填带标点的中文示例和术语文本 |
-| `asr.glossary` | `path` 启用识别前提示，可用 `terms` 指定优先词条。`correction_path` 启用识别后纠错。两个路径默认均为 `null` |
-| `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
-| `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
-| `diarization.window_sec` / `hop_sec` | `1.5` / `0.75`，声纹窗口和步长 |
-| `diarization.min_window_rms` / `min_group_sec` | `0.003` / `0.4`，过滤近静音窗口和平滑过短换人片段 |
-| `diarization.num_speakers` | `null`；非空时按指定人数聚类，不使用距离阈值选人数 |
-| `diarization.cluster_threshold` | `0.55`，余弦距离阈值；调大倾向合并更多簇，调小倾向分出更多簇 |
-| `llm.base_url` / `model` | DashScope 兼容端点 / `qwen-3.8-flash`，应按实际服务修改 |
-| `llm.api_key_env` | `DASHSCOPE_API_KEY`，从环境变量读取密钥 |
-| `llm.provider` | `openai_compatible`；设 `mock` 可离线联调纪要，不代表关闭本地模型下载 |
-| `llm.retries` | `3`，最大请求次数（含首次）；超时、连接错误、429 和 5xx 才重试。429 优先遵循 `Retry-After`；服务要求等待超过 300 秒时提示稍后重试 |
-| `llm.extra_request` | `{}`，透传请求字段，例如 `{"enable_thinking": false}`，是否支持由服务决定 |
-| `summarizer.strategy` | `auto`，按长度选择 `direct` 或 `map_reduce` |
-
-分离阶段遇到音频读取、依赖、模型或聚类等错误时，会提示原因并降级为单说话人，继续生成转写和纪要。`transcript.json` 的 `diarization_status` 和 `transcript.md` 会记录降级原因；原始转写不受影响，修复问题后可重跑 `diarize` 和纪要。
-
-## 纪要与云端 ASR
-
-纪要默认合并相邻同说话人的文本，不向 prompt 传词级数据；`summarizer.with_timestamps: false` 时不传逐句时间戳。`auto` 根据渲染后的文本长度选择策略：不超过 `direct_threshold_chars`（默认 9000）时直接生成，超过时按 `max_chunk_chars`（默认 4000）分段提炼要点，再合并生成；要点过长时继续压缩要点。
-
-`llm.max_output_tokens` 默认 2000，`temperature` 默认 0.3。接口返回 `finish_reason=length` 时，将该次输出上限加倍重试一次，重试可能产生额外费用，也可能超过服务端的模型限制；两次调用的用量都计入统计。若重试后仍被截断，会保留非空结果并在纪要末尾标为不完整；长会议任一中间摘要截断也会使整份纪要标为不完整。空结果会报错，不会写入或覆盖纪要。接口未报告可识别的结束原因时，完整性标记为无法确认；接口未报告截断也不能保证事实和细节准确，仍需人工核对。
-
-输出记录调用次数和 token 用量，服务端未提供用量时使用估算。配置 `summarizer.price_per_1k_input` / `price_per_1k_output` 后估算费用；实际 token 和费用取决于文本、服务和模型，没有固定节省比例。
-
-DashScope ASR 需设置 `asr.provider: dashscope`、有效的 `dashscope_asr.api_key_env` 和 `--file-url`（或配置 `dashscope_asr.file_url`）。工具不上传本地录音，也不会自动把 `audio.wav` 变成 URL。可对已有本地文件和其已上传的 URL 运行：
-
-```bash
-meetmin run --audio "recordings/meeting.wav" --file-url "https://example.com/meeting.wav" -n cloud
-```
-
-该模式实际转写的是 URL 指向的音频，须保证与本地文件相对应。云端结果已含说话人时，`diarize` 仅映射说话人名称，不提取本地 ECAPA 嵌入。
-
-## 开发、检查与 CI
-
-### 用人工标注评估转写
-
-标注文件用 UTF-8 文本，每段依次写说话人、起始时间 `HH:MM:SS` 和正文。正文可跨多行。评分读取已有 JSON，可用 `asr_raw.json` 看识别效果，或用 `transcript.json` 同时核对说话人。
-
-```powershell
-python scripts/evaluate_transcript.py data/sessions/example/label.txt data/d6/sessions/small-cpu/asr_raw.json --term demosaic --term "DRC Stat"
-```
-
-字符错误率按忽略标点、空白和大小写后的编辑距离计算。术语召回按人工标注中的出现次数计分。说话人归属评分使用 SciPy（随 `diar` 额外依赖安装），按时间重合为预测标签匹配参考标签；标注段落的终点取下一段起点，最后一段取录音结束。归属错误率只统计转写覆盖到的时间，同时报告覆盖秒数以便核对漏转。
-
-### 本地检查
-
-开发环境从仓库根目录安装：
-
-```bash
-python -m pip install -e ".[dev]"
-# 同时开发可选分离功能时使用：python -m pip install -e ".[dev,diar]"
-ruff check .
-ruff format --check .
-mypy
-python -m pytest
-python scripts/smoke_pipeline.py
-```
-
-`ruff format .` 可统一格式。Ruff 检查基础错误、未使用导入和导入顺序；mypy 以 Python 3.12 为类型检查基线，检查 `meetmin/` 与兼容入口 `main.py`，包含未标注函数体，但不要求所有函数完全标注。缺少类型信息的第三方库按配置跳过。pytest 自动收集 `tests/`，替代原来的手动测试 runner；测试需先安装项目。
-
-GitHub Actions（`.github/workflows/ci.yml`）在 push 和 PR 时运行 Ruff、格式检查和 mypy，并在 Linux Python 3.10 / 3.12 / 3.13、Windows Python 3.12 构建 sdist/wheel、安装 wheel、检查仓库目录外的命令入口，再运行离线测试和冒烟。测试阶段设置 Hugging Face 离线模式；安装依赖仍需要网络。CI 不安装 `diar` extra、不下载 Whisper/ECAPA 权重、不调用云端 API，也不验证真实录音设备或 GPU。
-
-离线测试包含真实音频解码和本地 VAD，以及用模拟对象覆盖的设备、显存回退、分离失败恢复和缓存行为。冒烟脚本合成音频，使用假 ASR、单说话人和 mock LLM 跑完整流程，不下载大模型、不访问云端；这些检查不能替代 Windows、GPU 或 ECAPA 实机验证。`scripts/smoke_config.yaml` 另供手动 CLI 冒烟使用（tiny + 关闭分离 + mock），其中真实 Whisper 首次使用仍会下载。
-
-```text
-AI-meeting-tool/
-├── main.py                         # 兼容 python main.py 的薄入口
-├── pyproject.toml                  # 打包、meetmin 命令、extras、检查工具配置
-├── MANIFEST.in                     # 源码分发包含配置、脚本和兼容入口
-├── .github/workflows/ci.yml        # lint、类型检查、构建及离线测试
-├── config.yaml                     # 用户配置，覆盖内置默认值
-├── requirements.txt                # 核心兼容版本范围
-├── requirements-optional.txt       # 旧安装命令兼容入口，引用 .[diar]
-├── requirements-win-py312.lock     # Windows / Python 3.12 核心固定版本
-├── meetmin/
-│   ├── cli.py                      # 所有子命令实现，meetmin 命令入口
-│   ├── __main__.py                 # python -m meetmin 入口
-│   ├── config.py                   # 默认配置与加载
-│   ├── doctor.py                   # 预检与 GPU 探测
-│   ├── pipeline.py                 # 转写保存、独立分离、纪要编排
-│   ├── session.py                  # 会话命名与 JSON 原子写入
-│   ├── audio/                      # WASAPI 录音、电平统计、解码与重采样
-│   ├── asr/                        # faster-whisper 和 DashScope provider
-│   ├── diarization/                # ECAPA 嵌入缓存、聚类、词级对齐
-│   └── summarizer/                 # OpenAI 兼容客户端、mock 与纪要策略
-├── scripts/smoke_pipeline.py       # 假 ASR + mock LLM 的离线冒烟
-├── scripts/smoke_config.yaml       # 手动 CLI 冒烟配置
-├── scripts/sandbox_fix/            # 受限沙箱安装兼容处理
-└── tests/                         # 离线行为及安装后 CLI 测试
-```
-
-扩展时可分别实现 `ASRProvider`（返回 `ASRResult`）、`Diarizer`（返回带 `start/end/label` 的时间段）或 `BaseLLM.chat()`，在对应工厂中注册。纪要提示词位于 `meetmin/summarizer/prompts.py`。
-
-## 已知限制
-
-- **本地麦克风**：默认只录电脑输出，本人发言需用 `--mic` 录入。双轨外放时会受串音影响，建议会前用耳机试录。
-- **多人重叠发言**：窗口聚类并非重叠语音分离，换人和同时说话的场景可能误判。可调整分离参数后重跑 `diarize`。
-- **人工校对**：`transcript.md` 只用于查看；`summarize` 读取 `transcript.json`，修改 Markdown 不会改变纪要输入。人工修订 JSON 后可重跑纪要，再次运行 `diarize` 会重建该 JSON。
-- **缓存与下载**：缓存检测是启发式检查，路径和文件存在不代表完整可用。模型可用性应通过会前短音频实跑确认。
-- **控制台中文乱码**：PowerShell 可尝试 `$env:PYTHONIOENCODING='utf-8'` 或使用 Windows Terminal。
-
-## 后续方向
-
-- 外放时的双轨串音抑制
-- 分段滚动转写与近实时纪要
-- 说话人声纹注册及跨会议复用
-- GUI / 系统托盘入口
+[开发与构建](doc/development.md) · [技术参考](doc/technical-reference.md)
