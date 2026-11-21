@@ -789,9 +789,10 @@ def test_ecapa_speech_spans_chunking_and_variable_length_embedding():
         return out
 
     diarizer._embed = Mock(side_effect=fake_embed)
+    diarizer._cluster = lambda e: np.zeros(len(e), dtype=int)
     audio = np.ones(16000 * 8, dtype=np.float32) * 0.1
     # (0, 2.0) 和 (2.2, 4.0) 间隔 0.2s <= 0.3s 应合并成 4.0s 并均分为两段 2.0s；
-    # (5.5, 6.3) 长度 0.8s < 1.2s 应被标为非核心段，不参与主聚类但通过质心重分配获得标签
+    # (5.5, 6.3) 长度 0.8s < 1.2s 应被标为非核心段，但同样提取嵌入并参与输出
     with _TmpDir() as td:
         cache = Path(td) / "embeddings.npz"
         segs = diarizer.diarize(
@@ -815,7 +816,37 @@ def test_ecapa_speech_spans_chunking_and_variable_length_embedding():
         assert diarizer._embed.call_count == 1
 
 
+def test_ecapa_centroid_reassignment_and_knn_outlier_filter_without_sklearn():
+    from meetmin.diarization.ecapa_speechbrain import (
+        _filter_knn_outliers,
+        _reassign_by_centroids,
+    )
+
+    spk_a = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (4, 1))
+    spk_b = np.tile(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32), (4, 1))
+    outlier = np.array([[0.0, 0.0, 1.0, 0.0]], dtype=np.float32)
+    short_b = np.array([[0.1, 0.995, 0.0, 0.0]], dtype=np.float32)
+    emb = np.vstack([spk_a, spk_b, outlier, short_b])
+    inliers = _filter_knn_outliers(emb[:9], min_keep=2)
+    assert list(inliers) == list(range(8))
+
+    core_idx = np.arange(9, dtype=int)
+    core_labels = np.array([0, 0, 0, 0, 1, 1, 1, 1, 2], dtype=int)
+    durations = np.array([2.0] * 8 + [1.5, 0.8])
+    reassigned = _reassign_by_centroids(
+        emb,
+        core_idx,
+        core_labels,
+        durations,
+        min_cluster_size=3,
+        min_cluster_sec=4.0,
+    )
+    assert set(reassigned.tolist()) == {0, 1}
+    assert reassigned[9] == 1
+
+
 def test_ecapa_min_cluster_filter_and_centroid_reassignment():
+    pytest.importorskip("sklearn")
     from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
     diarizer = object.__new__(EcapaSpeechbrainDiarizer)
@@ -844,6 +875,7 @@ def test_ecapa_min_cluster_filter_and_centroid_reassignment():
 
 
 def test_ecapa_fixed_num_speakers_resists_outliers():
+    pytest.importorskip("sklearn")
     from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
     diarizer = object.__new__(EcapaSpeechbrainDiarizer)
@@ -860,7 +892,9 @@ def test_ecapa_fixed_num_speakers_resists_outliers():
         [[0.0, 0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 1.0, 0.0]], dtype=np.float32
     )
     emb = np.vstack([*groups, outliers])
-    labels = diarizer._cluster(emb, core_mask=np.ones(len(emb), dtype=bool), durations=np.full(len(emb), 2.0))
+    labels = diarizer._cluster(
+        emb, core_mask=np.ones(len(emb), dtype=bool), durations=np.full(len(emb), 2.0)
+    )
     # 3 位真实说话人必须被完整分成 3 个互不相同的簇，不能被离群点占坑
     assert len(set(labels[:18].tolist())) == 3
     assert len(set(labels[0:6].tolist())) == 1
@@ -869,6 +903,7 @@ def test_ecapa_fixed_num_speakers_resists_outliers():
 
 
 def test_ecapa_spectral_clustering_auto_and_fixed():
+    pytest.importorskip("sklearn")
     from meetmin.diarization.ecapa_speechbrain import EcapaSpeechbrainDiarizer
 
     rng = np.random.default_rng(11)
@@ -889,7 +924,9 @@ def test_ecapa_spectral_clustering_auto_and_fixed():
             "min_cluster_size": 2,
             "min_cluster_sec": 4.0,
         }
-        labels = diarizer._cluster(emb, core_mask=np.ones(len(emb), dtype=bool), durations=durations)
+        labels = diarizer._cluster(
+            emb, core_mask=np.ones(len(emb), dtype=bool), durations=durations
+        )
         assert len(set(labels.tolist())) == 2
         assert len(set(labels[:8].tolist())) == 1
         assert len(set(labels[8:].tolist())) == 1
@@ -922,7 +959,6 @@ def test_align_speaker_at_point_prefers_nearest_center_on_overlap():
     ]
     assert speaker_at_point(0.9, segments) == 0  # 距 0.75 更近
     assert speaker_at_point(1.4, segments) == 1  # 距 1.50 更近（修复旧逻辑总返回 0 的偏置）
-
 
 
 # ---------------- config / session ----------------

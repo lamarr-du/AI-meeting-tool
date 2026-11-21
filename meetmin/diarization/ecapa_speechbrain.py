@@ -186,9 +186,7 @@ def _reassign_by_centroids(
         kept = stats[:keep_top_k]
     else:
         kept = [
-            item
-            for item in stats
-            if item[1] >= min_cluster_size and item[2] >= min_cluster_sec
+            item for item in stats if item[1] >= min_cluster_size and item[2] >= min_cluster_sec
         ]
         if not kept:
             stats.sort(key=lambda item: (item[2], item[1]), reverse=True)
@@ -468,7 +466,9 @@ class EcapaSpeechbrainDiarizer(Diarizer):
         else:
             labels = self._cluster(emb, core_mask=core_mask, durations=durations)
 
-        seg_merge_gap = max(hop_sec, merge_gap_sec) if mode == "sliding" else max(merge_gap_sec, 0.5)
+        seg_merge_gap = (
+            max(hop_sec, merge_gap_sec) if mode == "sliding" else max(merge_gap_sec, 0.5)
+        )
         return _merge_non_overlapping(starts, ends, labels, merge_gap_sec=seg_merge_gap)
 
     # ------------------------------------------------------------------
