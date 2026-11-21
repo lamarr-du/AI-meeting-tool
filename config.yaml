@@ -8,8 +8,8 @@ model_cache_dir: null
 
 recorder:
   device: null        # 内录设备索引或名称片段；null = 默认输出设备的 loopback（python main.py devices 查看）
-  channels: null
-  sample_rate: null
+  channels: null      # 电脑内录采集声道数，null = 跟随设备；保存固定为单声道
+  sample_rate: null   # 电脑内录采集采样率，null = 跟随设备；保存固定为 16 kHz
   microphone: false   # true = 同时录麦克风；临时启用可加 --mic
   microphone_device: null  # null = 默认 WASAPI 输入，也可填 devices 列出的麦克风索引
   silence_threshold: 0.003  # 归一化 RMS；低于此值连续 30 秒告警

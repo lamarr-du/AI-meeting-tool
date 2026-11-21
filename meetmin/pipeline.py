@@ -68,6 +68,8 @@ class Pipeline:
             "silence_threshold": float(rcfg.get("silence_threshold", 0.003)),
             "segment_seconds": float(rcfg.get("segment_seconds", 300)),
             "sync_seconds": float(rcfg.get("sync_seconds", 10)),
+            "output_sample_rate": 16000,
+            "output_channels": 1,
         }
         loopback = LoopbackRecorder(
             device=rcfg.get("device"),

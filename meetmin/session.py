@@ -1,7 +1,7 @@
 """一次会议 = 一个会话目录：data/sessions/<session_id>/。
 
 产物：
-  audio.wav        内录原始存档（设备原生采样率）
+  audio.wav        内录存档（16 kHz 单声道 16-bit PCM WAV）
   recording.json  双轨录音指向包含 audio.wav 与 microphone.wav 的同一批次
   asr_raw.json     原始转写（含词级时间戳与模型参数）
   embeddings.npz   ECAPA 窗口声纹嵌入及时间信息
