@@ -18,10 +18,15 @@ def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
 
 
 def speaker_at_point(t: float, segments: list[dict]):
+    best_label = None
+    best_dist = float("inf")
     for s in segments:
         if s["start"] <= t <= s["end"]:
-            return s["label"]
-    return None
+            dist = abs((s["start"] + s["end"]) / 2.0 - t)
+            if dist < best_dist:
+                best_dist = dist
+                best_label = s["label"]
+    return best_label
 
 
 def majority_label(start: float, end: float, segments: list[dict]):

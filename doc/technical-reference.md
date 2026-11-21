@@ -89,9 +89,9 @@ meetmin diarize -n weekly-20261113-090000123456-ab12
 meetmin summarize -n weekly-20261113-090000123456-ab12
 ```
 
-修改 `config.yaml` 中的 `cluster_threshold`、`num_speakers` 或 `min_group_sec` 后，同样只需重跑分离和纪要。原始转写不会被分离过程修改；失败的重跑不会自动清除上次已有的输出，须确认命令成功后再使用结果。
+修改 `config.yaml` 中的 `cluster_threshold`、`num_speakers`、`cluster_method`、`min_active_ratio`、`min_cluster_size`、`min_cluster_sec` 或 `min_group_sec` 后，同样只需重跑分离和纪要。原始转写不会被分离过程修改；失败的重跑不会自动清除上次已有的输出，须确认命令成功后再使用结果。
 
-`embeddings.npz` 包含归一化的 `embeddings`、窗口起止采样点 `starts` / `ends` 和 JSON 字符串 `metadata`（采样率、模型、窗口参数、语音区间与音频指纹）。可用 `numpy.load(path, allow_pickle=False)` 读取，作为后续声纹注册的数据基础；当前尚无声纹注册命令。音频、语音区间、窗口及能量阈值一致时复用嵌入；改变这些输入或删除文件会重新提取。仅改聚类/对齐参数不会重新提取。
+`embeddings.npz` 包含归一化的 `embeddings`、窗口起止采样点 `starts` / `ends` 和 JSON 字符串 `metadata`（采样率、模型、切窗模式、窗口参数、语音区间与音频指纹）。可用 `numpy.load(path, allow_pickle=False)` 读取，作为后续声纹注册的数据基础；当前尚无声纹注册命令。音频、语音区间、切窗模式、窗口参数及最低能量阈值一致时复用嵌入；改变这些输入或删除文件会重新提取。仅改活跃度筛选、聚类或对齐参数不会重新提取。
 
 本地 ECAPA 重跑仍需要原始音频，外部音频请保留在记录的绝对路径。Whisper 保留 `asr.word_timestamps: true` 才会请求词级数据；当前 DashScope 实现只解析句级数据。旧会话没有 `asr_raw.json` 时，需重新转写一次才能独立分离；已有 `transcript.json` 仍可用于生成纪要。
 
@@ -139,10 +139,13 @@ asr:
 | `asr.glossary` | `path` 启用识别前提示，可用 `terms` 指定优先词条。`correction_path` 启用识别后纠错。两个路径默认均为 `null` |
 | `asr.hf_endpoint` / `hf_disable_xet` | `null` / `true`，控制 Whisper 下载设置 |
 | `diarization.enabled` / `provider` | `true` / `ecapa_speechbrain`；本地转写时设 `enabled: false` 标记为“全体”，设 `provider: single` 使用单说话人；云端已有说话人时优先保留并映射名称 |
-| `diarization.window_sec` / `hop_sec` | `1.5` / `0.75`，声纹窗口和步长 |
-| `diarization.min_window_rms` / `min_group_sec` | `0.003` / `0.4`，过滤近静音窗口和平滑过短换人片段 |
-| `diarization.num_speakers` | `null`；非空时按指定人数聚类，不使用距离阈值选人数 |
-| `diarization.cluster_threshold` | `0.55`，余弦距离阈值；调大倾向合并更多簇，调小倾向分出更多簇 |
+| `diarization.window_mode` | `speech_spans`（默认，合并短停顿的 ASR 语音段并均分超长段，无 `speech_spans` 时自动退化为 `sliding`）；也可显式设为 `sliding` |
+| `diarization.window_sec` / `hop_sec` | `2.5` / `1.25`；`speech_spans` 模式下 `window_sec` 为长段切分上限，`sliding` 模式下为窗长与步长 |
+| `diarization.min_window_rms` / `min_active_ratio` | `0.003` / `0.45`；过滤近静音窗口，并将 20ms 帧活跃占比不足的窗口排除出主聚类（仅参与质心重分配） |
+| `diarization.min_cluster_size` / `min_cluster_sec` | `2` / `4.0`；自动人数模式下主簇最少核心段数与累计时长（秒），不达标小簇将重分配到最近主簇 |
+| `diarization.num_speakers` | `null`；非空时按指定人数聚类（默认 kNN 离群预筛 + Ward），不使用距离阈值选人数 |
+| `diarization.cluster_method` / `cluster_threshold` | `auto` / `0.64`；`auto` 在自动人数时用 `average`、指定人数时用 `ward`，也可选 `average` / `ward` / `spectral`；阈值调大倾向合并、调小倾向拆分 |
+| `diarization.min_group_sec` | `0.4`，对齐阶段平滑过短换人片段 |
 | `llm.base_url` / `model` | DashScope 兼容端点 / `qwen-3.8-flash`，应按实际服务修改 |
 | `llm.api_key_env` | `DASHSCOPE_API_KEY`，从环境变量读取密钥 |
 | `llm.provider` | `openai_compatible`；设 `mock` 可离线联调纪要，不代表关闭本地模型下载 |
