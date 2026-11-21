@@ -7,9 +7,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .cuda import CudaStatus
+
 MiB = 1024**2
 _CUDA_HEADROOM_MIB = 256
-_CUDA_BUDGET_MIB = 3072
 _TURBO = "large-v3-turbo"
 
 
@@ -61,7 +62,7 @@ def select_profile(
     config: dict,
     *,
     memory: tuple[int, int] | None,
-    gpu: tuple[str, int, int, list[str]] | None,
+    gpu: CudaStatus | None,
 ) -> AsrProfile:
     requested = config.get("profile", "auto")
     if requested not in ("auto", "cpu_light", "cpu_standard", "gpu_standard"):
@@ -80,30 +81,39 @@ def select_profile(
     cpu_profile = "cpu_standard" if standard_cpu else "cpu_light"
     cpu_model = model or (_TURBO if standard_cpu else "small")
 
-    reason = "按可用内存选择 CPU 档位"
+    gpu_model = model or _TURBO
+    configured_cpu = device == "cpu" or requested in ("cpu_light", "cpu_standard")
     if device == "cuda":
         reason = "显式指定 CUDA"
-    elif device == "cpu" or requested in ("cpu_light", "cpu_standard"):
+    elif configured_cpu:
         reason = "配置指定 CPU"
-    elif not gpu or gpu[3]:
-        reason = "未找到 CUDA 设备或运行库"
-    elif peak is None:
-        reason = "尚未配置目标模型的实测 CUDA 峰值"
-    elif peak > _CUDA_BUDGET_MIB or min(gpu[1], gpu[2]) < peak + _CUDA_HEADROOM_MIB:
-        reason = "实测峰值或当前空闲显存超出选档条件"
+    elif gpu is None or gpu.reason is not None:
+        reason = gpu.reason if gpu and gpu.reason else "未检测到 CUDA 设备"
+    elif peak is not None and gpu.memory is not None and gpu.memory[1] < peak + _CUDA_HEADROOM_MIB:
+        reason = (
+            f"{gpu_model} 预计需要 {peak + _CUDA_HEADROOM_MIB} MiB（含余量），"
+            f"当前空闲 {gpu.memory[1]} MiB"
+        )
+        if not model:
+            device, gpu_model = "cuda", "small"
     else:
         device = "cuda"
-        reason = "实测峰值与空闲显存符合选档条件"
+        reason = (
+            "CUDA 可用，实测峰值与空闲显存符合选档条件"
+            if peak is not None and gpu.memory is not None
+            else "CUDA 可用，尝试首选模型"
+        )
     if device == "cuda":
         return AsrProfile(
             requested,
             "gpu_standard",
-            model or _TURBO,
+            gpu_model,
             "cuda",
             compute or "int8_float16",
             cpu_model,
             reason,
         )
-    return AsrProfile(
-        requested, cpu_profile, cpu_model, "cpu", compute or "int8", cpu_model, reason
-    )
+    cpu_compute = compute or "int8"
+    if not configured_cpu and cpu_compute in ("float16", "int8_float16"):
+        cpu_compute = "int8"
+    return AsrProfile(requested, cpu_profile, cpu_model, "cpu", cpu_compute, cpu_model, reason)

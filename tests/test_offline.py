@@ -120,6 +120,7 @@ def test_whisper_gpu_oom_retries_cpu():
     from types import ModuleType, SimpleNamespace
     from unittest.mock import patch
 
+    from meetmin.asr.cuda import CudaStatus
     from meetmin.asr.faster_whisper_asr import FasterWhisperASR
 
     calls = []
@@ -143,7 +144,7 @@ def test_whisper_gpu_oom_retries_cpu():
     module.WhisperModel = FakeModel
     with (
         patch.dict(sys.modules, {"faster_whisper": module}),
-        patch("meetmin.doctor.gpu_status", return_value=("GPU", 8192, 8192, [])),
+        patch("meetmin.doctor.gpu_status", return_value=CudaStatus(memory=("GPU", 8192, 8192))),
     ):
         asr = FasterWhisperASR({"device": "auto", "model_size": "small", "cuda_peak_mib": 2400})
         assert asr.transcribe(np.zeros(16000, dtype=np.float32)).utterances == []

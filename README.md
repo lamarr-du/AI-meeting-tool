@@ -72,6 +72,8 @@ python -m pip install ".[gui]" "PyInstaller>=6,<7"
 python scripts/build_desktop.py
 ```
 
+构建默认包含 CUDA 12 和 cuDNN 9 运行库。脚本可从当前 Python 环境的 CUDA 版 PyTorch 中取 DLL，也支持通过 `--cuda-dir <目录>` 提供同一套运行库。从源码运行时，可用环境变量 `MEETMIN_CUDA_DLL_DIR` 指定 DLL 目录。仅构建 CPU 便携包时使用 `--cpu-only`。CUDA 仍需要机器上的 NVIDIA 驱动。
+
 双击 `dist/desktop/MeetMin/MeetMin.exe` 启动，复制到另一台电脑时请携带整个 `MeetMin` 文件夹。便携版包含 Python 和 Qt 运行时，Whisper 权重在首次使用时下载或读取已有缓存。便携版采用单说话人分组，双轨录音中的麦克风发言仍标记为「我」。
 
 ## 快速开始
@@ -214,7 +216,7 @@ Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装
 | Whisper 缓存 | 检查本地目录或推测的 Hugging Face 缓存中的 `model.bin`；未找到仅提示，不能保证模型完整 |
 | 声纹模型及可选依赖 | 检查缓存目录是否非空及能否找到 `torch`、`speechbrain`、`sklearn`；给出提示，不试加载模型 |
 | API Key | 检查指定环境变量是否存在；LLM Key 缺失只提示，DashScope ASR Key 或音频 URL 缺失则退出 |
-| GPU | 通过 `nvidia-smi` 查询第一张 NVIDIA GPU 的空闲/总显存，并尝试加载 CUDA/cuDNN 库；不能保证推理成功 |
+| GPU | 通过 CTranslate2 检查 CUDA 设备和计算类型，尝试加载 CUDA/cuDNN 库，并在可对应到当前设备时用 `nvidia-smi` 查询空闲显存 |
 | 磁盘 | 报告输出目录所在磁盘的剩余空间，不做容量预算或写入测试 |
 
 预检不会验证 API Key 有效性、云端模型名或 URL 可达性。未缓存的模型仍可能在录音结束后才开始下载；建议会前用短音频完成一次 `transcribe` 和 `diarize`。`transcribe`、`diarize`、`summarize` 单独运行时不自动执行 doctor。
@@ -227,11 +229,11 @@ Windows 实机验收可运行 `python scripts/check_recording.py`（需先安装
 |---|---|---|
 | `cpu_light` | `small` / int8 | 自动分配时，总内存不足 15 GiB、可用内存不足 6 GiB，或内存探测不可用 |
 | `cpu_standard` | `large-v3-turbo` / int8 | 自动分配时总内存至少 15 GiB 且可用内存至少 6 GiB |
-| `gpu_standard` | `large-v3-turbo` / int8_float16 | CUDA 运行库可加载，已配置目标机器上同一模型和解码配置的 `cuda_peak_mib` 实测峰值，峰值最多 3072 MiB，且当前空闲显存至少比峰值多 256 MiB |
+| `gpu_standard` | `large-v3-turbo` / int8_float16 | CUDA 检查通过时优先尝试；配置了 `cuda_peak_mib` 且能读取空闲显存时，预留 256 MiB 余量 |
 
-可用 `profile: cpu_light` 固定省内存的 CPU 档，或用 `profile: cpu_standard` 固定精度优先的 CPU 档。显式模型、设备和计算类型覆盖档位默认值。显式 `device: cuda` 直接使用 CUDA，由使用者负责显存预算；自动档使用已测峰值作选档依据，运行时占用仍会随配置、录音和其他进程变化。
+可用 `profile: cpu_light` 固定省内存的 CPU 档，或用 `profile: cpu_standard` 固定精度优先的 CPU 档。显式 `device: cuda` 直接尝试指定档位。自动档可用 `cuda_peak_mib` 预判显存，填入目标模型从加载到完成转写相对启动前的显存峰值增量。未配置峰值或无法读取空闲显存时直接尝试首选档位。
 
-CUDA 加载或主转写遇到显存不足时释放原模型并回退 CPU int8。显式指定模型时沿用该模型，自动搭配模型时按内存选择 CPU 回退模型。输出记录实际模型、设备、精度和回退状态。单轨或双轨转写结束后释放 Whisper，ECAPA 分离在 CPU 上执行。
+自动搭配模型时，如果 Turbo 的实测峰值超出当前显存预算，或加载、转写时遇到显存不足，则尝试 Small CUDA。Small 也遇到显存不足，或 CUDA 运行库、设备无法使用时，自动档切换到 CPU int8。显式指定模型时 CPU 回退沿用该模型。桌面处理日志和 `asr_raw.json` 按音轨记录实际模型、设备、精度和降级原因。单轨或双轨转写结束后释放 Whisper，ECAPA 分离在 CPU 上执行。
 
 Windows 的当前 CUDA 路径需要可加载的 CUDA 12 cuBLAS 和 cuDNN 9 库，预检会列出缺失项。[faster-whisper 安装说明](https://github.com/SYSTRAN/faster-whisper#gpu)
 

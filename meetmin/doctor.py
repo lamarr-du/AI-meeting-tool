@@ -2,50 +2,13 @@
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
 import importlib.util
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
+from .asr.cuda import gpu_status as gpu_status
 from .asr.profile import memory_status, select_profile
-
-
-def gpu_status():
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.free,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        name, free_text, total_text = [
-            x.strip() for x in result.stdout.splitlines()[0].split(",")[:3]
-        ]
-        free, total = int(free_text), int(total_text)
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return None
-    # DLL/SO 加载可检出缺失及间接依赖，但无法保证推理一定成功。
-    libraries = [
-        ("cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll")
-        if os.name == "nt"
-        else ("libcublas.so.12", "libcublasLt.so.12", "libcudnn.so.9")
-    ][0]
-    missing = []
-    for lib in libraries:
-        try:
-            ctypes.CDLL(lib)
-        except OSError:
-            missing.append(lib)
-    return name, free, total, missing
 
 
 def _model_cached(model):
@@ -103,7 +66,7 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
             if importlib.util.find_spec(mod) is None:
                 print(f"  错误：缺少 {mod}；请安装 requirements.txt")
                 ok = False
-        gpu = gpu_status()
+        gpu = gpu_status(asr.get("compute_type") or "int8_float16")
         memory = memory_status()
         if memory:
             print(f"  内存：可用 {memory[1] / 1024:.1f} GiB / 总计 {memory[0] / 1024:.1f} GiB")
@@ -124,21 +87,11 @@ def run_doctor(cfg, *, recording=True, device=None, file_url=None, check_asr=Tru
                 fallback = profile.cpu_fallback_model
                 if not _model_cached(fallback):
                     print(f"  CPU 回退模型 {fallback} 未检测到缓存，请提前准备。")
-        if gpu:
-            name, free, total, missing = gpu
+        if gpu is not None and gpu.memory is not None:
+            name, free, total = gpu.memory
             print(f"  GPU：{name}，空闲 {free} MiB / 总计 {total} MiB")
-            if missing:
-                print(
-                    "  CUDA 运行库无法加载："
-                    + ", ".join(missing)
-                    + "；Windows 需要 CUDA 12 和 cuDNN 9，建议使用 CPU int8"
-                )
-            else:
-                print(
-                    "  CUDA 库已加载；实际推理仍需验证。建议显存充足时使用 int8_float16，不启用批量推理。"
-                )
-        else:
-            print("  未检测到 NVIDIA GPU；CPU int8 可用（速度取决于机器和模型）。")
+        if gpu is not None:
+            print(f"  CUDA：{gpu.reason or '设备和运行库检查通过，实际推理仍需验证。'}")
     elif asr_provider == "dashscope":
         dc = cfg.get("dashscope_asr", {}) or {}
         if not (file_url or dc.get("file_url")):

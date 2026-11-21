@@ -145,11 +145,24 @@ class Pipeline:
                 duration = audio_duration(path) if path.exists() else 0.0
             return result, duration
 
+        def report_track(result: ASRResult) -> None:
+            extra = result.extra
+            if profile := extra.get("profile"):
+                self.progress(f"  选档：{profile['reason']}")
+            for fallback in extra.get("fallbacks", []):
+                self.progress(f"  ! {fallback['from']} → {fallback['to']}（{fallback['reason']}）")
+            if device := extra.get("effective_device"):
+                self.progress(
+                    f"  实际转写：{extra['asr_model']} · {device.upper()} · "
+                    f"{extra['effective_compute_type']}"
+                )
+
         provider_name = provider.name
         try:
             if on_asr_ready is not None:
                 on_asr_ready()
             result, duration = transcribe_track(audio, file_url)
+            report_track(result)
             utterances = [u for u in result.utterances if u.text.strip()]
             self.progress(
                 f"  {provider_name} 完成：{len(utterances)} 句，耗时 {time.time() - t0:.0f}s"
@@ -157,6 +170,7 @@ class Pipeline:
             if microphone is not None:
                 self.progress(f"[2a] 转写麦克风：{microphone}")
                 mic_result, mic_duration = transcribe_track(microphone)
+                report_track(mic_result)
         finally:
             close = getattr(provider, "close", None)
             if close is not None:
