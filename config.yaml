@@ -12,6 +12,7 @@ recorder:
   sample_rate: null   # 电脑内录采集采样率，null = 跟随设备；保存固定为 16 kHz
   microphone: false   # true = 同时录麦克风；临时启用可加 --mic
   microphone_device: null  # null = 默认 WASAPI 输入，也可填 devices 列出的麦克风索引
+  target_rms: 0.03          # 自适应增益目标 RMS（0.001–0.3）
   silence_threshold: 0.003  # 归一化 RMS；低于此值连续 30 秒告警
   segment_seconds: 300      # 分段长度（秒）
   sync_seconds: 10          # 活动分段同步磁盘的间隔（秒）

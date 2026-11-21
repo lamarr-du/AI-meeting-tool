@@ -9,6 +9,102 @@ from meetmin.gui import workflow
 from meetmin.pipeline import Pipeline
 
 
+def test_target_rms_settings_controls_and_save(tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from meetmin.config import DEFAULT_CONFIG, deep_merge
+    from meetmin.gui import app
+    from meetmin.gui.settings import SettingsDialog
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    cfg = deep_merge(DEFAULT_CONFIG, {"output_dir": str(tmp_path)})
+    dialog = SettingsDialog(cfg, "")
+    dialog.target_slider.setValue(87)
+    assert dialog.target_rms.value() == pytest.approx(0.087)
+    dialog.target_rms.setValue(0.123)
+    assert dialog.target_slider.value() == 123
+    next(
+        button for button in dialog.findChildren(QPushButton) if button.text() == "恢复默认值"
+    ).click()
+    assert dialog.target_rms.value() == pytest.approx(0.03)
+    dialog.target_rms.setValue(0.08)
+    monkeypatch.setattr(app.MeetingWindow, "refresh_devices", lambda self: None)
+    monkeypatch.setattr(app, "SettingsDialog", lambda *args: dialog)
+    monkeypatch.setattr(dialog, "exec", lambda: 1)
+    settings_path = str(tmp_path / "settings.ini")
+    settings = QSettings(settings_path, QSettings.Format.IniFormat)
+    window = app.MeetingWindow(cfg, settings)
+    try:
+        window.show_settings()
+        settings.sync()
+        assert cfg["recorder"]["target_rms"] == pytest.approx(0.08)
+        restored = QSettings(settings_path, QSettings.Format.IniFormat)
+        assert restored.value("target_rms", type=float) == pytest.approx(0.08)
+        assert Pipeline(cfg).recorder().target_rms == pytest.approx(0.08)
+    finally:
+        window.close()
+        dialog.close()
+        application.processEvents()
+
+
+def test_history_rename_and_delete(tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QSettings, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from meetmin.config import DEFAULT_CONFIG, deep_merge
+    from meetmin.gui import app
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(app.MeetingWindow, "refresh_devices", lambda self: None)
+    cfg = deep_merge(DEFAULT_CONFIG, {"output_dir": str(tmp_path)})
+    first = Pipeline(cfg).new_session("first")
+    first.save_json("meeting.json", {"title": "原名称", "extra": 42})
+    first.audio_path.write_bytes(b"audio")
+    second = Pipeline(cfg).new_session("second")
+    window = app.MeetingWindow(
+        cfg, QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    )
+    window.refresh_history(second)
+    try:
+        window.show()
+        application.processEvents()
+        item = window.sessions.item(0)
+        QTest.mouseMove(window.sessions.viewport(), window.sessions.visualItemRect(item).center())
+        application.processEvents()
+        assert window.sessions.button.isVisible()
+        assert window.sessions.session_id == item.data(Qt.ItemDataRole.UserRole)
+        monkeypatch.setattr(app.QInputDialog, "getText", lambda *a, **k: (" 新名称 ", True))
+        window.history_action(first.session_id, "rename")
+        assert workflow.metadata(first) == {"title": "新名称", "extra": 42}
+        assert first.audio_path.read_bytes() == b"audio"
+        assert window.session.session_id == second.session_id
+
+        monkeypatch.setattr(app.QInputDialog, "getText", lambda *a, **k: ("   ", True))
+        monkeypatch.setattr(app.QMessageBox, "warning", lambda *a, **k: None)
+        window.history_action(first.session_id, "rename")
+        assert workflow.metadata(first)["title"] == "新名称"
+
+        monkeypatch.setattr(app.QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+        window.history_action(first.session_id, "delete")
+        assert first.root.exists()
+        monkeypatch.setattr(app.QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+        window.history_action(first.session_id, "delete")
+        assert not first.root.exists()
+        assert window.session.session_id == second.session_id
+        window.history_action(second.session_id, "delete")
+        assert window.session is None
+        assert window.sessions.count() == 0
+    finally:
+        window.close()
+        application.processEvents()
+
+
 def test_imported_audio_remains_available_after_original_moves(tmp_path):
     session = Pipeline({"output_dir": str(tmp_path / "data")}).new_session("计划会议")
     session.save_json("meeting.json", {"title": "计划会议"})

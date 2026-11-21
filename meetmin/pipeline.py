@@ -25,6 +25,7 @@ from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
 from .audio.segments import SessionLock
 from .audio.session_recorder import SessionRecorder
+from .config import DEFAULT_TARGET_RMS
 from .diarization.align import UNKNOWN_NAME, assign_speakers, relabel
 from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
@@ -76,6 +77,7 @@ class Pipeline:
             "silence_threshold": float(rcfg.get("silence_threshold", 0.003)),
             "segment_seconds": float(rcfg.get("segment_seconds", 300)),
             "sync_seconds": float(rcfg.get("sync_seconds", 10)),
+            "target_rms": float(rcfg.get("target_rms", DEFAULT_TARGET_RMS)),
             "output_sample_rate": 16000,
             "output_channels": 1,
         }

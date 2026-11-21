@@ -15,6 +15,30 @@ from meetmin.pipeline import Pipeline
 from meetmin.session import Session
 
 
+@pytest.mark.parametrize(
+    "recorder_class,info",
+    [(LoopbackRecorder, {"isLoopbackDevice": True}), (MicrophoneRecorder, {})],
+)
+def test_configured_target_rms_changes_recorded_level(recorder_class, info):
+    samples = np.full(1600, 0.01, dtype="<f4")
+    outputs = []
+    for target in (0.03, 0.09):
+        recorder = recorder_class(target_rms=target)
+        control = recorder._create_level_control(16000, info)
+        output = np.frombuffer(control.to_pcm(samples.tobytes(), len(samples)), dtype="<i2")
+        outputs.append(float(np.mean(output)) / 32768)
+    assert outputs == pytest.approx([0.03, 0.09], abs=0.0001)
+
+
+def test_pipeline_passes_target_to_both_tracks():
+    recorder = Pipeline({"recorder": {"target_rms": 0.08, "microphone": True}}).recorder(
+        for_session=True
+    )
+    assert [track.target_rms for track in recorder._recorders] == [0.08, 0.08]
+    with pytest.raises(ValueError, match="target_rms"):
+        LoopbackRecorder(target_rms=0.5)
+
+
 class Clock:
     value = 10.0
 

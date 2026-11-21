@@ -8,6 +8,10 @@ from typing import Any
 
 import yaml
 
+DEFAULT_TARGET_RMS = 0.03
+MIN_TARGET_RMS = 0.001
+MAX_TARGET_RMS = 0.3
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "output_dir": "data",  # 会话产物目录：<output_dir>/sessions/<session_id>/
     "model_cache_dir": None,  # 默认工程或独立便携版目录下的 .cache
@@ -17,6 +21,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "sample_rate": None,  # null=跟随设备默认采样率
         "microphone": False,
         "microphone_device": None,  # null=默认 WASAPI 输入
+        "target_rms": DEFAULT_TARGET_RMS,  # 录音自适应增益目标电平
         "chunk_ms": 100,  # 每次读取的块长（毫秒）
         "segment_seconds": 300,  # 单个录音分段时长
         "sync_seconds": 10,  # 活动分段的磁盘同步间隔

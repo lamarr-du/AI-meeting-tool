@@ -4,9 +4,11 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -14,7 +16,10 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSlider,
 )
+
+from ..config import DEFAULT_TARGET_RMS, MAX_TARGET_RMS, MIN_TARGET_RMS
 
 
 class SettingsDialog(QDialog):
@@ -27,6 +32,31 @@ class SettingsDialog(QDialog):
         self.model = QLineEdit(cfg["llm"].get("model", ""))
         self.key = QLineEdit(api_key)
         self.key.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self.target_rms = QDoubleSpinBox()
+        self.target_rms.setAccessibleName("录音目标电平")
+        self.target_rms.setDecimals(3)
+        self.target_rms.setRange(MIN_TARGET_RMS, MAX_TARGET_RMS)
+        self.target_rms.setSingleStep(0.001)
+        self.target_rms.setValue(cfg["recorder"].get("target_rms", DEFAULT_TARGET_RMS))
+        self.target_slider = QSlider(Qt.Orientation.Horizontal)
+        self.target_slider.setAccessibleName("录音目标电平滑块")
+        self.target_slider.setRange(1, 300)
+        self.target_slider.setValue(round(self.target_rms.value() * 1000))
+        self.target_slider.valueChanged.connect(
+            lambda value: self.target_rms.setValue(value / 1000)
+        )
+        self.target_rms.valueChanged.connect(
+            lambda value: self.target_slider.setValue(round(value * 1000))
+        )
+        target = QHBoxLayout()
+        target.addWidget(self.target_slider, 1)
+        target.addWidget(self.target_rms)
+        reset_target = QPushButton("恢复默认值")
+        reset_target.clicked.connect(lambda: self.target_rms.setValue(DEFAULT_TARGET_RMS))
+        target_help = QLabel("影响新录音的电脑声音和麦克风；值越高，背景噪声也可能越明显。")
+        target_help.setWordWrap(True)
+        target_help.setObjectName("muted")
 
         browse = QPushButton("选择…")
         browse.clicked.connect(self.choose_folder)
@@ -57,6 +87,9 @@ class SettingsDialog(QDialog):
         layout.addRow("纪要模型", self.model)
         layout.addRow("API Key", self.key)
         layout.addRow(help_text)
+        layout.addRow("录音目标电平（RMS）", target)
+        layout.addRow("", reset_target)
+        layout.addRow(target_help)
         layout.addRow(buttons)
 
     def choose_folder(self) -> None:

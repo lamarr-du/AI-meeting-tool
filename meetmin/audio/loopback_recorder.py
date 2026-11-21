@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from ..config import DEFAULT_TARGET_RMS, MAX_TARGET_RMS, MIN_TARGET_RMS
 from .dsp import rms
 from .segments import SegmentedWriter, merge_segments
 
@@ -87,13 +88,13 @@ class _AudioBlock:
 class _AdaptiveLevel:
     """在量化为 16 位 PCM 前补偿低电平。由写线程持有，每次录音重新初始化。"""
 
-    TARGET_RMS = 0.03
     RELEASE_SECONDS = 0.08
     RESET_AFTER_SILENCE_SECONDS = 0.2
 
-    def __init__(self, rate: int, *, max_gain: float, noise_floor: float = 0.0):
+    def __init__(self, rate: int, *, max_gain: float, target_rms: float, noise_floor: float = 0.0):
         self.rate = rate
         self.max_gain = max_gain
+        self.target_rms = target_rms
         self.noise_floor = noise_floor
         self.reference = 0.0
         self.gain: float | None = None
@@ -125,7 +126,7 @@ class _AdaptiveLevel:
             boost_fraction = max(0.0, min(1.0, (level - self.noise_floor) / self.noise_floor))
             gain_limit = 1.0 + (self.max_gain - 1.0) * boost_fraction
         # Leave peak headroom when boosting and pass normal-level audio through at unity gain.
-        gain = max(1.0, min(self.TARGET_RMS / self.reference, gain_limit, 0.95 / peak))
+        gain = max(1.0, min(self.target_rms / self.reference, gain_limit, 0.95 / peak))
         if self.gain is not None and gain > self.gain:
             ramp = np.linspace(self.gain, gain, frames, dtype=np.float32)
             samples = samples.reshape(frames, -1) * ramp[:, None]
@@ -196,6 +197,7 @@ class LoopbackRecorder:
         sync_seconds: float = 10,
         output_sample_rate: int | None = None,
         output_channels: int | None = None,
+        target_rms: float = DEFAULT_TARGET_RMS,
     ):
         self.device = device
         self.channels = channels
@@ -205,6 +207,9 @@ class LoopbackRecorder:
         self._resampler: Any = None
         self.chunk_ms = max(20, int(chunk_ms))
         self.silence_threshold = float(silence_threshold)
+        self.target_rms = float(target_rms)
+        if not MIN_TARGET_RMS <= self.target_rms <= MAX_TARGET_RMS:
+            raise ValueError("target_rms 必须在 0.001 到 0.3 之间")
         if not 0 <= self.silence_threshold <= 1:
             raise ValueError("silence_threshold 必须在 0 到 1 之间")
         if not math.isfinite(queue_seconds) or queue_seconds <= 0:
@@ -300,7 +305,7 @@ class LoopbackRecorder:
 
     def _create_level_control(self, rate: int, info: dict) -> _AdaptiveLevel | None:
         if info.get("isLoopbackDevice"):
-            return _AdaptiveLevel(rate, max_gain=10_000.0)  # Up to 80 dB for playback attenuation.
+            return _AdaptiveLevel(rate, max_gain=10_000.0, target_rms=self.target_rms)
         return None
 
     # ---------------- 生命周期 ----------------
@@ -676,7 +681,7 @@ class LoopbackRecorder:
 
 class MicrophoneRecorder(LoopbackRecorder):
     def _create_level_control(self, rate: int, info: dict) -> _AdaptiveLevel:
-        return _AdaptiveLevel(rate, max_gain=16.0, noise_floor=0.0003)
+        return _AdaptiveLevel(rate, max_gain=16.0, target_rms=self.target_rms, noise_floor=0.0003)
 
     def _resolve_device(self, pa):
         pyaudio = _import_pyaudio()

@@ -10,7 +10,7 @@ from collections.abc import Callable
 from html import escape
 from pathlib import Path
 from threading import Event
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from PySide6.QtCore import QProcess, QSettings, QSize, QStandardPaths, Qt, QThread, QUrl, Signal
@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
 from ..asr.model_download import ModelDownloadProgress
 from ..audio.loopback_recorder import RecordingError, list_loopback_devices, list_microphone_devices
 from ..audio.session_recorder import SessionRecorder
-from ..config import deep_merge, load_config
+from ..config import MAX_TARGET_RMS, MIN_TARGET_RMS, deep_merge, load_config
 from ..pipeline import Pipeline
 from ..session import Session
 from ..summarizer.llm_client import MockLLM, get_llm
@@ -202,6 +202,42 @@ class Job(QThread):
             self.error = error
 
 
+class HistoryList(QListWidget):
+    action_requested = Signal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.setMouseTracking(True)
+        self.button = QToolButton(self.viewport())
+        self.button.setObjectName("historyActions")
+        self.button.setText("⋯")
+        self.button.setAccessibleName("会议操作")
+        self.button.setFixedSize(28, 28)
+        self.button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.session_id = ""
+        menu = QMenu(self.button)
+        menu.addAction("改名…", lambda: self.action_requested.emit(self.session_id, "rename"))
+        menu.addAction("删除…", lambda: self.action_requested.emit(self.session_id, "delete"))
+        self.button.setMenu(menu)
+        self.button.hide()
+        self.verticalScrollBar().valueChanged.connect(self.button.hide)
+
+    def mouseMoveEvent(self, event) -> None:
+        item = self.itemAt(event.position().toPoint())
+        if item is None:
+            self.button.hide()
+        else:
+            self.session_id = item.data(Qt.ItemDataRole.UserRole)
+            rect = self.visualItemRect(item)
+            self.button.move(rect.right() - self.button.width() - 7, rect.center().y() - 14)
+            self.button.show()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.button.hide()
+        super().leaveEvent(event)
+
+
 class MeetingWindow(QMainWindow):
     def __init__(self, cfg: dict, settings: QSettings):
         super().__init__()
@@ -257,13 +293,14 @@ class MeetingWindow(QMainWindow):
         navigation.addWidget(self.new)
         navigation.addSpacing(8)
         navigation.addWidget(label("会议历史", "navCaption"))
-        self.sessions = QListWidget()
+        self.sessions = HistoryList()
         self.sessions.setObjectName("historyList")
         self.sessions.setUniformItemSizes(True)
         self.sessions.setMouseTracking(True)
         self.sessions.setItemDelegate(HistoryDelegate(self.sessions))
         self.sessions.setAccessibleName("会议历史")
         self.sessions.currentItemChanged.connect(self.select_session)
+        self.sessions.action_requested.connect(self.history_action)
         navigation.addWidget(self.sessions, 1)
         divider = QFrame()
         divider.setObjectName("navDivider")
@@ -558,6 +595,51 @@ class MeetingWindow(QMainWindow):
             self.log.clear()
         self.session = session
         self.render_session()
+
+    def history_action(self, session_id: str, action: str) -> None:
+        session = Session(self.cfg["output_dir"], session_id)
+        title = str(workflow.metadata(session).get("title") or session_id)
+        selected = self.session
+        if action == "rename":
+            name, accepted = QInputDialog.getText(self, "改名", "会议名称", text=title)
+            if not accepted:
+                return
+            name = name.strip()
+            if not name:
+                QMessageBox.warning(self, "无法改名", "会议名称不能为空。")
+                return
+            try:
+                if not session.root.is_dir() or session.root.is_symlink():
+                    raise FileNotFoundError("会话文件夹不存在或不可用")
+                metadata = workflow.metadata(session)
+                metadata["title"] = name
+                session.save_json("meeting.json", metadata)
+            except OSError as error:
+                QMessageBox.warning(self, "改名失败", str(error))
+                return
+        elif action == "delete":
+            if (
+                QMessageBox.question(
+                    self,
+                    "删除会议",
+                    f"确定删除会议「{title}」吗？\n\n会话文件夹中的音频、转写和纪要等文件都将被永久删除。",
+                    defaultButton=QMessageBox.StandardButton.No,
+                )
+                != QMessageBox.StandardButton.Yes
+            ):
+                return
+            try:
+                shutil.rmtree(session.root)
+            except OSError as error:
+                QMessageBox.warning(self, "删除失败", str(error))
+                self.refresh_history(selected)
+                return
+            if selected is not None and selected.session_id == session_id:
+                selected = None
+        else:
+            return
+        self.sessions.button.hide()
+        self.refresh_history(selected)
 
     def render_session(self) -> None:
         session = self.session
@@ -1023,11 +1105,13 @@ class MeetingWindow(QMainWindow):
         output = dialog.output.text()
         selected = self.session if output == self.cfg["output_dir"] else None
         self.cfg["output_dir"] = output
+        self.cfg["recorder"]["target_rms"] = dialog.target_rms.value()
         self.cfg["llm"].update(
             base_url=dialog.url.text().strip(), model=dialog.model.text().strip()
         )
         self.api_key = dialog.key.text().strip()
         self.settings.setValue("output_dir", output)
+        self.settings.setValue("target_rms", dialog.target_rms.value())
         self.settings.setValue("llm_url", self.cfg["llm"]["base_url"])
         self.settings.setValue("llm_model", self.cfg["llm"]["model"])
         self.refresh_history(selected)
@@ -1069,6 +1153,11 @@ def run(config: Path | None) -> int:
             if not (Path(data) / "config.yaml").is_file():
                 cfg["recorder"]["microphone"] = True
         cfg["output_dir"] = settings.value("output_dir", str(output), type=str)
+        target_rms = cast(
+            float, settings.value("target_rms", cfg["recorder"]["target_rms"], type=float)
+        )
+        if MIN_TARGET_RMS <= target_rms <= MAX_TARGET_RMS:
+            cfg["recorder"]["target_rms"] = target_rms
         cfg["llm"]["base_url"] = settings.value("llm_url", cfg["llm"]["base_url"], type=str)
         cfg["llm"]["model"] = settings.value("llm_model", cfg["llm"]["model"], type=str)
         if getattr(sys, "frozen", False):
