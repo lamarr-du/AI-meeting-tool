@@ -38,7 +38,9 @@ def windows_cuda_directory() -> Path | None:
 
 
 @cache
-def _register_dll_directory(path: Path) -> object:
+def _register_dll_directory(path: Path) -> object | None:
+    if sys.platform != "win32":
+        return None
     # Keep the directory registered for libraries loaded lazily by cuDNN.
     return os.add_dll_directory(str(path))
 
