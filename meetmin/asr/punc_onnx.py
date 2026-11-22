@@ -51,12 +51,15 @@ def _download_hf_file(
     *,
     cache_dir: Path,
     on_model_download: Callable[[bool], None] | None = None,
+    local_files_only: bool = False,
 ) -> Path:
     import huggingface_hub
 
     cached = huggingface_hub.try_to_load_from_cache(repo_id, filename, cache_dir=cache_dir)
     if isinstance(cached, str) and Path(cached).is_file():
         return Path(cached)
+    if local_files_only:
+        raise FileNotFoundError(f"本地标点模型未缓存：{repo_id}/{filename}")
     if on_model_download is not None:
         on_model_download(True)
     try:
@@ -119,12 +122,14 @@ class FireRedPuncOnnx:
             FIRERED_MODEL_FILE,
             cache_dir=cache_dir,
             on_model_download=self._on_model_download,
+            local_files_only=bool(self.pcfg.get("local_files_only")),
         )
         tok_file = _download_hf_file(
             FIRERED_REPO,
             FIRERED_TOKENIZER_FILE,
             cache_dir=cache_dir,
             on_model_download=self._on_model_download,
+            local_files_only=bool(self.pcfg.get("local_files_only")),
         )
         return model_file, tok_file
 
@@ -242,6 +247,7 @@ class CtTransformerOnnx:
             CT_TRANSFORMER_MODEL_FILE,
             cache_dir=cache_dir,
             on_model_download=self._on_model_download,
+            local_files_only=bool(self.pcfg.get("local_files_only")),
         )
 
     def _ensure_loaded(self) -> None:

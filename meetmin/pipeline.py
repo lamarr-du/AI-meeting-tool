@@ -170,6 +170,7 @@ class Pipeline:
                 )
 
         provider_name = provider.name
+        microphone_result = None
         try:
             if on_asr_ready is not None:
                 on_asr_ready()
@@ -183,11 +184,27 @@ class Pipeline:
                 self.progress(f"[2a] 转写麦克风：{microphone}")
                 mic_result, mic_duration = transcribe_track(microphone)
                 report_track(mic_result)
+                microphone_result = (microphone, mic_result, mic_duration)
         finally:
             close = getattr(provider, "close", None)
             if close is not None:
                 close()
 
+        return self._save_raw_asr(
+            session, provider_name, (audio, result, duration), microphone_result, file_url=file_url
+        )
+
+    def _save_raw_asr(
+        self,
+        session: Session,
+        provider_name: str,
+        loopback: tuple[Path, ASRResult, float],
+        microphone: tuple[Path, ASRResult, float] | None,
+        *,
+        file_url: str | None = None,
+    ) -> dict:
+        audio, result, duration = loopback
+        utterances = [u for u in result.utterances if u.text.strip()]
         raw: dict[str, Any] = {
             "session_id": session.session_id,
             "audio_path": str(Path(audio).resolve())
@@ -228,11 +245,12 @@ class Pipeline:
                 k: dc[k] for k in ("model", "speaker_count", "language_hints") if k in dc
             }
         if microphone is not None:
+            microphone_path, mic_result, mic_duration = microphone
             mic_utterances = [u for u in mic_result.utterances if u.text.strip()]
             for u in mic_utterances:
                 u.speaker = "我"
             raw["microphone"] = {
-                "audio_path": str(microphone.resolve()),
+                "audio_path": str(microphone_path.resolve()),
                 "language": mic_result.language,
                 "asr": {k: v for k, v in mic_result.extra.items() if k != "duration"},
                 "utterances": [u.to_dict() for u in mic_utterances],

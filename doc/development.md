@@ -55,6 +55,12 @@ python scripts/evaluate_transcript.py data/sessions/example/label.txt data/d6/se
 
 字符错误率按忽略标点、空白和大小写后的编辑距离计算。术语召回按人工标注中的出现次数计分。说话人归属评分使用 SciPy（随 `diar` 额外依赖安装），按时间重合为预测标签匹配参考标签；标注段落的终点取下一段起点，最后一段取录音结束。归属错误率只统计转写覆盖到的时间，同时报告覆盖秒数以便核对漏转。
 
+实时转写可用已缓存的模型进行 1.0× 回放。输入为 16 kHz、16 位单声道 PCM WAV，双轨测试可加 `--microphone` 指定独立麦克风轨。终端会报告首次草稿、定稿延迟和归档耗时，产物默认写到 `data/live_replay`。
+
+```powershell
+python -m scripts.replay_live_sim data/sessions/example/audio.wav --warm
+```
+
 ### 本地检查
 
 开发环境从仓库根目录安装：

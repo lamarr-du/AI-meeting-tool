@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from meetmin.audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder, RecordingError
+from meetmin.audio.ring_buffer import IdleTick, PcmChunk
 from meetmin.audio.segments import SessionLock, merge_segments
 from meetmin.audio.session_recorder import SessionRecorder
 from meetmin.cli import cmd_recover
@@ -162,6 +163,38 @@ def read_audio(path, rate=1000):
     with wave.open(str(path), "rb") as wav:
         assert wav.getframerate() == rate
         return np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+
+
+def test_live_tap_idle_and_resampler_tail_match_the_saved_wav(recording):
+    r = recording
+    events = []
+    idle = threading.Event()
+
+    def tap(event):
+        events.append(event)
+        if isinstance(event, IdleTick):
+            idle.set()
+
+    r.rec.output_sample_rate = 16000
+    r.rec.output_channels = 1
+    r.rec.sample_rate = 48000
+    r.rec.audio_tap = tap
+    r.rec.start(r.path)
+    for index in range(5):
+        r.streams[-1].emit(index / 10, value=1000, frames=4800)
+    r.clock.value = 11.5
+    assert idle.wait(1)
+    assert any(isinstance(event, PcmChunk) for event in events)
+    r.rec.stop()
+
+    sample_count = 0
+    pcm = []
+    for event in events:
+        if isinstance(event, PcmChunk):
+            assert event.start == sample_count
+            pcm.append(event.pcm)
+            sample_count += len(event.pcm) // 2
+    assert b"".join(pcm) == read_audio(r.path, rate=16000).tobytes()
 
 
 def recover_failed(path):

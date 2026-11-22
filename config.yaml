@@ -46,6 +46,18 @@ asr:
   hf_endpoint: null          # 国内下不动模型时改: https://hf-mirror.com
   hf_disable_xet: true       # 规避 Xet 重建服务 401；需要 Xet 时设 false
 
+live:
+  enabled: true             # 桌面录音默认边录边转写，可在录音面板关闭
+  model_size: large-v3-turbo # 使用本地已缓存的模型，也可填写本地模型目录
+  device: auto              # auto / cpu / cuda
+  beam_size: 1              # 实时短窗使用贪心解码
+  hop_sec: 1.8
+  backpressure_hop_sec: 4.0 # 解码速度跟不上时降低草稿刷新频率
+  max_window_sec: 15
+  ring_buffer_sec: 60
+  endpoint_silence_ms: 600
+  flush_timeout_sec: 12    # 等待 ASR 尾窗的时限，不含 WAV 合并和标准产物整理
+
 diarization:
   enabled: true
   provider: campplus_onnx       # campplus_onnx（默认，纯 ONNX 零 Torch）| ecapa_speechbrain | single

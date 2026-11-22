@@ -123,6 +123,8 @@ class CampplusOnnxDiarizer(Diarizer):
         cached = try_to_load_from_cache(CAMPPLUS_REPO, CAMPPLUS_FILE, cache_dir=self._hub_cache)
         if isinstance(cached, str) and Path(cached).is_file():
             return Path(cached)
+        if self.dcfg.get("local_files_only"):
+            raise FileNotFoundError(f"本地声纹模型未缓存：{CAMPPLUS_REPO}/{CAMPPLUS_FILE}")
 
         if self._on_model_download is not None:
             self._on_model_download(True)

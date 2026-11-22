@@ -13,6 +13,7 @@ from threading import Event
 from ..asr.model_download import ModelDownloadProgress
 from ..audio.segments import SessionLock
 from ..audio.session_recorder import SessionRecorder, recover_recording
+from ..live_pipeline import LiveEventCallback, LiveSessionCoordinator
 from ..pipeline import Pipeline
 from ..session import Session
 
@@ -109,6 +110,29 @@ def record(
         stage("正在保存录音…")
         result = recorder.stop()
     return result
+
+
+def record_live(
+    recorder: SessionRecorder,
+    session: Session,
+    stop_requested: Event,
+    stage: Callable[[str], None],
+    meter: Callable[[dict], None],
+    *,
+    cfg: dict,
+    emit: LiveEventCallback,
+) -> dict:
+    coordinator = LiveSessionCoordinator(cfg, session, emit, dual_track=recorder.dual_track)
+    recorder.set_audio_tap(coordinator.feed)
+    coordinator.start()
+    try:
+        result = record(recorder, session, stop_requested, stage, meter)
+        stage("正在归档实时转写…")
+        result["live_transcript"] = coordinator.finish()
+        result["live_error"] = coordinator.error
+        return result
+    finally:
+        coordinator.cancel()
 
 
 def transcribe(

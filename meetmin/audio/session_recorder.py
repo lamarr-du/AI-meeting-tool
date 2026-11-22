@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 from ..session import Session
 from .loopback_recorder import LoopbackRecorder, RecordingError
+from .ring_buffer import AudioEvent
 from .segments import SessionLock, merge_segments
 
 TRACKS = (("loopback", "audio.wav"), ("microphone", "microphone.wav"))
@@ -28,6 +31,12 @@ class SessionRecorder:
     @property
     def dual_track(self) -> bool:
         return len(self._recorders) > 1
+
+    def set_audio_tap(self, callback: Callable[[str, AudioEvent], None] | None) -> None:
+        if self._lock is not None:
+            raise RuntimeError("只能在录音启动前设置实时音频分流")
+        for recorder, (track, _) in zip(self._recorders, TRACKS):
+            recorder.audio_tap = partial(callback, track) if callback is not None else None
 
     def start(self, session: Session, *, overwrite: bool = False) -> None:
         if self._lock is not None:

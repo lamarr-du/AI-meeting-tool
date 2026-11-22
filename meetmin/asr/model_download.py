@@ -17,6 +17,25 @@ class ModelDownloadProgress:
     complete: bool = False
 
 
+def cached_model(model: str, *, cache_dir: Path) -> Path | None:
+    """Resolve a complete Whisper model without any Hub requests."""
+    from faster_whisper.utils import _MODELS
+    from huggingface_hub import try_to_load_from_cache
+
+    path = Path(model).expanduser()
+    if not path.is_dir():
+        cached = try_to_load_from_cache(_MODELS.get(model, model), "model.bin", cache_dir=cache_dir)
+        if not isinstance(cached, str):
+            return None
+        path = Path(cached).parent
+    required = ("model.bin", "config.json", "tokenizer.json")
+    if all((path / name).is_file() for name in required) and any(
+        file.is_file() for file in path.glob("vocabulary.*")
+    ):
+        return path.resolve()
+    return None
+
+
 def download_model(
     model: str, report: Callable[[ModelDownloadProgress], None], *, cache_dir: Path
 ) -> str:
@@ -29,13 +48,8 @@ def download_model(
     repo = model if "/" in model else _MODELS.get(model)
     if repo is None:
         raise ValueError(f"未知 Whisper 模型：{model}")
-    cached = try_to_load_from_cache(repo, "model.bin", cache_dir=cache_dir)
-    if isinstance(cached, str):
-        folder = Path(cached).parent
-        if all((folder / name).is_file() for name in ("config.json", "tokenizer.json")) and any(
-            path.is_file() for path in folder.glob("vocabulary.*")
-        ):
-            return str(folder)
+    if folder := cached_model(repo, cache_dir=cache_dir):
+        return str(folder)
 
     class QuietBar(tqdm):
         def __init__(self, *args, **kwargs):

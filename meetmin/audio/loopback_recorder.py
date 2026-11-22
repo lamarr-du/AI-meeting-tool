@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import queue
 import threading
@@ -19,6 +20,7 @@ import numpy as np
 
 from ..config import DEFAULT_TARGET_RMS, MAX_TARGET_RMS, MIN_TARGET_RMS
 from .dsp import rms
+from .ring_buffer import SAMPLE_RATE, AudioEvent, IdleTick, PcmChunk
 from .segments import SegmentedWriter, merge_segments
 
 
@@ -205,6 +207,8 @@ class LoopbackRecorder:
         self.output_sample_rate = output_sample_rate
         self.output_channels = output_channels
         self._resampler: Any = None
+        self.audio_tap: Callable[[AudioEvent], None] | None = None
+        self._output_samples = 0
         self.chunk_ms = max(20, int(chunk_ms))
         self.silence_threshold = float(silence_threshold)
         self.target_rms = float(target_rms)
@@ -347,6 +351,7 @@ class LoopbackRecorder:
         self._finalized = False
         self._received_frames = 0
         self._padded_frames = 0
+        self._output_samples = 0
         with self._level_lock:
             self._frames = self._silent_frames = self._active_frames = 0
             self._level = 0.0
@@ -363,6 +368,8 @@ class LoopbackRecorder:
         output_ch = self.output_channels or ch
         if output_rate <= 0 or output_ch not in (1, ch):
             raise ValueError("录音保存格式的采样率或声道数无效")
+        if self.audio_tap is not None and (output_rate != SAMPLE_RATE or output_ch != 1):
+            raise ValueError("实时转写需要 16 kHz 单声道 PCM")
         self._resampler = None
         if output_rate != sr:
             import soxr
@@ -453,6 +460,7 @@ class LoopbackRecorder:
 
     def _run(self) -> None:
         pending: _AudioBlock | None = None
+        last_tick = 0.0
         try:
             while not self._producer_done.is_set() or not self._queue.empty():
                 try:
@@ -460,6 +468,25 @@ class LoopbackRecorder:
                 except queue.Empty:
                     assert self._wf is not None
                     self._wf.checkpoint()
+                    if self.audio_tap is not None and self._stop_at is None:
+                        now = self._now()
+                        # A valid ADC position can be up to 0.5 s ahead of arrival.
+                        # Keep the last block until a future stop cannot trim it.
+                        if pending is not None and now - pending.received_at >= (
+                            0.5 + pending.frames / self.sample_rate_actual
+                        ):
+                            self._write_block(pending)
+                            pending = None
+                        if (
+                            pending is None
+                            and self._last_data_time is not None
+                            and now - self._last_data_time >= 0.2
+                            and now - last_tick >= 0.1
+                        ):
+                            self._send_audio(
+                                IdleTick(round((now - self._started_at) * SAMPLE_RATE))
+                            )
+                            last_tick = now
                     continue
                 # Hold the last block so stop() can trim samples past the stop boundary.
                 if pending is not None:
@@ -515,7 +542,24 @@ class LoopbackRecorder:
             samples = samples[:, 0]
         if self._resampler is not None:
             samples = self._resampler.resample_chunk(samples)
-        self._wf.writeframesraw(samples.astype("<i2", copy=False).tobytes())
+        self._write_pcm(self._wf, samples)
+
+    def _write_pcm(self, writer: SegmentedWriter, samples: np.ndarray) -> None:
+        pcm = samples.astype("<i2", copy=False).tobytes()
+        writer.writeframesraw(pcm)
+        if self.audio_tap is not None and pcm:
+            start = self._output_samples
+            self._output_samples += len(samples)
+            self._send_audio(PcmChunk(start, pcm))
+
+    def _send_audio(self, event: AudioEvent) -> None:
+        callback = self.audio_tap
+        if callback is not None:
+            try:
+                callback(event)
+            except Exception:
+                self.audio_tap = None
+                logging.getLogger("meetmin").exception("实时音频分流已停止，继续保存录音")
 
     def _close_audio(self) -> None:
         # Called by the writer, or by start() only if no writer was ever started.
@@ -529,7 +573,7 @@ class LoopbackRecorder:
                         tail = self._resampler.resample_chunk(
                             np.empty(shape, dtype=np.int16), last=True
                         )
-                        writer.writeframesraw(tail.astype("<i2", copy=False).tobytes())
+                        self._write_pcm(writer, tail)
                         self._resampler = None
                 finally:
                     writer.close()

@@ -47,6 +47,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hf_endpoint": None,  # 国内可设 https://hf-mirror.com 下载模型
         "hf_disable_xet": True,  # 避免部分网络环境访问 Xet 重建服务时出现 401
     },
+    "live": {
+        "enabled": True,
+        "model_size": "large-v3-turbo",
+        "device": "auto",
+        "beam_size": 1,
+        "hop_sec": 1.8,
+        "backpressure_hop_sec": 4.0,
+        "max_window_sec": 15,
+        "ring_buffer_sec": 60,
+        "endpoint_silence_ms": 600,
+        "flush_timeout_sec": 12,
+    },
     "diarization": {
         "enabled": True,
         "provider": "campplus_onnx",  # campplus_onnx（默认，纯 ONNX 零 Torch）| ecapa_speechbrain | single
@@ -141,6 +153,11 @@ def load_config(path: str | Path | None = None) -> dict:
         local_model = config_dir / Path(model).expanduser()
         if local_model.is_dir():
             asr["model_size"] = str(local_model)
+    live = cfg.get("live")
+    if isinstance(live, dict) and isinstance(model := live.get("model_size"), str):
+        local_model = config_dir / Path(model).expanduser()
+        if local_model.is_dir():
+            live["model_size"] = str(local_model)
     glossary = asr.get("glossary") if isinstance(asr, dict) else None
     if isinstance(glossary, dict):
         for key in ("path", "correction_path"):

@@ -60,6 +60,7 @@ from ..session import Session
 from ..summarizer.llm_client import MockLLM, get_llm
 from ..textutil import ts
 from . import workflow
+from .live_transcript import LiveTranscriptView
 from .settings import SettingsDialog
 from .style import (
     HISTORY_DATE,
@@ -188,6 +189,7 @@ class Job(QThread):
     log = Signal(str)
     meter = Signal(dict)
     model_download = Signal(object)
+    live_event = Signal(dict)
 
     def __init__(self, action: Callable[[Job], Any], parent: QWidget):
         super().__init__(parent)
@@ -393,10 +395,14 @@ class MeetingWindow(QMainWindow):
         result_layout.setContentsMargins(1, 1, 1, 1)
         self.tabs = QTabWidget()
         self.transcript = MarkdownPreview("会议转写")
+        self.live_transcript = LiveTranscriptView()
+        self.transcript_stack = QStackedWidget()
+        self.transcript_stack.addWidget(self.transcript)
+        self.transcript_stack.addWidget(self.live_transcript)
         self.minutes = MarkdownPreview("会议纪要")
         self.log = QPlainTextEdit(readOnly=True, maximumBlockCount=300)
         self.log.setAccessibleName("处理日志")
-        self.tabs.addTab(self.transcript, "转写")
+        self.tabs.addTab(self.transcript_stack, "转写")
         self.tabs.addTab(self.minutes, "纪要")
         self.tabs.addTab(self.log, "处理日志")
         result_layout.addWidget(self.tabs)
@@ -444,9 +450,19 @@ class MeetingWindow(QMainWindow):
         buttons.addWidget(self.import_button)
         buttons.addStretch()
         form.addLayout(buttons)
-        hint = label("录音结束或导入后自动转写", "muted")
-        hint.setWordWrap(True)
-        form.addWidget(hint)
+        self.live_enabled = QCheckBox("边录边转写")
+        self.live_enabled.setChecked(
+            cast(
+                bool,
+                self.settings.value(
+                    "live_enabled", bool((self.cfg.get("live") or {}).get("enabled")), type=bool
+                ),
+            )
+        )
+        self.live_enabled.toggled.connect(
+            lambda checked: self.settings.setValue("live_enabled", checked)
+        )
+        form.addWidget(self.live_enabled)
         form.addStretch()
         columns.addLayout(form, 5)
 
@@ -498,9 +514,9 @@ class MeetingWindow(QMainWindow):
         self.stop.setIcon(line_icon("stop", "#89253e"))
         self.stop.clicked.connect(self.request_stop)
         controls.addWidget(self.stop)
-        hint = label("停止后自动转写", "muted")
-        hint.setWordWrap(True)
-        controls.addWidget(hint, 1)
+        self.record_hint = label("", "muted")
+        self.record_hint.setWordWrap(True)
+        controls.addWidget(self.record_hint, 1)
         timer.addLayout(controls)
         timer.addStretch()
         columns.addLayout(timer, 5)
@@ -673,6 +689,8 @@ class MeetingWindow(QMainWindow):
         else:
             self.title.setText("新建会议")
         self.set_status(message, tone)
+        if self.stop_requested is None:
+            self.transcript_stack.setCurrentWidget(self.transcript)
         self.transcript.show_file(
             self.transcript_path, "转写完成后在这里查看带时间戳的发言。", f"# 会议转写 {session_id}"
         )
@@ -726,6 +744,7 @@ class MeetingWindow(QMainWindow):
         self.stop.setEnabled(capturing)
         self.import_button.setEnabled(ready)
         self.meeting_name.setEnabled(ready)
+        self.live_enabled.setEnabled(ready)
         self.loopback_devices.setEnabled(ready and self.loopback_available)
         self.microphone.setEnabled(ready and self.mic_available)
         self.microphone_devices.setEnabled(
@@ -776,6 +795,7 @@ class MeetingWindow(QMainWindow):
         self.job.log.connect(self.log.appendPlainText)
         self.job.meter.connect(self.show_meter)
         self.job.model_download.connect(self.show_model_download)
+        self.job.live_event.connect(self.live_transcript.apply_event)
         self.job.finished.connect(self.job_finished)
         self.job.start()
         self.update_controls()
@@ -839,7 +859,7 @@ class MeetingWindow(QMainWindow):
 
     def new_meeting(self) -> None:
         self.sessions.setCurrentRow(-1)
-        self.tabs.setCurrentWidget(self.transcript)
+        self.tabs.setCurrentWidget(self.transcript_stack)
         self.meeting_name.setFocus()
 
     def make_session(self, default_title: str) -> Session | None:
@@ -852,7 +872,7 @@ class MeetingWindow(QMainWindow):
             return None
         self.meeting_name.clear()
         self.refresh_history(session)
-        self.tabs.setCurrentWidget(self.transcript)
+        self.tabs.setCurrentWidget(self.transcript_stack)
         return session
 
     def start_recording(self) -> None:
@@ -873,11 +893,22 @@ class MeetingWindow(QMainWindow):
         stop_requested = self.stop_requested = Event()
         self.recorded_at = time.monotonic()
         self.show_meter({"microphone": {} if recorder.dual_track else None})
+        live = self.live_enabled.isChecked()
+        self.record_hint.setText("停止后归档转写" if live else "停止后自动转写")
+        if live:
+            self.live_transcript.reset(dual_track=recorder.dual_track)
+            self.transcript_stack.setCurrentWidget(self.live_transcript)
+            self.tabs.setCurrentWidget(self.transcript_stack)
+
+        def record_job(job: Job) -> dict:
+            args = (recorder, session, stop_requested, job.stage.emit, job.meter.emit)
+            if live:
+                return workflow.record_live(*args, cfg=cfg, emit=job.live_event.emit)
+            return workflow.record(*args)
+
         self.launch(
             "正在启动录音…",
-            lambda job: workflow.record(
-                recorder, session, stop_requested, job.stage.emit, job.meter.emit
-            ),
+            record_job,
             lambda result: self.recording_saved(session, result),
         )
 
@@ -916,7 +947,13 @@ class MeetingWindow(QMainWindow):
                 self.log.appendPlainText(
                     f"{caption}有 {track['padded_sec']:.1f} 秒无数据，已补静音。"
                 )
-        if not self.close_after_recording:
+        if transcript := result.get("live_transcript"):
+            self.set_status("实时转写已归档。", "success")
+            self.transcription_saved(transcript)
+        elif error := result.get("live_error"):
+            self.log.appendPlainText(f"实时转写未完成：{error}")
+            self.set_status("录音已保存，可继续转写。", "warning")
+        elif not self.close_after_recording:
             self.transcribe_session(session)
 
     def import_audio(self) -> None:
@@ -951,7 +988,7 @@ class MeetingWindow(QMainWindow):
         )
 
     def transcription_saved(self, result: dict) -> None:
-        self.tabs.setCurrentWidget(self.transcript)
+        self.tabs.setCurrentWidget(self.transcript_stack)
         if not result["utterances"]:
             self.set_status("转写未检测到发言。请检查录音设备或换一段音频。", "warning")
             self.generate.setEnabled(False)

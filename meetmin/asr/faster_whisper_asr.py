@@ -20,8 +20,7 @@ from ..audio.dsp import TARGET_SR
 from ..glossary import glossary_hotwords, load_terms, select_terms
 from ..model_cache import configure_xet_cache, hub_cache_dir
 from .base import ASRProvider, ASRResult, Utterance
-from .cuda import prepare_cuda_runtime
-from .model_download import ModelDownloadProgress, download_model
+from .model_download import ModelDownloadProgress, cached_model, download_model
 from .profile import memory_status, select_profile
 from .quality import Decoded, QualityOptions, Span, review
 
@@ -106,10 +105,10 @@ class FasterWhisperASR(ASRProvider):
         from ..doctor import gpu_status
 
         device = acfg.get("device", "auto")
-        auto_cuda = device == "auto" and acfg.get("profile") not in ("cpu_light", "cpu_standard")
-        gpu = gpu_status(acfg.get("compute_type") or "int8_float16") if auto_cuda else None
-        if device == "cuda":
-            prepare_cuda_runtime()
+        try_cuda = device == "cuda" or (
+            device == "auto" and acfg.get("profile") not in ("cpu_light", "cpu_standard")
+        )
+        gpu = gpu_status(acfg.get("compute_type") or "int8_float16") if try_cuda else None
         try:
             from faster_whisper import WhisperModel
         except ImportError as e:  # pragma: no cover
@@ -139,6 +138,7 @@ class FasterWhisperASR(ASRProvider):
                         device=self._device,
                         compute_type=self._compute,
                         download_root=str(self._hub_cache),
+                        **({"local_files_only": True} if self.acfg.get("local_files_only") else {}),
                     )
                     return
                 except (OSError, RuntimeError) as error:
@@ -147,6 +147,8 @@ class FasterWhisperASR(ASRProvider):
                         raise
                 self._advance_fallback(*failure)
         except Exception as e:
+            if self.acfg.get("local_files_only"):
+                raise RuntimeError(f"无法加载本地 Whisper 模型（{self._size}）：{e}") from e
             raise RuntimeError(
                 f"加载/下载 whisper 模型失败（{self._size}）：{e}\n"
                 "  · 首次运行需联网下载权重；国内网络可在 config.yaml 设 asr.hf_endpoint: https://hf-mirror.com\n"
@@ -156,6 +158,11 @@ class FasterWhisperASR(ASRProvider):
 
     def _model_source(self) -> str:
         source = self._size
+        if self.acfg.get("local_files_only"):
+            path = cached_model(source, cache_dir=self._hub_cache)
+            if path is None:
+                raise FileNotFoundError("请在录音前准备完整模型，含本地 tokenizer.json")
+            return str(path)
         path = Path(source).expanduser()
         if path.is_dir():
             return str(path.resolve())
@@ -260,21 +267,7 @@ class FasterWhisperASR(ASRProvider):
             self._advance_fallback(*failure)
             self._load_with_fallback()
 
-    def _transcribe(
-        self,
-        audio: np.ndarray | None,
-        *,
-        file_path: str | None = None,
-        progress_cb: Any = None,
-        **kwargs: Any,
-    ) -> ASRResult:
-        if audio is None:
-            if not file_path:
-                raise ValueError("需要 audio（16k float32 数组）或 file_path 之一")
-            from ..audio.dsp import to_mono_16k
-
-            audio = to_mono_16k(file_path)
-
+    def _decode_options(self) -> tuple[dict[str, Any], dict, dict[str, Any]]:
         condition_on_previous_text = self.acfg.get("condition_on_previous_text", False)
         if not isinstance(condition_on_previous_text, bool):
             raise ValueError("asr.condition_on_previous_text 必须为 true 或 false")
@@ -291,7 +284,6 @@ class FasterWhisperASR(ASRProvider):
         effective_hotwords, glossary = self._apply_glossary(effective_hotwords, language)
         words_enabled = bool(self.acfg.get("word_timestamps", True))
         decode_guards = _decode_guards(self.acfg, words_enabled)
-        quality_options = QualityOptions.from_config(self.acfg.get("quality", {}))
         options: dict[str, Any] = {
             "language": language,
             "beam_size": int(self.acfg.get("beam_size", 1)),
@@ -302,6 +294,53 @@ class FasterWhisperASR(ASRProvider):
             "vad_parameters": _VAD_PARAMETERS,
             **decode_guards,
         }
+        return options, glossary, decode_guards
+
+    def build_stream_options(self) -> dict[str, Any]:
+        options, _, _ = self._decode_options()
+        return {**options, "vad_filter": False, "temperature": 0.0}
+
+    def decode_window(
+        self, audio: np.ndarray, offset: float, *, options: dict[str, Any]
+    ) -> list[Decoded]:
+        while True:
+            try:
+                segments, _ = self.model.transcribe(audio, **options)
+                return [_decoded(segment, offset) for segment in segments if segment.text.strip()]
+            except (OSError, RuntimeError) as error:
+                failure = self._cuda_failure(error)
+                if failure is None:
+                    raise
+            self._advance_fallback(*failure)
+            self._load_with_fallback()
+            options.update(self.build_stream_options())
+
+    def stream_metadata(self) -> dict:
+        return {
+            "asr_model": self._size,
+            "effective_device": self._device,
+            "effective_compute_type": self._compute,
+            "fallbacks": list(self._fallbacks),
+            "profile": asdict(self._profile),
+        }
+
+    def _transcribe(
+        self,
+        audio: np.ndarray | None,
+        *,
+        file_path: str | None = None,
+        progress_cb: Any = None,
+        **kwargs: Any,
+    ) -> ASRResult:
+        if audio is None:
+            if not file_path:
+                raise ValueError("需要 audio（16k float32 数组）或 file_path 之一")
+            from ..audio.dsp import to_mono_16k
+
+            audio = to_mono_16k(file_path)
+
+        options, glossary, decode_guards = self._decode_options()
+        quality_options = QualityOptions.from_config(self.acfg.get("quality", {}))
         segments, info = self.model.transcribe(audio, **options)
         detected_language = getattr(info, "language", None)
         decoded = []
@@ -314,7 +353,7 @@ class FasterWhisperASR(ASRProvider):
 
         retry_options = {
             **options,
-            "language": detected_language or language,
+            "language": detected_language or options["language"],
             "beam_size": max(options["beam_size"], 3),
             "condition_on_previous_text": False,
             "no_repeat_ngram_size": max(decode_guards["no_repeat_ngram_size"], 4),
@@ -362,8 +401,8 @@ class FasterWhisperASR(ASRProvider):
                 "effective_compute_type": self._compute,
                 "quality": quality_report,
                 "parameters": {
-                    "condition_on_previous_text": condition_on_previous_text,
-                    "hotwords": effective_hotwords,
+                    "condition_on_previous_text": options["condition_on_previous_text"],
+                    "hotwords": options["hotwords"],
                     **({"glossary": glossary} if glossary else {}),
                     **decode_guards,
                     "quality": asdict(quality_options),
