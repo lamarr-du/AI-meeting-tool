@@ -59,6 +59,7 @@ from ..config import MAX_TARGET_RMS, MIN_TARGET_RMS, deep_merge, load_config
 from ..live_pipeline import SpeakerRenames
 from ..pipeline import Pipeline
 from ..session import Session
+from ..speakers import speaker_roster
 from ..summarizer.llm_client import MockLLM, get_llm
 from ..textutil import ts
 from . import workflow
@@ -370,6 +371,8 @@ class MeetingWindow(QMainWindow):
         self.retry.clicked.connect(self.retry_transcription)
         self.generate = QPushButton("生成纪要")
         self.generate.clicked.connect(self.generate_minutes)
+        self.rename_speaker = QPushButton("标记说话人")
+        self.rename_speaker.clicked.connect(self.rename_transcript_speaker)
         self.more = QToolButton()
         self.more.setObjectName("moreActions")
         self.more.setText("更多操作")
@@ -389,6 +392,7 @@ class MeetingWindow(QMainWindow):
         self.open_folder.triggered.connect(self.open_session_folder)
         self.more.setMenu(menu)
         actions.addWidget(self.retry)
+        actions.addWidget(self.rename_speaker)
         actions.addWidget(self.generate)
         actions.addWidget(self.more)
 
@@ -774,6 +778,10 @@ class MeetingWindow(QMainWindow):
         )
         show_actions = self.session is not None and not running
         self.generate.setVisible(show_actions)
+        self.rename_speaker.setVisible(show_actions and self.transcript_path is not None)
+        self.rename_speaker.setEnabled(
+            ready and self.session is not None and (self.session.root / "transcript.json").is_file()
+        )
         self.generate.setEnabled(ready and self.transcript_path is not None)
         self.generate.setText("重新生成纪要" if self.minutes_path is not None else "生成纪要")
         style_property(self.generate, "primaryAction", self.minutes_path is None)
@@ -934,6 +942,34 @@ class MeetingWindow(QMainWindow):
     def rename_live_speaker(self, speaker: int, name: str) -> None:
         if self.job is not None and self.recording_active():
             self.job.speaker_renames.put((speaker, name))
+
+    def rename_transcript_speaker(self) -> None:
+        session = self.session
+        if session is None or self.job is not None:
+            return
+        try:
+            roster = speaker_roster(session.load_transcript())
+            if not roster:
+                QMessageBox.information(self, "标记说话人", "转写中暂无可标记的说话人。")
+                return
+            names = list(roster.values())
+            current, accepted = QInputDialog.getItem(
+                self, "标记说话人", "选择转写中的说话人", names, 0, False
+            )
+            if not accepted:
+                return
+            name, accepted = QInputDialog.getText(self, "标记说话人", "姓名", text=current)
+            if not accepted:
+                return
+            Pipeline(self.cfg).rename_speaker(session, current, name)
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.warning(self, "标记失败", str(error))
+            return
+        self.render_session()
+        message = "说话人姓名已保存。"
+        if self.minutes_path is not None:
+            message += "已有纪要不会自动更新，请重新生成纪要。"
+        self.set_status(message, "success")
 
     def show_meter(self, status: dict) -> None:
         if self.stop_requested is None:

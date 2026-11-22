@@ -4,7 +4,7 @@ import pytest
 
 from meetmin.cli import main
 from meetmin.pipeline import Pipeline
-from meetmin.speakers import rename_speakers, speaker_preview
+from meetmin.speakers import rename_speaker, rename_speakers, speaker_preview
 
 
 def _transcript():
@@ -44,6 +44,13 @@ def test_rename_rejects_invalid_batch(assignments):
     with pytest.raises(ValueError):
         rename_speakers(source, assignments)
     assert source == _transcript()
+
+
+def test_exact_display_name_can_be_renamed_even_if_it_contains_assignment_syntax():
+    renamed = rename_speaker(_transcript(), "说话人A", "甲=负责人")
+    renamed = rename_speaker(renamed, "甲=负责人", "张三")
+    assert renamed["utterances"][0]["speaker"] == "张三"
+    assert renamed["speaker_names"]["说话人A"] == "张三"
 
 
 def test_cli_renames_current_transcript_and_feeds_summary(tmp_path, capsys):
