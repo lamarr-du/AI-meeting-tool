@@ -591,9 +591,12 @@ class Pipeline:
             return self._correct_glossary(session, session.load_transcript())
 
     # ---------------- (3) AI 纪要 ----------------
-    def export_web_prompt(self, session: Session, *, overwrite: bool = False) -> Path:
+    def web_prompt(self, session: Session) -> str:
         transcript = self._load_minutes_transcript(session)
-        prompt = build_web_prompt(transcript, config=self.cfg)
+        return build_web_prompt(transcript, config=self.cfg)
+
+    def export_web_prompt(self, session: Session, *, overwrite: bool = False) -> Path:
+        prompt = self.web_prompt(session)
         return session.save_text_safely("minutes_web_prompt.txt", prompt, overwrite=overwrite)
 
     def import_web_minutes(

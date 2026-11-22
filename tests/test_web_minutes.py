@@ -122,6 +122,47 @@ def test_desktop_prompt_actions_use_chosen_export_path(meeting, tmp_path, monkey
         application.processEvents()
 
 
+def test_desktop_copy_prompt_uses_latest_transcript_without_export(meeting, tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+
+    from meetmin.gui import app
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(app.MeetingWindow, "refresh_devices", lambda self: None)
+    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("不应访问网络"))
+    session, cfg = meeting
+    pipe = Pipeline(cfg)
+    pipe._save_transcript(session, session.load_transcript())
+    pipe.rename_speaker(session, "说话人A", "张三")
+    window = app.MeetingWindow(
+        cfg, QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    )
+    window.refresh_history(session)
+    monkeypatch.setattr(
+        window, "launch", lambda _, action, done: done(action(SimpleNamespace(log=Mock())))
+    )
+    try:
+        assert window.copy_web_prompt.isEnabled()
+        window.copy_web_prompt.trigger()
+        prompt = application.clipboard().text()
+        assert "张三" in prompt and "说话人B: 最后一句" in prompt
+        assert "开头" + "重要内容" * 3000 in prompt
+        assert "已复制" in window.stage.text()
+        assert not (session.root / "minutes_web_prompt.txt").exists()
+        assert prompt == pipe.web_prompt(session)
+
+        session.save_transcript({"utterances": [{"text": "  "}]})
+        with pytest.raises(RuntimeError, match="转写结果为空"):
+            window.copy_prompt()
+        assert application.clipboard().text() == prompt
+    finally:
+        window.close()
+        application.processEvents()
+
+
 def test_empty_or_invalid_import_preserves_minutes(meeting, tmp_path):
     session, cfg = meeting
     session.minutes_md.write_text("原始纪要", encoding="utf-8")

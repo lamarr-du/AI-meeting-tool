@@ -383,6 +383,8 @@ class MeetingWindow(QMainWindow):
         self.export_minutes = menu.addAction("导出纪要…")
         self.export_minutes.triggered.connect(lambda: self.export_file(self.minutes_path))
         menu.addSeparator()
+        self.copy_web_prompt = menu.addAction("复制 AI 网页提示词")
+        self.copy_web_prompt.triggered.connect(self.copy_prompt)
         self.web_prompt = menu.addAction("导出 AI 网页提示词…")
         self.web_prompt.triggered.connect(self.export_prompt)
         self.web_minutes = menu.addAction("导入 AI 网页纪要…")
@@ -790,6 +792,7 @@ class MeetingWindow(QMainWindow):
         self.export_transcript.setEnabled(self.transcript_path is not None)
         self.export_minutes.setEnabled(self.minutes_path is not None)
         can_use_web = self.transcript_path is not None
+        self.copy_web_prompt.setEnabled(can_use_web)
         self.web_prompt.setEnabled(can_use_web)
         self.web_minutes.setEnabled(can_use_web)
 
@@ -1131,6 +1134,20 @@ class MeetingWindow(QMainWindow):
                 )
             except OSError as error:
                 self.set_status(f"导出失败：{error}", "error")
+
+    def copy_prompt(self) -> None:
+        session = self.session
+        assert session is not None
+
+        def copied(prompt: str) -> None:
+            QApplication.clipboard().setText(prompt)
+            self.set_status("AI 网页提示词已复制，可粘贴到 AI 网页。", "success")
+
+        self.launch(
+            "正在整理 AI 网页提示词…",
+            lambda job: Pipeline(self.cfg, progress=job.log.emit).web_prompt(session),
+            copied,
+        )
 
     def export_prompt(self) -> None:
         session = self.session
