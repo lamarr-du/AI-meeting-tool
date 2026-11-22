@@ -1,5 +1,6 @@
 """录音生命周期、时间轴和故障测试，无需声卡或 PyAudio。"""
 
+import json
 import threading
 import wave
 from types import SimpleNamespace
@@ -8,11 +9,36 @@ import numpy as np
 import pytest
 
 from meetmin.audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder, RecordingError
+from meetmin.audio.ring_buffer import IdleTick, PcmChunk
 from meetmin.audio.segments import SessionLock, merge_segments
-from meetmin.audio.session_recorder import SessionRecorder
+from meetmin.audio.session_recorder import RECORDING_DIAGNOSTICS, SessionRecorder
 from meetmin.cli import cmd_recover
 from meetmin.pipeline import Pipeline
 from meetmin.session import Session
+
+
+@pytest.mark.parametrize(
+    "recorder_class,info",
+    [(LoopbackRecorder, {"isLoopbackDevice": True}), (MicrophoneRecorder, {})],
+)
+def test_configured_target_rms_changes_recorded_level(recorder_class, info):
+    samples = np.full(1600, 0.01, dtype="<f4")
+    outputs = []
+    for target in (0.03, 0.09):
+        recorder = recorder_class(target_rms=target)
+        control = recorder._create_level_control(16000, info)
+        output = np.frombuffer(control.to_pcm(samples.tobytes(), len(samples)), dtype="<i2")
+        outputs.append(float(np.mean(output)) / 32768)
+    assert outputs == pytest.approx([0.03, 0.09], abs=0.0001)
+
+
+def test_pipeline_passes_target_to_both_tracks():
+    recorder = Pipeline({"recorder": {"target_rms": 0.08, "microphone": True}}).recorder(
+        for_session=True
+    )
+    assert [track.target_rms for track in recorder._recorders] == [0.08, 0.08]
+    with pytest.raises(ValueError, match="target_rms"):
+        LoopbackRecorder(target_rms=0.5)
 
 
 class Clock:
@@ -73,6 +99,8 @@ class Stream:
             if timing
             else {}
         )
+        if isinstance(timing, dict):
+            times = timing
         result = self.callback(data, frames, times, flags)
         if result[1] == 2:
             self.active = False
@@ -138,6 +166,38 @@ def read_audio(path, rate=1000):
     with wave.open(str(path), "rb") as wav:
         assert wav.getframerate() == rate
         return np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+
+
+def test_live_tap_idle_and_resampler_tail_match_the_saved_wav(recording):
+    r = recording
+    events = []
+    idle = threading.Event()
+
+    def tap(event):
+        events.append(event)
+        if isinstance(event, IdleTick):
+            idle.set()
+
+    r.rec.output_sample_rate = 16000
+    r.rec.output_channels = 1
+    r.rec.sample_rate = 48000
+    r.rec.audio_tap = tap
+    r.rec.start(r.path)
+    for index in range(5):
+        r.streams[-1].emit(index / 10, value=1000, frames=4800)
+    r.clock.value = 11.5
+    assert idle.wait(1)
+    assert any(isinstance(event, PcmChunk) for event in events)
+    r.rec.stop()
+
+    sample_count = 0
+    pcm = []
+    for event in events:
+        if isinstance(event, PcmChunk):
+            assert event.start == sample_count
+            pcm.append(event.pcm)
+            sample_count += len(event.pcm) // 2
+    assert b"".join(pcm) == read_audio(r.path, rate=16000).tobytes()
 
 
 def recover_failed(path):
@@ -451,6 +511,58 @@ def test_stream_stopped_unexpectedly(recording):
         r.rec.stop()
 
 
+def test_session_restarts_inactive_loopback_once_and_keeps_the_gap(recording, tmp_path):
+    r = recording
+    session = Session(tmp_path, "retry-active")
+    recorder = SessionRecorder(r.rec)
+    recorder.start(session)
+    stream = r.streams[-1]
+    stream.emit(0.0, value=1000)
+    stream.active = False
+    r.clock.value = 10.3
+    info = recorder.status()
+    assert not info["failed"] and info["stream_restarts"] == 1
+    assert len(r.streams) == 1 and stream.active
+    stream.emit(0.4, value=2000)
+    r.clock.value = 10.6
+
+    recorder.stop()
+    np.testing.assert_array_equal(
+        read_audio(session.audio_path), np.repeat([1000, 0, 2000, 0], [100, 300, 100, 100])
+    )
+    logs = [
+        json.loads(line)
+        for line in (session.root / RECORDING_DIAGNOSTICS).read_text("utf-8").splitlines()
+    ]
+    assert [entry["event"] for entry in logs] == [
+        "recording.started",
+        "recording.status_changed",
+        "recording.stopped",
+    ]
+    assert logs[1]["tracks"]["loopback"]["stream_restarts"] == 1
+
+
+def test_repeated_stream_failure_preserves_segments_and_logs_error(recording, tmp_path):
+    r = recording
+    session = Session(tmp_path, "retry-failed")
+    recorder = SessionRecorder(r.rec)
+    recorder.start(session)
+    stream = r.streams[-1]
+    stream.emit(0.0, value=1000)
+    stream.active = False
+    assert not recorder.status()["failed"]
+    stream.active = False
+    assert recorder.status()["failed"]
+    with pytest.raises(RecordingError, match="意外停止"):
+        recorder.stop()
+
+    assert not session.audio_path.exists()
+    entry = json.loads((session.root / RECORDING_DIAGNOSTICS).read_text("utf-8").splitlines()[-1])
+    assert entry["event"] == "recording.failed"
+    assert "意外停止" in entry["tracks"]["loopback"]["error"]
+    assert entry["tracks"]["loopback"]["stream_restart_attempts"] == 1
+
+
 def test_stop_detects_stream_failure_without_status_polling(recording):
     r = recording
     r.rec.start(r.path)
@@ -507,7 +619,45 @@ def test_missing_timestamps_fallback_is_visible(recording):
     np.testing.assert_array_equal(read_audio(r.path)[500:600], np.full(100, 1000))
 
 
-@pytest.mark.parametrize("position", [-1, 0, 0.02, 10000])
+def test_short_timestamp_glitch_keeps_pcm_and_the_next_real_gap(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0, value=1000)
+    stream.emit(0, received=10.2, value=1200)
+    stream.emit(0.2, timing=False, value=1400)
+    stream.emit(0.3, value=1600)
+    stream.emit(0.7, value=1800)
+    r.clock.value = 11
+
+    info = r.rec.stop()
+    assert info["timing_mode"] == "device"
+    assert info["repaired_timestamp_blocks"] == 2
+    assert info["received_sec"] == 0.5
+    np.testing.assert_array_equal(
+        read_audio(r.path),
+        np.repeat([1000, 1200, 1400, 1600, 0, 1800, 0], [100, 100, 100, 100, 300, 100, 200]),
+    )
+
+
+def test_adc_ahead_of_callback_does_not_abort_contiguous_audio(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    origin = 10 + stream.epoch
+    stream.emit(0)
+    stream.emit(
+        0.1,
+        timing={"input_buffer_adc_time": origin + 0.22, "current_time": origin + 0.2},
+    )
+    stream.emit(0.2)
+    r.clock.value = 10.3
+
+    assert r.rec.stop()["repaired_timestamp_blocks"] == 1
+    np.testing.assert_array_equal(read_audio(r.path), np.full(300, 1000))
+
+
+@pytest.mark.parametrize("position", [-1, 0.02, 10000])
 def test_broken_timestamps_do_not_silently_drop_or_pad_audio(recording, position):
     r = recording
     r.rec.start(r.path)
@@ -516,6 +666,30 @@ def test_broken_timestamps_do_not_silently_drop_or_pad_audio(recording, position
     with pytest.raises(RecordingError, match="时间戳|时钟|重叠"):
         r.rec.stop()
     assert len(recover_failed(r.path)) <= 200
+
+
+def test_persistent_missing_timestamps_cannot_run_past_the_repair_limit(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0)
+    for index in range(1, 4):
+        stream.emit(index / 10, timing=False)
+    with pytest.raises(RecordingError, match="时间戳") as error:
+        r.rec.stop()
+    assert error.value.info["repaired_timestamp_blocks"] == 2
+    np.testing.assert_array_equal(recover_failed(r.path), np.full(300, 1000))
+
+
+def test_bad_timestamp_after_a_gap_cannot_collapse_the_gap(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0)
+    stream.emit(1.0, timing=False)
+    with pytest.raises(RecordingError, match="时间戳"):
+        r.rec.stop()
+    np.testing.assert_array_equal(recover_failed(r.path), np.full(100, 1000))
 
 
 def test_jitter_does_not_add_gaps(recording):

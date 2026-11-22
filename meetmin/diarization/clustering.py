@@ -16,6 +16,7 @@ import math
 import os
 import secrets
 import zipfile
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,66 @@ def frame_active_ratio(wav: np.ndarray, frame_rms_threshold: float) -> float:
     frames = wav[: n_frames * _FRAME_SAMPLES].reshape(n_frames, _FRAME_SAMPLES)
     frame_rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
     return float(np.mean(frame_rms >= frame_rms_threshold))
+
+
+class StreamingRmsTracker:
+    """Retain up to 60 seconds of voiced 20 ms frame RMS values."""
+
+    def __init__(self, minimum: float):
+        self.minimum = minimum
+        self.frames: deque[float] = deque(maxlen=60 * SR // _FRAME_SAMPLES)
+
+    def update(self, audio: np.ndarray) -> float:
+        usable = len(audio) // _FRAME_SAMPLES * _FRAME_SAMPLES
+        frames = audio[:usable].reshape(-1, _FRAME_SAMPLES)
+        levels = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+        self.frames.extend(levels[levels >= self.minimum])
+        if len(self.frames) < 50:
+            return max(self.minimum, 0.015)
+        p75 = float(np.percentile(self.frames, 75))
+        return float(np.clip(p75 * 0.25, self.minimum, max(self.minimum, 0.02)))
+
+
+def linear_sum_assignment_max(weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Maximum-weight rectangular assignment, using shortest augmenting paths."""
+    costs = -np.asarray(weights, dtype=np.float64)
+    transposed = costs.shape[0] > costs.shape[1]
+    if transposed:
+        costs = costs.T
+    rows, cols = costs.shape
+    u, v = np.zeros(rows + 1), np.zeros(cols + 1)
+    matched, previous = np.zeros(cols + 1, dtype=int), np.zeros(cols + 1, dtype=int)
+    for row in range(1, rows + 1):
+        matched[0] = row
+        col = 0
+        slack = np.full(cols + 1, np.inf)
+        used = np.zeros(cols + 1, dtype=bool)
+        while True:
+            used[col] = True
+            active = matched[col]
+            remaining = np.flatnonzero(~used)
+            reduced = costs[active - 1, remaining - 1] - u[active] - v[remaining]
+            improved = remaining[reduced < slack[remaining]]
+            slack[improved] = reduced[reduced < slack[remaining]]
+            previous[improved] = col
+            next_col = int(remaining[np.argmin(slack[remaining])])
+            delta = slack[next_col]
+            u[matched[used]] += delta
+            v[used] -= delta
+            slack[~used] -= delta
+            col = next_col
+            if matched[col] == 0:
+                break
+        while col:
+            prior = previous[col]
+            matched[col] = matched[prior]
+            col = prior
+    col_indices = np.flatnonzero(matched[1:])
+    row_indices = matched[col_indices + 1] - 1
+    if transposed:
+        row_indices, col_indices = col_indices, row_indices
+    order = np.argsort(row_indices)
+    return row_indices[order], col_indices[order]
 
 
 def estimate_frame_rms_threshold(
@@ -214,6 +275,47 @@ def save_embedding_cache(
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def reuse_live_embeddings(
+    cache_path: str | Path | None, signature: str, starts: list[int], ends: list[int]
+) -> dict[int, np.ndarray]:
+    """Reuse only exact speech windows from a live cache for this model and PCM."""
+    if cache_path is None or not Path(cache_path).is_file():
+        return {}
+    expected = json.loads(signature)
+    try:
+        with np.load(cache_path, allow_pickle=False) as cached:
+            metadata = json.loads(str(cached["metadata"].item()))
+            if not isinstance(metadata, dict) or metadata.get("window_mode") != "live_commit":
+                return {}
+            keys = ("schema_version", "model", "sample_rate", "audio_sha256")
+            if any(metadata.get(key) != expected[key] for key in keys):
+                return {}
+            vectors, old_starts, old_ends = cached["embeddings"], cached["starts"], cached["ends"]
+            if (
+                vectors.ndim != 2
+                or vectors.shape[1] != 192
+                or len(vectors) != len(old_starts)
+                or len(vectors) != len(old_ends)
+                or old_starts.ndim != 1
+                or old_ends.ndim != 1
+                or not np.isfinite(vectors).all()
+            ):
+                return {}
+            # Short live windows may be padded using different surrounding PCM.
+            known = {
+                (int(a), int(b)): vector
+                for a, b, vector in zip(old_starts, old_ends, vectors, strict=True)
+                if b - a >= _MIN_EMBED_SAMPLES
+            }
+            return {
+                index: known[a, b]
+                for index, (a, b) in enumerate(zip(starts, ends, strict=True))
+                if (a, b) in known
+            }
+    except (OSError, ValueError, KeyError, EOFError, TypeError, zipfile.BadZipFile):
+        return {}
 
 
 def build_cache_signature(

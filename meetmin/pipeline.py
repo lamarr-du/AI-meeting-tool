@@ -25,7 +25,9 @@ from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
 from .audio.segments import SessionLock
 from .audio.session_recorder import SessionRecorder
+from .config import DEFAULT_TARGET_RMS
 from .diarization.align import UNKNOWN_NAME, assign_speakers, relabel
+from .diarization.live_recovery import restore_live_speaker_names
 from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
 from .speakers import rename_speakers, speaker_preview
@@ -76,6 +78,7 @@ class Pipeline:
             "silence_threshold": float(rcfg.get("silence_threshold", 0.003)),
             "segment_seconds": float(rcfg.get("segment_seconds", 300)),
             "sync_seconds": float(rcfg.get("sync_seconds", 10)),
+            "target_rms": float(rcfg.get("target_rms", DEFAULT_TARGET_RMS)),
             "output_sample_rate": 16000,
             "output_channels": 1,
         }
@@ -168,6 +171,7 @@ class Pipeline:
                 )
 
         provider_name = provider.name
+        microphone_result = None
         try:
             if on_asr_ready is not None:
                 on_asr_ready()
@@ -181,11 +185,27 @@ class Pipeline:
                 self.progress(f"[2a] 转写麦克风：{microphone}")
                 mic_result, mic_duration = transcribe_track(microphone)
                 report_track(mic_result)
+                microphone_result = (microphone, mic_result, mic_duration)
         finally:
             close = getattr(provider, "close", None)
             if close is not None:
                 close()
 
+        return self._save_raw_asr(
+            session, provider_name, (audio, result, duration), microphone_result, file_url=file_url
+        )
+
+    def _save_raw_asr(
+        self,
+        session: Session,
+        provider_name: str,
+        loopback: tuple[Path, ASRResult, float],
+        microphone: tuple[Path, ASRResult, float] | None,
+        *,
+        file_url: str | None = None,
+    ) -> dict:
+        audio, result, duration = loopback
+        utterances = [u for u in result.utterances if u.text.strip()]
         raw: dict[str, Any] = {
             "session_id": session.session_id,
             "audio_path": str(Path(audio).resolve())
@@ -226,11 +246,12 @@ class Pipeline:
                 k: dc[k] for k in ("model", "speaker_count", "language_hints") if k in dc
             }
         if microphone is not None:
+            microphone_path, mic_result, mic_duration = microphone
             mic_utterances = [u for u in mic_result.utterances if u.text.strip()]
             for u in mic_utterances:
                 u.speaker = "我"
             raw["microphone"] = {
-                "audio_path": str(microphone.resolve()),
+                "audio_path": str(microphone_path.resolve()),
                 "language": mic_result.language,
                 "asr": {k: v for k, v in mic_result.extra.items() if k != "duration"},
                 "utterances": [u.to_dict() for u in mic_utterances],
@@ -244,7 +265,12 @@ class Pipeline:
         return raw
 
     def diarize(
-        self, session: Session, *, on_model_download: Callable[[bool], None] | None = None
+        self,
+        session: Session,
+        *,
+        on_model_download: Callable[[bool], None] | None = None,
+        suppressed_microphone: set[int] | None = None,
+        restore_live_names: bool = False,
     ) -> dict:
         """从原始转写重建精简转写；绝不调用 ASR。"""
         import json
@@ -278,6 +304,44 @@ class Pipeline:
             for u in utterances:
                 u.speaker = "说话人A"
             speakers = ["说话人A"] if utterances else []
+        if restore_live_names:
+            try:
+                restored = restore_live_speaker_names(utterances, session.root / "events.jsonl")
+            except OSError as exc:
+                self.progress(f"  ! 无法读取录中说话人姓名：{exc}")
+            else:
+                if restored is not utterances:
+                    utterances = restored
+                    speakers = list(
+                        dict.fromkeys(
+                            u.speaker
+                            for u in utterances
+                            if isinstance(u.speaker, str) and u.speaker != UNKNOWN_NAME
+                        )
+                    )
+                    self.progress("  ✓ 已按录音时间轴还原录中标记的说话人姓名。")
+        return self._publish_aligned_transcript(
+            session,
+            raw,
+            utterances,
+            speakers,
+            on_model_download=on_model_download,
+            error=error,
+            suppressed_microphone=suppressed_microphone,
+        )
+
+    def _publish_aligned_transcript(
+        self,
+        session: Session,
+        raw: dict,
+        utterances: list[Utterance],
+        speakers: list[str],
+        *,
+        on_model_download: Callable[[bool], None] | None = None,
+        error: str | None = None,
+        suppressed_microphone: set[int] | None = None,
+        speaker_names: dict[str, str] | None = None,
+    ) -> dict:
         local_whisper = (raw.get("asr") or {}).get("provider") == "faster_whisper"
         punctuator: Punctuator | None = None
         if local_whisper:
@@ -289,7 +353,9 @@ class Pipeline:
         if microphone := raw.get("microphone"):
             transcript["microphone"] = {k: v for k, v in microphone.items() if k != "utterances"}
             mic_utterances = [
-                Utterance.from_dict(u) for u in microphone["utterances"] if u["text"].strip()
+                Utterance.from_dict(u)
+                for index, u in enumerate(microphone["utterances"])
+                if u["text"].strip() and index not in (suppressed_microphone or ())
             ]
             for u in mic_utterances:
                 u.speaker = "我"
@@ -307,7 +373,9 @@ class Pipeline:
                 )
             )
         transcript["speakers"] = speakers
-        transcript["diarization"] = dict(dcfg)
+        transcript["diarization"] = dict(self.cfg.get("diarization") or {})
+        if speaker_names:
+            transcript["speaker_names"] = speaker_names
         if error is not None:
             transcript["diarization_status"] = {"status": "fallback", "error": error}
         transcript["utterances"] = [u.to_dict() for u in utterances]

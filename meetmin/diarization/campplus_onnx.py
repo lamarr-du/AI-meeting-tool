@@ -24,6 +24,7 @@ from .clustering import (
     extract_wave_slice,
     load_embedding_cache,
     merge_non_overlapping,
+    reuse_live_embeddings,
     save_embedding_cache,
 )
 
@@ -123,6 +124,8 @@ class CampplusOnnxDiarizer(Diarizer):
         cached = try_to_load_from_cache(CAMPPLUS_REPO, CAMPPLUS_FILE, cache_dir=self._hub_cache)
         if isinstance(cached, str) and Path(cached).is_file():
             return Path(cached)
+        if self.dcfg.get("local_files_only"):
+            raise FileNotFoundError(f"本地声纹模型未缓存：{CAMPPLUS_REPO}/{CAMPPLUS_FILE}")
 
         if self._on_model_download is not None:
             self._on_model_download(True)
@@ -161,6 +164,10 @@ class CampplusOnnxDiarizer(Diarizer):
             vecs.append(vec / max(norm, 1e-9))
         return np.stack(vecs, axis=0)
 
+    def embed_waveforms(self, wavs: list[np.ndarray]) -> np.ndarray:
+        """Encode local 16 kHz mono waveforms on CPU."""
+        return self._embed_waveforms(wavs)
+
     def _model_signature(self) -> str:
         configured = self.dcfg.get("model_path")
         if configured:
@@ -187,8 +194,23 @@ class CampplusOnnxDiarizer(Diarizer):
         )
         emb = load_embedding_cache(cache_path, signature, starts, ends)
         if emb is None:
-            wavs = [extract_wave_slice(audio16k, a, b) for a, b in zip(starts, ends)]
-            emb = self._embed_waveforms(wavs)
+            reused = reuse_live_embeddings(cache_path, signature, starts, ends)
+            missing = [
+                extract_wave_slice(audio16k, a, b)
+                for index, (a, b) in enumerate(zip(starts, ends, strict=True))
+                if index not in reused
+            ]
+            fresh = self._embed_waveforms(missing)
+            if reused:
+                new_vectors = iter(fresh)
+                emb = np.stack(
+                    [
+                        reused[index] if index in reused else next(new_vectors)
+                        for index in range(len(starts))
+                    ]
+                )
+            else:
+                emb = fresh
             save_embedding_cache(cache_path, emb, starts, ends, signature)
         if not starts:
             return []

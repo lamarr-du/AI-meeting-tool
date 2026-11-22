@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
+import time
 import uuid
+from collections.abc import Callable
+from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 from ..session import Session
 from .loopback_recorder import LoopbackRecorder, RecordingError
+from .ring_buffer import AudioEvent
 from .segments import SessionLock, merge_segments
 
 TRACKS = (("loopback", "audio.wav"), ("microphone", "microphone.wav"))
+RECORDING_DIAGNOSTICS = "recording_diagnostics.jsonl"
 
 
 class SessionRecorder:
@@ -24,10 +33,18 @@ class SessionRecorder:
         self._session: Session
         self._take: Path | None = None
         self._prepared: list[LoopbackRecorder] = []
+        self._last_diagnostic = 0.0
+        self._last_status_key: tuple[bool, int] = (False, 0)
 
     @property
     def dual_track(self) -> bool:
         return len(self._recorders) > 1
+
+    def set_audio_tap(self, callback: Callable[[str, AudioEvent], None] | None) -> None:
+        if self._lock is not None:
+            raise RuntimeError("只能在录音启动前设置实时音频分流")
+        for recorder, (track, _) in zip(self._recorders, TRACKS):
+            recorder.audio_tap = partial(callback, track) if callback is not None else None
 
     def start(self, session: Session, *, overwrite: bool = False) -> None:
         if self._lock is not None:
@@ -36,6 +53,8 @@ class SessionRecorder:
         self._lock = SessionLock(session.ensure().root)
         self._prepared = []
         self._take = None
+        self._last_diagnostic = time.monotonic()
+        self._last_status_key = (False, 0)
         recorder: LoopbackRecorder | None = None
         try:
             if not overwrite and (
@@ -57,6 +76,7 @@ class SessionRecorder:
             start = self._recorders[0]._now()
             for recorder in self._prepared:
                 recorder._begin(start)
+            self._diagnose("recording.started", self._status(allow_restart=True))
         except Exception as error:
             if recorder is not None:
                 recorder._fail(error)
@@ -66,11 +86,65 @@ class SessionRecorder:
             raise
 
     def status(self) -> dict:
-        info = self._recorders[0].status()
+        info = self._status(allow_restart=True)
+        if self._lock is None:
+            return info
+        status_key = (bool(info["failed"]), int(info["stream_restart_attempts"]))
+        now = time.monotonic()
+        if status_key != self._last_status_key:
+            self._diagnose("recording.status_changed", info)
+        elif now - self._last_diagnostic >= 30:
+            self._diagnose("recording.checkpoint", info)
+        else:
+            return info
+        self._last_diagnostic = now
+        self._last_status_key = status_key
+        return info
+
+    def _status(self, *, allow_restart: bool) -> dict:
+        info = self._recorders[0].status(allow_restart=allow_restart)
         if self.dual_track:
             info["microphone"] = self._recorders[1].status()
             info["failed"] |= info["microphone"]["failed"]
         return info
+
+    def _diagnose(self, event: str, info: dict) -> None:
+        tracks = {}
+        for recorder, (track, _) in zip(self._prepared, TRACKS):
+            values = info.get("microphone") if track == "microphone" else info
+            if values is None:
+                continue
+            tracks[track] = {
+                "device": recorder.device_name,
+                "sample_rate": recorder.sample_rate_actual,
+                "channels": recorder.channels_actual,
+                "chunk_ms": recorder.chunk_ms,
+                **{
+                    key: values[key]
+                    for key in (
+                        "state",
+                        "duration_sec",
+                        "received_sec",
+                        "padded_sec",
+                        "no_data_sec",
+                        "timing_mode",
+                        "repaired_timestamp_blocks",
+                        "stream_restart_attempts",
+                        "stream_restarts",
+                        "error",
+                        "cleanup_errors",
+                    )
+                    if key in values
+                },
+            }
+        entry = {"time": datetime.now().astimezone().isoformat(), "event": event, "tracks": tracks}
+        try:
+            with (self._session.root / RECORDING_DIAGNOSTICS).open("a", encoding="utf-8") as log:
+                log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                log.flush()
+                os.fsync(log.fileno())
+        except OSError:
+            logging.getLogger("meetmin").warning("无法写入会话录音诊断日志", exc_info=True)
 
     def stop(self) -> dict:
         if self._lock is None:
@@ -113,6 +187,7 @@ class SessionRecorder:
             info["finalized"] = False
             raise RecordingError(f"发布录音失败：{error}", info) from error
         finally:
+            self._diagnose("recording.failed" if info["failed"] else "recording.stopped", info)
             if not info["cleanup_pending"]:
                 self._release()
         return info

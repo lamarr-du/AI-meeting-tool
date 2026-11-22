@@ -165,13 +165,14 @@ def assign_speakers(
     return out
 
 
+def speaker_name(index: int) -> str:
+    return "说话人" + (chr(ord("A") + index) if index < 26 else str(index + 1))
+
+
 def relabel(utterances: list[Utterance]) -> list[str]:
     """把内部簇标签/云端 speaker_id 按首次发言顺序映射为 '说话人A/B/...'，原地改写并返回名单。"""
     mapping: dict = {}
     speakers: list[str] = []
-
-    def name_for(i: int) -> str:
-        return "说话人" + (chr(ord("A") + i) if i < 26 else str(i + 1))
 
     for u in utterances:
         key = u.speaker
@@ -179,7 +180,7 @@ def relabel(utterances: list[Utterance]) -> list[str]:
             u.speaker = UNKNOWN_NAME
             continue
         if key not in mapping:
-            mapping[key] = name_for(len(speakers))
+            mapping[key] = speaker_name(len(speakers))
             speakers.append(mapping[key])
         u.speaker = mapping[key]
     return speakers

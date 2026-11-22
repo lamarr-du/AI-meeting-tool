@@ -90,6 +90,8 @@ QComboBox::down-arrow { image: none; }
 QToolButton#moreActions { padding-right: 24px; }
 QToolButton::menu-indicator { subcontrol-origin: padding; subcontrol-position: center right; }
 QListWidget#historyList { background: transparent; border: 0; outline: 0; }
+QToolButton#historyActions { padding: 0; border: 0; border-radius: 5px; font-size: 18px; }
+QToolButton#historyActions::menu-indicator { image: none; width: 0; }
 QTabWidget::pane { border: 0; border-top: 1px solid #ebe6f2; }
 QTabWidget::tab-bar { left: 16px; }
 QTabBar::tab {
@@ -241,7 +243,7 @@ class HistoryDelegate(QStyledItemDelegate):
         icon.paint(painter, int(rect.x()) + 10, int(rect.y()) + 16, 19, 19)
         title = str(index.data() or "")
         date = str(index.data(HISTORY_DATE) or "")
-        title_rect = rect.adjusted(38, 3 if date else 0, -9, -24 if date else 0)
+        title_rect = rect.adjusted(38, 3 if date else 0, -38, -24 if date else 0)
         font = QFont(option.font)
         font.setWeight(QFont.Weight.DemiBold if selected else QFont.Weight.Normal)
         painter.setFont(font)

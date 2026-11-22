@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import queue
 import threading
@@ -17,7 +18,9 @@ from typing import Any
 
 import numpy as np
 
+from ..config import DEFAULT_TARGET_RMS, MAX_TARGET_RMS, MIN_TARGET_RMS
 from .dsp import rms
+from .ring_buffer import SAMPLE_RATE, AudioEvent, IdleTick, PcmChunk
 from .segments import SegmentedWriter, merge_segments
 
 
@@ -87,13 +90,13 @@ class _AudioBlock:
 class _AdaptiveLevel:
     """在量化为 16 位 PCM 前补偿低电平。由写线程持有，每次录音重新初始化。"""
 
-    TARGET_RMS = 0.03
     RELEASE_SECONDS = 0.08
     RESET_AFTER_SILENCE_SECONDS = 0.2
 
-    def __init__(self, rate: int, *, max_gain: float, noise_floor: float = 0.0):
+    def __init__(self, rate: int, *, max_gain: float, target_rms: float, noise_floor: float = 0.0):
         self.rate = rate
         self.max_gain = max_gain
+        self.target_rms = target_rms
         self.noise_floor = noise_floor
         self.reference = 0.0
         self.gain: float | None = None
@@ -125,7 +128,7 @@ class _AdaptiveLevel:
             boost_fraction = max(0.0, min(1.0, (level - self.noise_floor) / self.noise_floor))
             gain_limit = 1.0 + (self.max_gain - 1.0) * boost_fraction
         # Leave peak headroom when boosting and pass normal-level audio through at unity gain.
-        gain = max(1.0, min(self.TARGET_RMS / self.reference, gain_limit, 0.95 / peak))
+        gain = max(1.0, min(self.target_rms / self.reference, gain_limit, 0.95 / peak))
         if self.gain is not None and gain > self.gain:
             ramp = np.linspace(self.gain, gain, frames, dtype=np.float32)
             samples = samples.reshape(frames, -1) * ramp[:, None]
@@ -144,29 +147,34 @@ class _Timeline:
         self.stream_origin = stream_origin
         self.mode = "pending"
         self.previous_adc: float | None = None
+        self.previous_callback: float | None = None
+        self.previous_received: float | None = None
         self.tolerance = max(round(rate * 0.02), chunk_frames // 2)
+        self.bridge_limit = 2 * chunk_frames
+        self.bridged_frames = 0
+        self.repaired_blocks = 0
 
     def position(self, block: _AudioBlock, cursor: int) -> int:
-        adc = block.timing.get("input_buffer_adc_time", 0.0)
-        current = block.timing.get("current_time", 0.0)
-        valid = (
-            isinstance(adc, (int, float))
-            and isinstance(current, (int, float))
-            and math.isfinite(adc)
-            and math.isfinite(current)
-            and 0 < adc <= current
-        )
+        adc = self._timestamp(block.timing.get("input_buffer_adc_time"))
+        current = self._timestamp(block.timing.get("current_time"))
+        valid = adc is not None and current is not None and adc <= current
         if self.mode == "pending":
             self.mode = "device" if valid and self.stream_origin is not None else "arrival"
         if self.mode == "device":
-            if not valid or (self.previous_adc is not None and adc <= self.previous_adc):
-                raise RuntimeError("音频采集时间戳无效或倒退，无法可靠定位音频")
             assert self.stream_origin is not None
-            seconds = adc - self.stream_origin
+            seconds = adc - self.stream_origin if adc is not None else None
             # Reject a clock reset / bogus timestamp before it can generate a huge zero-filled file.
-            if seconds > block.received_at - self.start + 0.5 or seconds < -0.5:
+            if seconds is not None and not -0.5 <= seconds <= block.received_at - self.start + 0.5:
                 raise RuntimeError("音频采集时钟与录音时钟不一致")
+            if not valid or (
+                adc is not None and self.previous_adc is not None and adc <= self.previous_adc
+            ):
+                return self._bridge_timestamp(block, cursor, adc, current)
+            assert seconds is not None
             self.previous_adc = adc
+            self.previous_callback = current
+            self.previous_received = block.received_at
+            self.bridged_frames = 0
         else:
             # Arrival timing is approximate: scheduler delays are indistinguishable from gaps.
             seconds = block.received_at - self.start - block.frames / self.rate
@@ -176,6 +184,45 @@ class _Timeline:
             raise RuntimeError("音频块严重重叠或迟到，无法可靠保持时间轴")
         # WASAPI timestamps have jitter; contiguous blocks must not acquire tiny gaps each time.
         return target if delta > self.tolerance or cursor == 0 else cursor
+
+    @staticmethod
+    def _timestamp(value: object) -> float | None:
+        if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+            return float(value)
+        return None
+
+    def _bridge_timestamp(
+        self, block: _AudioBlock, cursor: int, adc: float | None, current: float | None
+    ) -> int:
+        assert self.previous_received is not None
+        limit = (block.frames + self.tolerance) / self.rate
+        # A callback can arrive late on the Python thread. Either clock can
+        # confirm consecutive packets, but neither can justify inventing a gap.
+        arrival_step = block.received_at - self.previous_received
+        callback_step = (
+            current - self.previous_callback
+            if current is not None and self.previous_callback is not None
+            else math.inf
+        )
+        continuous = 0 <= arrival_step <= limit or (
+            0 <= arrival_step <= 0.5 and 0 < callback_step <= limit
+        )
+        if (
+            self.bridged_frames + block.frames > self.bridge_limit
+            or not continuous
+            or (
+                adc is not None
+                and self.previous_adc is not None
+                and adc < self.previous_adc - self.tolerance / self.rate
+            )
+            or (adc is not None and current is not None and adc - current > limit)
+        ):
+            raise RuntimeError("音频采集时间戳无效或倒退，无法可靠定位音频")
+        self.bridged_frames += block.frames
+        self.repaired_blocks += 1
+        self.previous_callback = current
+        self.previous_received = block.received_at
+        return cursor
 
 
 class LoopbackRecorder:
@@ -196,6 +243,7 @@ class LoopbackRecorder:
         sync_seconds: float = 10,
         output_sample_rate: int | None = None,
         output_channels: int | None = None,
+        target_rms: float = DEFAULT_TARGET_RMS,
     ):
         self.device = device
         self.channels = channels
@@ -203,8 +251,13 @@ class LoopbackRecorder:
         self.output_sample_rate = output_sample_rate
         self.output_channels = output_channels
         self._resampler: Any = None
+        self.audio_tap: Callable[[AudioEvent], None] | None = None
+        self._output_samples = 0
         self.chunk_ms = max(20, int(chunk_ms))
         self.silence_threshold = float(silence_threshold)
+        self.target_rms = float(target_rms)
+        if not MIN_TARGET_RMS <= self.target_rms <= MAX_TARGET_RMS:
+            raise ValueError("target_rms 必须在 0.001 到 0.3 之间")
         if not 0 <= self.silence_threshold <= 1:
             raise ValueError("silence_threshold 必须在 0 到 1 之间")
         if not math.isfinite(queue_seconds) or queue_seconds <= 0:
@@ -225,6 +278,8 @@ class LoopbackRecorder:
         self._producer_done = threading.Event()
         self._failed = threading.Event()
         self._errors: queue.SimpleQueue[Exception] = queue.SimpleQueue()
+        self._restart_attempts = 0
+        self._stream_restarts = 0
         self._queue: queue.Queue[_AudioBlock] = queue.Queue(self._queue_size)
         self._state = "IDLE"
         self._started_at = 0.0
@@ -300,7 +355,7 @@ class LoopbackRecorder:
 
     def _create_level_control(self, rate: int, info: dict) -> _AdaptiveLevel | None:
         if info.get("isLoopbackDevice"):
-            return _AdaptiveLevel(rate, max_gain=10_000.0)  # Up to 80 dB for playback attenuation.
+            return _AdaptiveLevel(rate, max_gain=10_000.0, target_rms=self.target_rms)
         return None
 
     # ---------------- 生命周期 ----------------
@@ -334,6 +389,8 @@ class LoopbackRecorder:
         self._producer_done.clear()
         self._failed.clear()
         self._errors = queue.SimpleQueue()
+        self._restart_attempts = 0
+        self._stream_restarts = 0
         self._queue = queue.Queue(self._queue_size)
         self._error = None
         self._secondary_errors = []
@@ -342,6 +399,7 @@ class LoopbackRecorder:
         self._finalized = False
         self._received_frames = 0
         self._padded_frames = 0
+        self._output_samples = 0
         with self._level_lock:
             self._frames = self._silent_frames = self._active_frames = 0
             self._level = 0.0
@@ -358,6 +416,8 @@ class LoopbackRecorder:
         output_ch = self.output_channels or ch
         if output_rate <= 0 or output_ch not in (1, ch):
             raise ValueError("录音保存格式的采样率或声道数无效")
+        if self.audio_tap is not None and (output_rate != SAMPLE_RATE or output_ch != 1):
+            raise ValueError("实时转写需要 16 kHz 单声道 PCM")
         self._resampler = None
         if output_rate != sr:
             import soxr
@@ -448,6 +508,7 @@ class LoopbackRecorder:
 
     def _run(self) -> None:
         pending: _AudioBlock | None = None
+        last_tick = 0.0
         try:
             while not self._producer_done.is_set() or not self._queue.empty():
                 try:
@@ -455,6 +516,25 @@ class LoopbackRecorder:
                 except queue.Empty:
                     assert self._wf is not None
                     self._wf.checkpoint()
+                    if self.audio_tap is not None and self._stop_at is None:
+                        now = self._now()
+                        # A valid ADC position can be up to 0.5 s ahead of arrival.
+                        # Keep the last block until a future stop cannot trim it.
+                        if pending is not None and now - pending.received_at >= (
+                            0.5 + pending.frames / self.sample_rate_actual
+                        ):
+                            self._write_block(pending)
+                            pending = None
+                        if (
+                            pending is None
+                            and self._last_data_time is not None
+                            and now - self._last_data_time >= 0.2
+                            and now - last_tick >= 0.1
+                        ):
+                            self._send_audio(
+                                IdleTick(round((now - self._started_at) * SAMPLE_RATE))
+                            )
+                            last_tick = now
                     continue
                 # Hold the last block so stop() can trim samples past the stop boundary.
                 if pending is not None:
@@ -510,7 +590,24 @@ class LoopbackRecorder:
             samples = samples[:, 0]
         if self._resampler is not None:
             samples = self._resampler.resample_chunk(samples)
-        self._wf.writeframesraw(samples.astype("<i2", copy=False).tobytes())
+        self._write_pcm(self._wf, samples)
+
+    def _write_pcm(self, writer: SegmentedWriter, samples: np.ndarray) -> None:
+        pcm = samples.astype("<i2", copy=False).tobytes()
+        writer.writeframesraw(pcm)
+        if self.audio_tap is not None and pcm:
+            start = self._output_samples
+            self._output_samples += len(samples)
+            self._send_audio(PcmChunk(start, pcm))
+
+    def _send_audio(self, event: AudioEvent) -> None:
+        callback = self.audio_tap
+        if callback is not None:
+            try:
+                callback(event)
+            except Exception:
+                self.audio_tap = None
+                logging.getLogger("meetmin").exception("实时音频分流已停止，继续保存录音")
 
     def _close_audio(self) -> None:
         # Called by the writer, or by start() only if no writer was ever started.
@@ -524,7 +621,7 @@ class LoopbackRecorder:
                         tail = self._resampler.resample_chunk(
                             np.empty(shape, dtype=np.int16), last=True
                         )
-                        writer.writeframesraw(tail.astype("<i2", copy=False).tobytes())
+                        self._write_pcm(writer, tail)
                         self._resampler = None
                 finally:
                     writer.close()
@@ -553,13 +650,29 @@ class LoopbackRecorder:
                 self._silent_frames = 0
                 self._active_frames += frames
 
-    def status(self) -> dict:
+    def _restart_inactive_stream(self) -> None:
+        """Try once on the same stream, retaining its clock and the writer."""
+        self._restart_attempts += 1
+        try:
+            self._stream.stop_stream()
+            self._stream.start_stream()
+            if not self._stream.is_active():
+                raise RuntimeError("重启后设备仍未处于采集状态")
+        except Exception as error:
+            self._fail(RuntimeError(f"录音流意外停止，自动重启失败：{error!r}"))
+        else:
+            self._stream_restarts += 1
+
+    def status(self, *, allow_restart: bool = False) -> dict:
         if self._state == "RECORDING" and not self._failed.is_set():
             try:
-                if not self._stream.is_active():
-                    self._fail(RuntimeError("录音流意外停止"))
-                elif self._thread is None or not self._thread.is_alive():
+                if self._thread is None or not self._thread.is_alive():
                     self._fail(RuntimeError("录音写线程意外退出"))
+                elif not self._stream.is_active():
+                    if allow_restart and self._stop_at is None and not self._restart_attempts:
+                        self._restart_inactive_stream()
+                    else:
+                        self._fail(RuntimeError("录音流意外停止"))
             except Exception as error:
                 self._fail(error)
         self._collect_errors()
@@ -578,9 +691,14 @@ class LoopbackRecorder:
                 "state": "FAILED" if self._failed.is_set() else self._state,
                 "error": str(self._error) if self._error is not None else None,
                 "cleanup_errors": list(self._secondary_errors),
+                "stream_restart_attempts": self._restart_attempts,
+                "stream_restarts": self._stream_restarts,
                 "received_sec": self._received_frames / sr,
                 "padded_sec": self._padded_frames / sr,
                 "timing_mode": self._timeline.mode if self._timeline is not None else "pending",
+                "repaired_timestamp_blocks": (
+                    self._timeline.repaired_blocks if self._timeline is not None else 0
+                ),
                 "finalized": self._finalized,
                 "cleanup_pending": self._thread is not None
                 or self._stream is not None
@@ -676,7 +794,7 @@ class LoopbackRecorder:
 
 class MicrophoneRecorder(LoopbackRecorder):
     def _create_level_control(self, rate: int, info: dict) -> _AdaptiveLevel:
-        return _AdaptiveLevel(rate, max_gain=16.0, noise_floor=0.0003)
+        return _AdaptiveLevel(rate, max_gain=16.0, target_rms=self.target_rms, noise_floor=0.0003)
 
     def _resolve_device(self, pa):
         pyaudio = _import_pyaudio()

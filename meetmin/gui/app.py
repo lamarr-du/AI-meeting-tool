@@ -9,8 +9,9 @@ import time
 from collections.abc import Callable
 from html import escape
 from pathlib import Path
+from queue import SimpleQueue
 from threading import Event
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from PySide6.QtCore import QProcess, QSettings, QSize, QStandardPaths, Qt, QThread, QUrl, Signal
@@ -53,13 +54,15 @@ from PySide6.QtWidgets import (
 
 from ..asr.model_download import ModelDownloadProgress
 from ..audio.loopback_recorder import RecordingError, list_loopback_devices, list_microphone_devices
-from ..audio.session_recorder import SessionRecorder
-from ..config import deep_merge, load_config
+from ..audio.session_recorder import RECORDING_DIAGNOSTICS, SessionRecorder
+from ..config import MAX_TARGET_RMS, MIN_TARGET_RMS, deep_merge, load_config
+from ..live_pipeline import SpeakerRenames
 from ..pipeline import Pipeline
 from ..session import Session
 from ..summarizer.llm_client import MockLLM, get_llm
 from ..textutil import ts
 from . import workflow
+from .live_transcript import LiveTranscriptView
 from .settings import SettingsDialog
 from .style import (
     HISTORY_DATE,
@@ -188,18 +191,56 @@ class Job(QThread):
     log = Signal(str)
     meter = Signal(dict)
     model_download = Signal(object)
+    live_event = Signal(dict)
 
     def __init__(self, action: Callable[[Job], Any], parent: QWidget):
         super().__init__(parent)
         self.action = action
         self.result: Any = None
         self.error: Exception | None = None
+        self.speaker_renames: SpeakerRenames = SimpleQueue()
 
     def run(self) -> None:
         try:
             self.result = self.action(self)
         except Exception as error:
             self.error = error
+
+
+class HistoryList(QListWidget):
+    action_requested = Signal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.setMouseTracking(True)
+        self.button = QToolButton(self.viewport())
+        self.button.setObjectName("historyActions")
+        self.button.setText("⋯")
+        self.button.setAccessibleName("会议操作")
+        self.button.setFixedSize(28, 28)
+        self.button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.session_id = ""
+        menu = QMenu(self.button)
+        menu.addAction("改名…", lambda: self.action_requested.emit(self.session_id, "rename"))
+        menu.addAction("删除…", lambda: self.action_requested.emit(self.session_id, "delete"))
+        self.button.setMenu(menu)
+        self.button.hide()
+        self.verticalScrollBar().valueChanged.connect(self.button.hide)
+
+    def mouseMoveEvent(self, event) -> None:
+        item = self.itemAt(event.position().toPoint())
+        if item is None:
+            self.button.hide()
+        else:
+            self.session_id = item.data(Qt.ItemDataRole.UserRole)
+            rect = self.visualItemRect(item)
+            self.button.move(rect.right() - self.button.width() - 7, rect.center().y() - 14)
+            self.button.show()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.button.hide()
+        super().leaveEvent(event)
 
 
 class MeetingWindow(QMainWindow):
@@ -257,13 +298,14 @@ class MeetingWindow(QMainWindow):
         navigation.addWidget(self.new)
         navigation.addSpacing(8)
         navigation.addWidget(label("会议历史", "navCaption"))
-        self.sessions = QListWidget()
+        self.sessions = HistoryList()
         self.sessions.setObjectName("historyList")
         self.sessions.setUniformItemSizes(True)
         self.sessions.setMouseTracking(True)
         self.sessions.setItemDelegate(HistoryDelegate(self.sessions))
         self.sessions.setAccessibleName("会议历史")
         self.sessions.currentItemChanged.connect(self.select_session)
+        self.sessions.action_requested.connect(self.history_action)
         navigation.addWidget(self.sessions, 1)
         divider = QFrame()
         divider.setObjectName("navDivider")
@@ -356,10 +398,15 @@ class MeetingWindow(QMainWindow):
         result_layout.setContentsMargins(1, 1, 1, 1)
         self.tabs = QTabWidget()
         self.transcript = MarkdownPreview("会议转写")
+        self.live_transcript = LiveTranscriptView()
+        self.live_transcript.rename_requested.connect(self.rename_live_speaker)
+        self.transcript_stack = QStackedWidget()
+        self.transcript_stack.addWidget(self.transcript)
+        self.transcript_stack.addWidget(self.live_transcript)
         self.minutes = MarkdownPreview("会议纪要")
         self.log = QPlainTextEdit(readOnly=True, maximumBlockCount=300)
         self.log.setAccessibleName("处理日志")
-        self.tabs.addTab(self.transcript, "转写")
+        self.tabs.addTab(self.transcript_stack, "转写")
         self.tabs.addTab(self.minutes, "纪要")
         self.tabs.addTab(self.log, "处理日志")
         result_layout.addWidget(self.tabs)
@@ -407,9 +454,19 @@ class MeetingWindow(QMainWindow):
         buttons.addWidget(self.import_button)
         buttons.addStretch()
         form.addLayout(buttons)
-        hint = label("录音结束或导入后自动转写", "muted")
-        hint.setWordWrap(True)
-        form.addWidget(hint)
+        self.live_enabled = QCheckBox("边录边转写")
+        self.live_enabled.setChecked(
+            cast(
+                bool,
+                self.settings.value(
+                    "live_enabled", bool((self.cfg.get("live") or {}).get("enabled")), type=bool
+                ),
+            )
+        )
+        self.live_enabled.toggled.connect(
+            lambda checked: self.settings.setValue("live_enabled", checked)
+        )
+        form.addWidget(self.live_enabled)
         form.addStretch()
         columns.addLayout(form, 5)
 
@@ -461,9 +518,9 @@ class MeetingWindow(QMainWindow):
         self.stop.setIcon(line_icon("stop", "#89253e"))
         self.stop.clicked.connect(self.request_stop)
         controls.addWidget(self.stop)
-        hint = label("停止后自动转写", "muted")
-        hint.setWordWrap(True)
-        controls.addWidget(hint, 1)
+        self.record_hint = label("", "muted")
+        self.record_hint.setWordWrap(True)
+        controls.addWidget(self.record_hint, 1)
         timer.addLayout(controls)
         timer.addStretch()
         columns.addLayout(timer, 5)
@@ -559,6 +616,51 @@ class MeetingWindow(QMainWindow):
         self.session = session
         self.render_session()
 
+    def history_action(self, session_id: str, action: str) -> None:
+        session = Session(self.cfg["output_dir"], session_id)
+        title = str(workflow.metadata(session).get("title") or session_id)
+        selected = self.session
+        if action == "rename":
+            name, accepted = QInputDialog.getText(self, "改名", "会议名称", text=title)
+            if not accepted:
+                return
+            name = name.strip()
+            if not name:
+                QMessageBox.warning(self, "无法改名", "会议名称不能为空。")
+                return
+            try:
+                if not session.root.is_dir() or session.root.is_symlink():
+                    raise FileNotFoundError("会话文件夹不存在或不可用")
+                metadata = workflow.metadata(session)
+                metadata["title"] = name
+                session.save_json("meeting.json", metadata)
+            except OSError as error:
+                QMessageBox.warning(self, "改名失败", str(error))
+                return
+        elif action == "delete":
+            if (
+                QMessageBox.question(
+                    self,
+                    "删除会议",
+                    f"确定删除会议「{title}」吗？\n\n会话文件夹中的音频、转写和纪要等文件都将被永久删除。",
+                    defaultButton=QMessageBox.StandardButton.No,
+                )
+                != QMessageBox.StandardButton.Yes
+            ):
+                return
+            try:
+                shutil.rmtree(session.root)
+            except OSError as error:
+                QMessageBox.warning(self, "删除失败", str(error))
+                self.refresh_history(selected)
+                return
+            if selected is not None and selected.session_id == session_id:
+                selected = None
+        else:
+            return
+        self.sessions.button.hide()
+        self.refresh_history(selected)
+
     def render_session(self) -> None:
         session = self.session
         session_id = session.session_id if session else ""
@@ -591,6 +693,8 @@ class MeetingWindow(QMainWindow):
         else:
             self.title.setText("新建会议")
         self.set_status(message, tone)
+        if self.stop_requested is None:
+            self.transcript_stack.setCurrentWidget(self.transcript)
         self.transcript.show_file(
             self.transcript_path, "转写完成后在这里查看带时间戳的发言。", f"# 会议转写 {session_id}"
         )
@@ -644,6 +748,7 @@ class MeetingWindow(QMainWindow):
         self.stop.setEnabled(capturing)
         self.import_button.setEnabled(ready)
         self.meeting_name.setEnabled(ready)
+        self.live_enabled.setEnabled(ready)
         self.loopback_devices.setEnabled(ready and self.loopback_available)
         self.microphone.setEnabled(ready and self.mic_available)
         self.microphone_devices.setEnabled(
@@ -694,6 +799,7 @@ class MeetingWindow(QMainWindow):
         self.job.log.connect(self.log.appendPlainText)
         self.job.meter.connect(self.show_meter)
         self.job.model_download.connect(self.show_model_download)
+        self.job.live_event.connect(self.live_transcript.apply_event)
         self.job.finished.connect(self.job_finished)
         self.job.start()
         self.update_controls()
@@ -747,6 +853,12 @@ class MeetingWindow(QMainWindow):
                 error += "\n录音文件仍在收尾，请点击「重试保存录音」。"
             elif was_recording and self.recovery:
                 error += "\n已写入的分段仍在，可以点击「恢复录音」。"
+            if (
+                was_recording
+                and self.session is not None
+                and (self.session.root / RECORDING_DIAGNOSTICS).is_file()
+            ):
+                error += "\n录音诊断日志已保存到会话文件夹。"
             self.log.appendPlainText(error)
             self.set_status("处理失败 · " + error, "error")
         elif done is not None:
@@ -757,7 +869,7 @@ class MeetingWindow(QMainWindow):
 
     def new_meeting(self) -> None:
         self.sessions.setCurrentRow(-1)
-        self.tabs.setCurrentWidget(self.transcript)
+        self.tabs.setCurrentWidget(self.transcript_stack)
         self.meeting_name.setFocus()
 
     def make_session(self, default_title: str) -> Session | None:
@@ -770,7 +882,7 @@ class MeetingWindow(QMainWindow):
             return None
         self.meeting_name.clear()
         self.refresh_history(session)
-        self.tabs.setCurrentWidget(self.transcript)
+        self.tabs.setCurrentWidget(self.transcript_stack)
         return session
 
     def start_recording(self) -> None:
@@ -791,19 +903,37 @@ class MeetingWindow(QMainWindow):
         stop_requested = self.stop_requested = Event()
         self.recorded_at = time.monotonic()
         self.show_meter({"microphone": {} if recorder.dual_track else None})
+        live = self.live_enabled.isChecked()
+        self.record_hint.setText("停止后归档转写" if live else "停止后自动转写")
+        if live:
+            self.live_transcript.reset(dual_track=recorder.dual_track)
+            self.transcript_stack.setCurrentWidget(self.live_transcript)
+            self.tabs.setCurrentWidget(self.transcript_stack)
+
+        def record_job(job: Job) -> dict:
+            args = (recorder, session, stop_requested, job.stage.emit, job.meter.emit)
+            if live:
+                return workflow.record_live(
+                    *args, cfg=cfg, emit=job.live_event.emit, renames=job.speaker_renames
+                )
+            return workflow.record(*args)
+
         self.launch(
             "正在启动录音…",
-            lambda job: workflow.record(
-                recorder, session, stop_requested, job.stage.emit, job.meter.emit
-            ),
+            record_job,
             lambda result: self.recording_saved(session, result),
         )
 
     def request_stop(self) -> None:
         if self.stop_requested is not None:
+            self.live_transcript.renaming_enabled = False
             self.stop_requested.set()
             self.set_status("正在保存录音…")
             self.update_controls()
+
+    def rename_live_speaker(self, speaker: int, name: str) -> None:
+        if self.job is not None and self.recording_active():
+            self.job.speaker_renames.put((speaker, name))
 
     def show_meter(self, status: dict) -> None:
         if self.stop_requested is None:
@@ -834,7 +964,22 @@ class MeetingWindow(QMainWindow):
                 self.log.appendPlainText(
                     f"{caption}有 {track['padded_sec']:.1f} 秒无数据，已补静音。"
                 )
-        if not self.close_after_recording:
+            if track and track.get("repaired_timestamp_blocks", 0):
+                self.log.appendPlainText(
+                    f"{caption}有 {track['repaired_timestamp_blocks']} 个音频块的采集时间戳异常，"
+                    "已按连续样本保留录音。"
+                )
+            if track and track.get("stream_restarts", 0):
+                self.log.appendPlainText(
+                    f"{caption}的录音流曾中断并已自动重启。中断前后的音频均已保留。"
+                )
+        if transcript := result.get("live_transcript"):
+            self.set_status("实时转写已归档。", "success")
+            self.transcription_saved(transcript)
+        elif error := result.get("live_error"):
+            self.log.appendPlainText(f"实时转写未完成：{error}")
+            self.set_status("录音已保存，可继续转写。", "warning")
+        elif not self.close_after_recording:
             self.transcribe_session(session)
 
     def import_audio(self) -> None:
@@ -869,7 +1014,7 @@ class MeetingWindow(QMainWindow):
         )
 
     def transcription_saved(self, result: dict) -> None:
-        self.tabs.setCurrentWidget(self.transcript)
+        self.tabs.setCurrentWidget(self.transcript_stack)
         if not result["utterances"]:
             self.set_status("转写未检测到发言。请检查录音设备或换一段音频。", "warning")
             self.generate.setEnabled(False)
@@ -1023,11 +1168,16 @@ class MeetingWindow(QMainWindow):
         output = dialog.output.text()
         selected = self.session if output == self.cfg["output_dir"] else None
         self.cfg["output_dir"] = output
+        self.cfg["recorder"]["target_rms"] = dialog.target_rms.value()
+        bleed = dialog.bleed_suppression.isChecked()
+        self.cfg.setdefault("live", {}).setdefault("bleed_suppression", {})["enabled"] = bleed
         self.cfg["llm"].update(
             base_url=dialog.url.text().strip(), model=dialog.model.text().strip()
         )
         self.api_key = dialog.key.text().strip()
         self.settings.setValue("output_dir", output)
+        self.settings.setValue("target_rms", dialog.target_rms.value())
+        self.settings.setValue("bleed_suppression", bleed)
         self.settings.setValue("llm_url", self.cfg["llm"]["base_url"])
         self.settings.setValue("llm_model", self.cfg["llm"]["model"])
         self.refresh_history(selected)
@@ -1069,10 +1219,32 @@ def run(config: Path | None) -> int:
             if not (Path(data) / "config.yaml").is_file():
                 cfg["recorder"]["microphone"] = True
         cfg["output_dir"] = settings.value("output_dir", str(output), type=str)
+        target_rms = cast(
+            float, settings.value("target_rms", cfg["recorder"]["target_rms"], type=float)
+        )
+        if MIN_TARGET_RMS <= target_rms <= MAX_TARGET_RMS:
+            cfg["recorder"]["target_rms"] = target_rms
+        live = cfg.get("live") or {}
+        bleed = live.get("bleed_suppression") or {}
+        bleed["enabled"] = settings.value(
+            "bleed_suppression", bleed.get("enabled", True), type=bool
+        )
+        live["bleed_suppression"] = bleed
+        cfg["live"] = live
         cfg["llm"]["base_url"] = settings.value("llm_url", cfg["llm"]["base_url"], type=str)
         cfg["llm"]["model"] = settings.value("llm_model", cfg["llm"]["model"], type=str)
         if getattr(sys, "frozen", False):
-            cfg["diarization"]["provider"] = "single"
+            provider = str(cfg["diarization"].get("provider", "campplus_onnx")).lower()
+            if provider in ("campplus_onnx", "campplus", "onnx", "3dspeaker"):
+                try:
+                    import onnxruntime
+
+                    if "CPUExecutionProvider" not in onnxruntime.get_available_providers():
+                        cfg["diarization"]["provider"] = "single"
+                except (ImportError, OSError):
+                    cfg["diarization"]["provider"] = "single"
+            elif provider != "single":
+                cfg["diarization"]["provider"] = "single"
         window = MeetingWindow(cfg, settings)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, yaml.YAMLError) as error:
         QMessageBox.critical(None, "无法启动 MeetMin", str(error))

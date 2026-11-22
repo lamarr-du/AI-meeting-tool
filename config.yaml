@@ -12,6 +12,7 @@ recorder:
   sample_rate: null   # 电脑内录采集采样率，null = 跟随设备；保存固定为 16 kHz
   microphone: false   # true = 同时录麦克风；临时启用可加 --mic
   microphone_device: null  # null = 默认 WASAPI 输入，也可填 devices 列出的麦克风索引
+  target_rms: 0.03          # 自适应增益目标 RMS（0.001–0.3）
   silence_threshold: 0.003  # 归一化 RMS；低于此值连续 30 秒告警
   segment_seconds: 300      # 分段长度（秒）
   sync_seconds: 10          # 活动分段同步磁盘的间隔（秒）
@@ -44,6 +45,22 @@ asr:
   word_timestamps: true      # 说话人分离对齐需要
   hf_endpoint: null          # 国内下不动模型时改: https://hf-mirror.com
   hf_disable_xet: true       # 规避 Xet 重建服务 401；需要 Xet 时设 false
+
+live:
+  enabled: true             # 桌面录音默认边录边转写，可在录音面板关闭
+  model_size: large-v3-turbo # 使用本地已缓存的模型，也可填写本地模型目录
+  device: auto              # auto / cpu / cuda
+  beam_size: 1              # 实时短窗使用贪心解码
+  hop_sec: 1.8
+  backpressure_hop_sec: 4.0 # 解码速度跟不上时降低草稿刷新频率
+  max_window_sec: 15
+  ring_buffer_sec: 60
+  endpoint_silence_ms: 600
+  flush_timeout_sec: 12    # 等待 ASR 尾窗的时限，不含 WAV 合并和标准产物整理
+  diarization:
+    enabled: true          # 录中用已缓存的 CAM++，停录沿用录中标签并保存声纹
+  bleed_suppression:
+    enabled: true          # 双轨近同时重复文本过滤，佩戴耳机时可关闭
 
 diarization:
   enabled: true

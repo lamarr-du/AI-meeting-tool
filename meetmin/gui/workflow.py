@@ -13,6 +13,7 @@ from threading import Event
 from ..asr.model_download import ModelDownloadProgress
 from ..audio.segments import SessionLock
 from ..audio.session_recorder import SessionRecorder, recover_recording
+from ..live_pipeline import LiveEventCallback, LiveSessionCoordinator, SpeakerRenames
 from ..pipeline import Pipeline
 from ..session import Session
 
@@ -111,6 +112,32 @@ def record(
     return result
 
 
+def record_live(
+    recorder: SessionRecorder,
+    session: Session,
+    stop_requested: Event,
+    stage: Callable[[str], None],
+    meter: Callable[[dict], None],
+    *,
+    cfg: dict,
+    emit: LiveEventCallback,
+    renames: SpeakerRenames | None = None,
+) -> dict:
+    coordinator = LiveSessionCoordinator(
+        cfg, session, emit, dual_track=recorder.dual_track, renames=renames
+    )
+    recorder.set_audio_tap(coordinator.feed)
+    coordinator.start()
+    try:
+        result = record(recorder, session, stop_requested, stage, meter)
+        stage("正在归档实时转写…")
+        result["live_transcript"] = coordinator.finish()
+        result["live_error"] = coordinator.error
+        return result
+    finally:
+        coordinator.cancel()
+
+
 def transcribe(
     pipe: Pipeline,
     session: Session,
@@ -142,7 +169,7 @@ def transcribe(
             else "正在整理转写与说话人…"
         )
 
-    return pipe.diarize(session, on_model_download=speaker_download)
+    return pipe.diarize(session, on_model_download=speaker_download, restore_live_names=True)
 
 
 def api_key_available(cfg: dict, api_key: str) -> bool:

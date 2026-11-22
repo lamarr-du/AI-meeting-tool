@@ -8,6 +8,10 @@ from typing import Any
 
 import yaml
 
+DEFAULT_TARGET_RMS = 0.03
+MIN_TARGET_RMS = 0.001
+MAX_TARGET_RMS = 0.3
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "output_dir": "data",  # 会话产物目录：<output_dir>/sessions/<session_id>/
     "model_cache_dir": None,  # 默认工程或独立便携版目录下的 .cache
@@ -17,6 +21,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "sample_rate": None,  # null=跟随设备默认采样率
         "microphone": False,
         "microphone_device": None,  # null=默认 WASAPI 输入
+        "target_rms": DEFAULT_TARGET_RMS,  # 录音自适应增益目标电平
         "chunk_ms": 100,  # 每次读取的块长（毫秒）
         "segment_seconds": 300,  # 单个录音分段时长
         "sync_seconds": 10,  # 活动分段的磁盘同步间隔
@@ -41,6 +46,37 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "word_timestamps": True,  # 词级时间戳（供说话人分离对齐，建议保留）
         "hf_endpoint": None,  # 国内可设 https://hf-mirror.com 下载模型
         "hf_disable_xet": True,  # 避免部分网络环境访问 Xet 重建服务时出现 401
+    },
+    "live": {
+        "enabled": True,
+        "model_size": "large-v3-turbo",
+        "device": "auto",
+        "beam_size": 1,
+        "hop_sec": 1.8,
+        "backpressure_hop_sec": 4.0,
+        "max_window_sec": 15,
+        "ring_buffer_sec": 60,
+        "endpoint_silence_ms": 600,
+        "flush_timeout_sec": 12,
+        "diarization": {
+            "enabled": True,
+            "min_embed_sec": 1.5,
+            "online_assign_sim": 0.58,
+            "online_new_cluster_sim": 0.40,
+            "online_ema_alpha": 0.15,
+            "warmup_recluster_sec": [20, 45, 90],
+            "steady_recluster_sec": 45,
+            "bounded_max_embeddings": 1000,
+            "bounded_window_sec": 900,
+            "prototypes_per_speaker": 15,
+            "freeze_after_sec": 120,
+            "relabel_hysteresis_margin": 0.08,
+        },
+        "bleed_suppression": {
+            "enabled": True,
+            "window_ms": 600,
+            "min_bigram_similarity": 0.75,
+        },
     },
     "diarization": {
         "enabled": True,
@@ -136,6 +172,11 @@ def load_config(path: str | Path | None = None) -> dict:
         local_model = config_dir / Path(model).expanduser()
         if local_model.is_dir():
             asr["model_size"] = str(local_model)
+    live = cfg.get("live")
+    if isinstance(live, dict) and isinstance(model := live.get("model_size"), str):
+        local_model = config_dir / Path(model).expanduser()
+        if local_model.is_dir():
+            live["model_size"] = str(local_model)
     glossary = asr.get("glossary") if isinstance(asr, dict) else None
     if isinstance(glossary, dict):
         for key in ("path", "correction_path"):
