@@ -947,6 +947,11 @@ class MeetingWindow(QMainWindow):
                 self.log.appendPlainText(
                     f"{caption}有 {track['padded_sec']:.1f} 秒无数据，已补静音。"
                 )
+            if track and track.get("repaired_timestamp_blocks", 0):
+                self.log.appendPlainText(
+                    f"{caption}有 {track['repaired_timestamp_blocks']} 个音频块的采集时间戳异常，"
+                    "已按连续样本保留录音。"
+                )
         if transcript := result.get("live_transcript"):
             self.set_status("实时转写已归档。", "success")
             self.transcription_saved(transcript)

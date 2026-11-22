@@ -98,6 +98,8 @@ class Stream:
             if timing
             else {}
         )
+        if isinstance(timing, dict):
+            times = timing
         result = self.callback(data, frames, times, flags)
         if result[1] == 2:
             self.active = False
@@ -564,7 +566,45 @@ def test_missing_timestamps_fallback_is_visible(recording):
     np.testing.assert_array_equal(read_audio(r.path)[500:600], np.full(100, 1000))
 
 
-@pytest.mark.parametrize("position", [-1, 0, 0.02, 10000])
+def test_short_timestamp_glitch_keeps_pcm_and_the_next_real_gap(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0, value=1000)
+    stream.emit(0, received=10.2, value=1200)
+    stream.emit(0.2, timing=False, value=1400)
+    stream.emit(0.3, value=1600)
+    stream.emit(0.7, value=1800)
+    r.clock.value = 11
+
+    info = r.rec.stop()
+    assert info["timing_mode"] == "device"
+    assert info["repaired_timestamp_blocks"] == 2
+    assert info["received_sec"] == 0.5
+    np.testing.assert_array_equal(
+        read_audio(r.path),
+        np.repeat([1000, 1200, 1400, 1600, 0, 1800, 0], [100, 100, 100, 100, 300, 100, 200]),
+    )
+
+
+def test_adc_ahead_of_callback_does_not_abort_contiguous_audio(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    origin = 10 + stream.epoch
+    stream.emit(0)
+    stream.emit(
+        0.1,
+        timing={"input_buffer_adc_time": origin + 0.22, "current_time": origin + 0.2},
+    )
+    stream.emit(0.2)
+    r.clock.value = 10.3
+
+    assert r.rec.stop()["repaired_timestamp_blocks"] == 1
+    np.testing.assert_array_equal(read_audio(r.path), np.full(300, 1000))
+
+
+@pytest.mark.parametrize("position", [-1, 0.02, 10000])
 def test_broken_timestamps_do_not_silently_drop_or_pad_audio(recording, position):
     r = recording
     r.rec.start(r.path)
@@ -573,6 +613,30 @@ def test_broken_timestamps_do_not_silently_drop_or_pad_audio(recording, position
     with pytest.raises(RecordingError, match="时间戳|时钟|重叠"):
         r.rec.stop()
     assert len(recover_failed(r.path)) <= 200
+
+
+def test_persistent_missing_timestamps_cannot_run_past_the_repair_limit(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0)
+    for index in range(1, 4):
+        stream.emit(index / 10, timing=False)
+    with pytest.raises(RecordingError, match="时间戳") as error:
+        r.rec.stop()
+    assert error.value.info["repaired_timestamp_blocks"] == 2
+    np.testing.assert_array_equal(recover_failed(r.path), np.full(300, 1000))
+
+
+def test_bad_timestamp_after_a_gap_cannot_collapse_the_gap(recording):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0)
+    stream.emit(1.0, timing=False)
+    with pytest.raises(RecordingError, match="时间戳"):
+        r.rec.stop()
+    np.testing.assert_array_equal(recover_failed(r.path), np.full(100, 1000))
 
 
 def test_jitter_does_not_add_gaps(recording):

@@ -147,29 +147,34 @@ class _Timeline:
         self.stream_origin = stream_origin
         self.mode = "pending"
         self.previous_adc: float | None = None
+        self.previous_callback: float | None = None
+        self.previous_received: float | None = None
         self.tolerance = max(round(rate * 0.02), chunk_frames // 2)
+        self.bridge_limit = 2 * chunk_frames
+        self.bridged_frames = 0
+        self.repaired_blocks = 0
 
     def position(self, block: _AudioBlock, cursor: int) -> int:
-        adc = block.timing.get("input_buffer_adc_time", 0.0)
-        current = block.timing.get("current_time", 0.0)
-        valid = (
-            isinstance(adc, (int, float))
-            and isinstance(current, (int, float))
-            and math.isfinite(adc)
-            and math.isfinite(current)
-            and 0 < adc <= current
-        )
+        adc = self._timestamp(block.timing.get("input_buffer_adc_time"))
+        current = self._timestamp(block.timing.get("current_time"))
+        valid = adc is not None and current is not None and adc <= current
         if self.mode == "pending":
             self.mode = "device" if valid and self.stream_origin is not None else "arrival"
         if self.mode == "device":
-            if not valid or (self.previous_adc is not None and adc <= self.previous_adc):
-                raise RuntimeError("音频采集时间戳无效或倒退，无法可靠定位音频")
             assert self.stream_origin is not None
-            seconds = adc - self.stream_origin
+            seconds = adc - self.stream_origin if adc is not None else None
             # Reject a clock reset / bogus timestamp before it can generate a huge zero-filled file.
-            if seconds > block.received_at - self.start + 0.5 or seconds < -0.5:
+            if seconds is not None and not -0.5 <= seconds <= block.received_at - self.start + 0.5:
                 raise RuntimeError("音频采集时钟与录音时钟不一致")
+            if not valid or (
+                adc is not None and self.previous_adc is not None and adc <= self.previous_adc
+            ):
+                return self._bridge_timestamp(block, cursor, adc, current)
+            assert seconds is not None
             self.previous_adc = adc
+            self.previous_callback = current
+            self.previous_received = block.received_at
+            self.bridged_frames = 0
         else:
             # Arrival timing is approximate: scheduler delays are indistinguishable from gaps.
             seconds = block.received_at - self.start - block.frames / self.rate
@@ -179,6 +184,45 @@ class _Timeline:
             raise RuntimeError("音频块严重重叠或迟到，无法可靠保持时间轴")
         # WASAPI timestamps have jitter; contiguous blocks must not acquire tiny gaps each time.
         return target if delta > self.tolerance or cursor == 0 else cursor
+
+    @staticmethod
+    def _timestamp(value: object) -> float | None:
+        if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+            return float(value)
+        return None
+
+    def _bridge_timestamp(
+        self, block: _AudioBlock, cursor: int, adc: float | None, current: float | None
+    ) -> int:
+        assert self.previous_received is not None
+        limit = (block.frames + self.tolerance) / self.rate
+        # A callback can arrive late on the Python thread. Either clock can
+        # confirm consecutive packets, but neither can justify inventing a gap.
+        arrival_step = block.received_at - self.previous_received
+        callback_step = (
+            current - self.previous_callback
+            if current is not None and self.previous_callback is not None
+            else math.inf
+        )
+        continuous = 0 <= arrival_step <= limit or (
+            0 <= arrival_step <= 0.5 and 0 < callback_step <= limit
+        )
+        if (
+            self.bridged_frames + block.frames > self.bridge_limit
+            or not continuous
+            or (
+                adc is not None
+                and self.previous_adc is not None
+                and adc < self.previous_adc - self.tolerance / self.rate
+            )
+            or (adc is not None and current is not None and adc - current > limit)
+        ):
+            raise RuntimeError("音频采集时间戳无效或倒退，无法可靠定位音频")
+        self.bridged_frames += block.frames
+        self.repaired_blocks += 1
+        self.previous_callback = current
+        self.previous_received = block.received_at
+        return cursor
 
 
 class LoopbackRecorder:
@@ -630,6 +674,9 @@ class LoopbackRecorder:
                 "received_sec": self._received_frames / sr,
                 "padded_sec": self._padded_frames / sr,
                 "timing_mode": self._timeline.mode if self._timeline is not None else "pending",
+                "repaired_timestamp_blocks": (
+                    self._timeline.repaired_blocks if self._timeline is not None else 0
+                ),
                 "finalized": self._finalized,
                 "cleanup_pending": self._thread is not None
                 or self._stream is not None
