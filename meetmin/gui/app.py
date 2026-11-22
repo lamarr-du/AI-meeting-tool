@@ -387,8 +387,10 @@ class MeetingWindow(QMainWindow):
         self.copy_web_prompt.triggered.connect(self.copy_prompt)
         self.web_prompt = menu.addAction("导出 AI 网页提示词…")
         self.web_prompt.triggered.connect(self.export_prompt)
-        self.web_minutes = menu.addAction("导入 AI 网页纪要…")
+        self.web_minutes = menu.addAction("粘贴 AI 网页纪要…")
         self.web_minutes.triggered.connect(self.import_minutes)
+        self.web_minutes_file = menu.addAction("从文件导入 AI 网页纪要…")
+        self.web_minutes_file.triggered.connect(self.import_minutes_file)
         menu.addSeparator()
         self.open_folder = menu.addAction("打开会话文件夹")
         self.open_folder.triggered.connect(self.open_session_folder)
@@ -795,6 +797,7 @@ class MeetingWindow(QMainWindow):
         self.copy_web_prompt.setEnabled(can_use_web)
         self.web_prompt.setEnabled(can_use_web)
         self.web_minutes.setEnabled(can_use_web)
+        self.web_minutes_file.setEnabled(can_use_web)
 
     def launch(
         self,
@@ -1183,22 +1186,50 @@ class MeetingWindow(QMainWindow):
     def import_minutes(self) -> None:
         session = self.session
         assert session is not None
+        text = ""
+        while True:
+            text, accepted = QInputDialog.getMultiLineText(
+                self, "粘贴 AI 网页纪要", "请输入或粘贴 AI 网页生成的纪要（支持 Markdown）：", text
+            )
+            if not accepted:
+                return
+            if not text.strip():
+                QMessageBox.warning(self, "无法导入", "请输入或粘贴纪要内容。")
+                continue
+            if not self.confirm_minutes_replacement():
+                continue
+            break
+        overwrite = self.minutes_path is not None
+        self.launch(
+            "正在导入纪要…",
+            lambda job: Pipeline(self.cfg, progress=job.log.emit).import_web_minutes_text(
+                session, text, overwrite=overwrite
+            ),
+            lambda _result: self.tabs.setCurrentWidget(self.minutes),
+        )
+
+    def confirm_minutes_replacement(self) -> bool:
+        return (
+            self.minutes_path is None
+            or QMessageBox.question(
+                self,
+                "替换纪要",
+                "要用导入的内容替换当前纪要吗？",
+                defaultButton=QMessageBox.StandardButton.No,
+            )
+            == QMessageBox.StandardButton.Yes
+        )
+
+    def import_minutes_file(self) -> None:
+        session = self.session
+        assert session is not None
         filename, _ = QFileDialog.getOpenFileName(
             self, "导入 AI 网页纪要", "", "文本文件 (*.md *.txt);;全部文件 (*)"
         )
         if not filename:
             return
         overwrite = self.minutes_path is not None
-        if (
-            overwrite
-            and QMessageBox.question(
-                self,
-                "替换纪要",
-                "要用导入的文件替换当前纪要吗？",
-                defaultButton=QMessageBox.StandardButton.No,
-            )
-            != QMessageBox.StandardButton.Yes
-        ):
+        if not self.confirm_minutes_replacement():
             return
         self.launch(
             "正在导入纪要…",

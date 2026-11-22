@@ -174,6 +174,77 @@ def test_empty_or_invalid_import_preserves_minutes(meeting, tmp_path):
         assert session.minutes_md.read_text(encoding="utf-8") == "原始纪要"
 
 
+def test_desktop_paste_minutes_cancel_retry_and_replace(meeting, tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from meetmin.gui import app
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(app.MeetingWindow, "refresh_devices", lambda self: None)
+    session, cfg = meeting
+    pipe = Pipeline(cfg)
+    pipe._save_transcript(session, session.load_transcript())
+    window = app.MeetingWindow(
+        cfg, QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    )
+    window.refresh_history(session)
+
+    def launch(_message, action, done):
+        result = action(SimpleNamespace(log=Mock()))
+        window.render_session()
+        done(result)
+
+    monkeypatch.setattr(window, "launch", launch)
+    warnings = Mock()
+    monkeypatch.setattr(app.QMessageBox, "warning", warnings)
+    responses = iter([("  ", True), ("# 结论\n\n已完成。", True)])
+    monkeypatch.setattr(app.QInputDialog, "getMultiLineText", lambda *a: next(responses))
+    try:
+        assert window.web_minutes.isEnabled() and window.web_minutes_file.isEnabled()
+        window.import_minutes()
+        assert warnings.call_count == 1
+        original = session.minutes_md.read_text(encoding="utf-8")
+        assert "# 结论\n\n已完成。" in original
+        assert "从 AI 网页导入" in original
+        assert window.tabs.currentWidget() == window.minutes
+
+        inputs = []
+        responses = iter([("新纪要", True), ("新纪要", False)])
+
+        def prompt(*args):
+            inputs.append(args[-1])
+            return next(responses)
+
+        monkeypatch.setattr(app.QInputDialog, "getMultiLineText", prompt)
+        monkeypatch.setattr(app.QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+        window.import_minutes()
+        assert inputs == ["", "新纪要"]
+        assert session.minutes_md.read_text(encoding="utf-8") == original
+
+        monkeypatch.setattr(app.QInputDialog, "getMultiLineText", lambda *a: ("新纪要", True))
+        monkeypatch.setattr(app.QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+        window.import_minutes()
+        assert "新纪要" in session.minutes_md.read_text(encoding="utf-8")
+        assert "新纪要" in window.minutes.reader.toPlainText()
+    finally:
+        window.close()
+        application.processEvents()
+
+
+def test_pasted_minutes_empty_and_existing_are_not_overwritten(meeting):
+    session, cfg = meeting
+    session.minutes_md.write_text("原始纪要", encoding="utf-8")
+    pipe = Pipeline(cfg)
+    with pytest.raises(ValueError, match="内容为空"):
+        pipe.import_web_minutes_text(session, " \n", overwrite=True)
+    with pytest.raises(FileExistsError):
+        pipe.import_web_minutes_text(session, "新纪要")
+    assert session.minutes_md.read_text(encoding="utf-8") == "原始纪要"
+
+
 def test_empty_transcript_rejected_without_output(meeting):
     session, cfg = meeting
     session.save_transcript({"utterances": [{"text": "  "}]})

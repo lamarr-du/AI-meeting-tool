@@ -602,11 +602,16 @@ class Pipeline:
     def import_web_minutes(
         self, session: Session, source: str | Path, *, overwrite: bool = False
     ) -> Path:
-        # Validate the session before accepting a result associated with it.
+        text = Path(source).read_text(encoding="utf-8-sig")
+        return self.import_web_minutes_text(session, text, overwrite=overwrite)
+
+    def import_web_minutes_text(
+        self, session: Session, text: str, *, overwrite: bool = False
+    ) -> Path:
         session.load_transcript()
-        text = Path(source).read_text(encoding="utf-8-sig").strip()
+        text = text.strip()
         if not text:
-            raise ValueError("导入文件为空，未写入纪要。")
+            raise ValueError("纪要内容为空，未写入纪要。")
         content = "> 由用户从 AI 网页导入；请对照转写核对行动项和数字。\n\n" + text + "\n"
         return session.save_text_safely("minutes.md", content, overwrite=overwrite)
 
