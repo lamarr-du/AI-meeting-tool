@@ -21,7 +21,7 @@ asr:
   provider: faster_whisper   # faster_whisper（本地离线，零 token）| dashscope（云端 Paraformer，自带分离）
   language: zh               # null = 自动检测语种
   profile: auto              # auto / cpu_light / cpu_standard / gpu_standard
-  model_size: null           # null 由档位选择，也可指定模型名或本地模型目录
+  model_size: deepdml/faster-whisper-large-v3-turbo-ct2  # 复用本机已缓存的模型
   device: auto               # auto / cpu / cuda
   compute_type: null         # null 跟随设备，CPU int8 / CUDA int8_float16
   cuda_peak_mib: null        # 当前模型、计算类型及配置在目标 GPU 上的实测峰值
@@ -48,7 +48,7 @@ asr:
 
 live:
   enabled: true             # 桌面录音默认边录边转写，可在录音面板关闭
-  model_size: large-v3-turbo # 使用本地已缓存的模型，也可填写本地模型目录
+  model_size: deepdml/faster-whisper-large-v3-turbo-ct2  # 与离线转写共用缓存
   device: auto              # auto / cpu / cuda
   beam_size: 1              # 实时短窗使用贪心解码
   hop_sec: 1.8

@@ -69,6 +69,16 @@ def test_offline_model_requires_the_tokenizer(monkeypatch, tmp_path):
     assert cached_model("large-v3-turbo", cache_dir=tmp_path) == folder.resolve()
 
 
+def test_live_inherits_asr_compute_type(tmp_path):
+    coordinator = LiveSessionCoordinator(
+        {"asr": {"compute_type": "int8_float32"}},
+        Session(tmp_path, "live").ensure(),
+        lambda event: None,
+        dual_track=False,
+    )
+    assert coordinator.pipe.cfg["asr"]["compute_type"] == "int8_float32"
+
+
 @pytest.mark.parametrize("bleed_enabled", [False, True])
 def test_live_dual_track_archives_standard_artifacts(monkeypatch, tmp_path, bleed_enabled):
     from faster_whisper import vad
