@@ -169,7 +169,7 @@ def transcribe(
             else "正在整理转写与说话人…"
         )
 
-    return pipe.diarize(session, on_model_download=speaker_download)
+    return pipe.diarize(session, on_model_download=speaker_download, restore_live_names=True)
 
 
 def api_key_available(cfg: dict, api_key: str) -> bool:

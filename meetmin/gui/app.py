@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
 
 from ..asr.model_download import ModelDownloadProgress
 from ..audio.loopback_recorder import RecordingError, list_loopback_devices, list_microphone_devices
-from ..audio.session_recorder import SessionRecorder
+from ..audio.session_recorder import RECORDING_DIAGNOSTICS, SessionRecorder
 from ..config import MAX_TARGET_RMS, MIN_TARGET_RMS, deep_merge, load_config
 from ..live_pipeline import SpeakerRenames
 from ..pipeline import Pipeline
@@ -853,6 +853,12 @@ class MeetingWindow(QMainWindow):
                 error += "\n录音文件仍在收尾，请点击「重试保存录音」。"
             elif was_recording and self.recovery:
                 error += "\n已写入的分段仍在，可以点击「恢复录音」。"
+            if (
+                was_recording
+                and self.session is not None
+                and (self.session.root / RECORDING_DIAGNOSTICS).is_file()
+            ):
+                error += "\n录音诊断日志已保存到会话文件夹。"
             self.log.appendPlainText(error)
             self.set_status("处理失败 · " + error, "error")
         elif done is not None:
@@ -962,6 +968,10 @@ class MeetingWindow(QMainWindow):
                 self.log.appendPlainText(
                     f"{caption}有 {track['repaired_timestamp_blocks']} 个音频块的采集时间戳异常，"
                     "已按连续样本保留录音。"
+                )
+            if track and track.get("stream_restarts", 0):
+                self.log.appendPlainText(
+                    f"{caption}的录音流曾中断并已自动重启。中断前后的音频均已保留。"
                 )
         if transcript := result.get("live_transcript"):
             self.set_status("实时转写已归档。", "success")

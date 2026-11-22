@@ -1,5 +1,6 @@
 """录音生命周期、时间轴和故障测试，无需声卡或 PyAudio。"""
 
+import json
 import threading
 import wave
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ import pytest
 from meetmin.audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder, RecordingError
 from meetmin.audio.ring_buffer import IdleTick, PcmChunk
 from meetmin.audio.segments import SessionLock, merge_segments
-from meetmin.audio.session_recorder import SessionRecorder
+from meetmin.audio.session_recorder import RECORDING_DIAGNOSTICS, SessionRecorder
 from meetmin.cli import cmd_recover
 from meetmin.pipeline import Pipeline
 from meetmin.session import Session
@@ -508,6 +509,58 @@ def test_stream_stopped_unexpectedly(recording):
     assert not r.rec.is_recording
     with pytest.raises(RecordingError, match="意外停止"):
         r.rec.stop()
+
+
+def test_session_restarts_inactive_loopback_once_and_keeps_the_gap(recording, tmp_path):
+    r = recording
+    session = Session(tmp_path, "retry-active")
+    recorder = SessionRecorder(r.rec)
+    recorder.start(session)
+    stream = r.streams[-1]
+    stream.emit(0.0, value=1000)
+    stream.active = False
+    r.clock.value = 10.3
+    info = recorder.status()
+    assert not info["failed"] and info["stream_restarts"] == 1
+    assert len(r.streams) == 1 and stream.active
+    stream.emit(0.4, value=2000)
+    r.clock.value = 10.6
+
+    recorder.stop()
+    np.testing.assert_array_equal(
+        read_audio(session.audio_path), np.repeat([1000, 0, 2000, 0], [100, 300, 100, 100])
+    )
+    logs = [
+        json.loads(line)
+        for line in (session.root / RECORDING_DIAGNOSTICS).read_text("utf-8").splitlines()
+    ]
+    assert [entry["event"] for entry in logs] == [
+        "recording.started",
+        "recording.status_changed",
+        "recording.stopped",
+    ]
+    assert logs[1]["tracks"]["loopback"]["stream_restarts"] == 1
+
+
+def test_repeated_stream_failure_preserves_segments_and_logs_error(recording, tmp_path):
+    r = recording
+    session = Session(tmp_path, "retry-failed")
+    recorder = SessionRecorder(r.rec)
+    recorder.start(session)
+    stream = r.streams[-1]
+    stream.emit(0.0, value=1000)
+    stream.active = False
+    assert not recorder.status()["failed"]
+    stream.active = False
+    assert recorder.status()["failed"]
+    with pytest.raises(RecordingError, match="意外停止"):
+        recorder.stop()
+
+    assert not session.audio_path.exists()
+    entry = json.loads((session.root / RECORDING_DIAGNOSTICS).read_text("utf-8").splitlines()[-1])
+    assert entry["event"] == "recording.failed"
+    assert "意外停止" in entry["tracks"]["loopback"]["error"]
+    assert entry["tracks"]["loopback"]["stream_restart_attempts"] == 1
 
 
 def test_stop_detects_stream_failure_without_status_polling(recording):

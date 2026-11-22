@@ -27,6 +27,7 @@ from .audio.segments import SessionLock
 from .audio.session_recorder import SessionRecorder
 from .config import DEFAULT_TARGET_RMS
 from .diarization.align import UNKNOWN_NAME, assign_speakers, relabel
+from .diarization.live_recovery import restore_live_speaker_names
 from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
 from .speakers import rename_speakers, speaker_preview
@@ -269,6 +270,7 @@ class Pipeline:
         *,
         on_model_download: Callable[[bool], None] | None = None,
         suppressed_microphone: set[int] | None = None,
+        restore_live_names: bool = False,
     ) -> dict:
         """从原始转写重建精简转写；绝不调用 ASR。"""
         import json
@@ -302,6 +304,22 @@ class Pipeline:
             for u in utterances:
                 u.speaker = "说话人A"
             speakers = ["说话人A"] if utterances else []
+        if restore_live_names:
+            try:
+                restored = restore_live_speaker_names(utterances, session.root / "events.jsonl")
+            except OSError as exc:
+                self.progress(f"  ! 无法读取录中说话人姓名：{exc}")
+            else:
+                if restored is not utterances:
+                    utterances = restored
+                    speakers = list(
+                        dict.fromkeys(
+                            u.speaker
+                            for u in utterances
+                            if isinstance(u.speaker, str) and u.speaker != UNKNOWN_NAME
+                        )
+                    )
+                    self.progress("  ✓ 已按录音时间轴还原录中标记的说话人姓名。")
         return self._publish_aligned_transcript(
             session,
             raw,

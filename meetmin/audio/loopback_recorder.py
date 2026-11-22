@@ -278,6 +278,8 @@ class LoopbackRecorder:
         self._producer_done = threading.Event()
         self._failed = threading.Event()
         self._errors: queue.SimpleQueue[Exception] = queue.SimpleQueue()
+        self._restart_attempts = 0
+        self._stream_restarts = 0
         self._queue: queue.Queue[_AudioBlock] = queue.Queue(self._queue_size)
         self._state = "IDLE"
         self._started_at = 0.0
@@ -387,6 +389,8 @@ class LoopbackRecorder:
         self._producer_done.clear()
         self._failed.clear()
         self._errors = queue.SimpleQueue()
+        self._restart_attempts = 0
+        self._stream_restarts = 0
         self._queue = queue.Queue(self._queue_size)
         self._error = None
         self._secondary_errors = []
@@ -646,13 +650,29 @@ class LoopbackRecorder:
                 self._silent_frames = 0
                 self._active_frames += frames
 
-    def status(self) -> dict:
+    def _restart_inactive_stream(self) -> None:
+        """Try once on the same stream, retaining its clock and the writer."""
+        self._restart_attempts += 1
+        try:
+            self._stream.stop_stream()
+            self._stream.start_stream()
+            if not self._stream.is_active():
+                raise RuntimeError("重启后设备仍未处于采集状态")
+        except Exception as error:
+            self._fail(RuntimeError(f"录音流意外停止，自动重启失败：{error!r}"))
+        else:
+            self._stream_restarts += 1
+
+    def status(self, *, allow_restart: bool = False) -> dict:
         if self._state == "RECORDING" and not self._failed.is_set():
             try:
-                if not self._stream.is_active():
-                    self._fail(RuntimeError("录音流意外停止"))
-                elif self._thread is None or not self._thread.is_alive():
+                if self._thread is None or not self._thread.is_alive():
                     self._fail(RuntimeError("录音写线程意外退出"))
+                elif not self._stream.is_active():
+                    if allow_restart and self._stop_at is None and not self._restart_attempts:
+                        self._restart_inactive_stream()
+                    else:
+                        self._fail(RuntimeError("录音流意外停止"))
             except Exception as error:
                 self._fail(error)
         self._collect_errors()
@@ -671,6 +691,8 @@ class LoopbackRecorder:
                 "state": "FAILED" if self._failed.is_set() else self._state,
                 "error": str(self._error) if self._error is not None else None,
                 "cleanup_errors": list(self._secondary_errors),
+                "stream_restart_attempts": self._restart_attempts,
+                "stream_restarts": self._stream_restarts,
                 "received_sec": self._received_frames / sr,
                 "padded_sec": self._padded_frames / sr,
                 "timing_mode": self._timeline.mode if self._timeline is not None else "pending",
