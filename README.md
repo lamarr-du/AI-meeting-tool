@@ -15,7 +15,11 @@ python -m pip install -c requirements-win-py312.lock ".[gui]"
 python -m meetmin.gui
 ```
 
-如果项目内已有 `.conda` 环境，无需再次创建；后续启动时先激活该环境，再运行 `python -m meetmin.gui`。
+如果项目内已有 `.conda` 环境，无需再次创建。首次安装成功后，后续在项目目录打开 PowerShell，执行下面一条命令即可启动，无需先激活环境：
+
+```powershell
+.\.conda\python.exe -m meetmin.gui
+```
 
 1. 点击 **新建会议**，选择 **开始录音** 或 **导入音频**。Windows 可以录制电脑声音，勾选 **同时录制麦克风** 可录下自己的发言，建议佩戴耳机。macOS 和 Linux 可导入已有音频。
 2. 勾选 **边录边转写** 后，Windows 桌面版使用已缓存的 Whisper Turbo 和 CAM++ 模型。远端发言在录制过程中会逐步显示并修正说话人，点击徽章可为该说话人改名。首次使用可先关闭实时模式，完成一次录音或音频导入来准备模型缓存。
