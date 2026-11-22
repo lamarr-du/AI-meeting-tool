@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from html import escape
 from pathlib import Path
+from queue import SimpleQueue
 from threading import Event
 from typing import Any, cast
 
@@ -55,6 +56,7 @@ from ..asr.model_download import ModelDownloadProgress
 from ..audio.loopback_recorder import RecordingError, list_loopback_devices, list_microphone_devices
 from ..audio.session_recorder import SessionRecorder
 from ..config import MAX_TARGET_RMS, MIN_TARGET_RMS, deep_merge, load_config
+from ..live_pipeline import SpeakerRenames
 from ..pipeline import Pipeline
 from ..session import Session
 from ..summarizer.llm_client import MockLLM, get_llm
@@ -196,6 +198,7 @@ class Job(QThread):
         self.action = action
         self.result: Any = None
         self.error: Exception | None = None
+        self.speaker_renames: SpeakerRenames = SimpleQueue()
 
     def run(self) -> None:
         try:
@@ -396,6 +399,7 @@ class MeetingWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.transcript = MarkdownPreview("会议转写")
         self.live_transcript = LiveTranscriptView()
+        self.live_transcript.rename_requested.connect(self.rename_live_speaker)
         self.transcript_stack = QStackedWidget()
         self.transcript_stack.addWidget(self.transcript)
         self.transcript_stack.addWidget(self.live_transcript)
@@ -903,7 +907,9 @@ class MeetingWindow(QMainWindow):
         def record_job(job: Job) -> dict:
             args = (recorder, session, stop_requested, job.stage.emit, job.meter.emit)
             if live:
-                return workflow.record_live(*args, cfg=cfg, emit=job.live_event.emit)
+                return workflow.record_live(
+                    *args, cfg=cfg, emit=job.live_event.emit, renames=job.speaker_renames
+                )
             return workflow.record(*args)
 
         self.launch(
@@ -914,9 +920,14 @@ class MeetingWindow(QMainWindow):
 
     def request_stop(self) -> None:
         if self.stop_requested is not None:
+            self.live_transcript.renaming_enabled = False
             self.stop_requested.set()
             self.set_status("正在保存录音…")
             self.update_controls()
+
+    def rename_live_speaker(self, speaker: int, name: str) -> None:
+        if self.job is not None and self.recording_active():
+            self.job.speaker_renames.put((speaker, name))
 
     def show_meter(self, status: dict) -> None:
         if self.stop_requested is None:
@@ -1148,12 +1159,15 @@ class MeetingWindow(QMainWindow):
         selected = self.session if output == self.cfg["output_dir"] else None
         self.cfg["output_dir"] = output
         self.cfg["recorder"]["target_rms"] = dialog.target_rms.value()
+        bleed = dialog.bleed_suppression.isChecked()
+        self.cfg.setdefault("live", {}).setdefault("bleed_suppression", {})["enabled"] = bleed
         self.cfg["llm"].update(
             base_url=dialog.url.text().strip(), model=dialog.model.text().strip()
         )
         self.api_key = dialog.key.text().strip()
         self.settings.setValue("output_dir", output)
         self.settings.setValue("target_rms", dialog.target_rms.value())
+        self.settings.setValue("bleed_suppression", bleed)
         self.settings.setValue("llm_url", self.cfg["llm"]["base_url"])
         self.settings.setValue("llm_model", self.cfg["llm"]["model"])
         self.refresh_history(selected)
@@ -1200,10 +1214,27 @@ def run(config: Path | None) -> int:
         )
         if MIN_TARGET_RMS <= target_rms <= MAX_TARGET_RMS:
             cfg["recorder"]["target_rms"] = target_rms
+        live = cfg.get("live") or {}
+        bleed = live.get("bleed_suppression") or {}
+        bleed["enabled"] = settings.value(
+            "bleed_suppression", bleed.get("enabled", True), type=bool
+        )
+        live["bleed_suppression"] = bleed
+        cfg["live"] = live
         cfg["llm"]["base_url"] = settings.value("llm_url", cfg["llm"]["base_url"], type=str)
         cfg["llm"]["model"] = settings.value("llm_model", cfg["llm"]["model"], type=str)
         if getattr(sys, "frozen", False):
-            cfg["diarization"]["provider"] = "single"
+            provider = str(cfg["diarization"].get("provider", "campplus_onnx")).lower()
+            if provider in ("campplus_onnx", "campplus", "onnx", "3dspeaker"):
+                try:
+                    import onnxruntime
+
+                    if "CPUExecutionProvider" not in onnxruntime.get_available_providers():
+                        cfg["diarization"]["provider"] = "single"
+                except (ImportError, OSError):
+                    cfg["diarization"]["provider"] = "single"
+            elif provider != "single":
+                cfg["diarization"]["provider"] = "single"
         window = MeetingWindow(cfg, settings)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, yaml.YAMLError) as error:
         QMessageBox.critical(None, "无法启动 MeetMin", str(error))

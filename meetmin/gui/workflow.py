@@ -13,7 +13,7 @@ from threading import Event
 from ..asr.model_download import ModelDownloadProgress
 from ..audio.segments import SessionLock
 from ..audio.session_recorder import SessionRecorder, recover_recording
-from ..live_pipeline import LiveEventCallback, LiveSessionCoordinator
+from ..live_pipeline import LiveEventCallback, LiveSessionCoordinator, SpeakerRenames
 from ..pipeline import Pipeline
 from ..session import Session
 
@@ -121,8 +121,11 @@ def record_live(
     *,
     cfg: dict,
     emit: LiveEventCallback,
+    renames: SpeakerRenames | None = None,
 ) -> dict:
-    coordinator = LiveSessionCoordinator(cfg, session, emit, dual_track=recorder.dual_track)
+    coordinator = LiveSessionCoordinator(
+        cfg, session, emit, dual_track=recorder.dual_track, renames=renames
+    )
     recorder.set_audio_tap(coordinator.feed)
     coordinator.start()
     try:

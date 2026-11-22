@@ -69,8 +69,11 @@ def test_offline_model_requires_the_tokenizer(monkeypatch, tmp_path):
     assert cached_model("large-v3-turbo", cache_dir=tmp_path) == folder.resolve()
 
 
-def test_live_dual_track_archives_standard_artifacts(monkeypatch, tmp_path):
+@pytest.mark.parametrize("bleed_enabled", [False, True])
+def test_live_dual_track_archives_standard_artifacts(monkeypatch, tmp_path, bleed_enabled):
     from faster_whisper import vad
+
+    text = "测试实时录音的外放去重功能"
 
     class Provider:
         def __init__(self, cfg, **_kwargs):
@@ -85,9 +88,7 @@ def test_live_dual_track_archives_standard_artifacts(monkeypatch, tmp_path):
         def decode_window(self, audio, offset, *, options):
             end = offset + len(audio) / SAMPLE_RATE
             return [
-                Decoded(
-                    Utterance(offset, end, "测试", words=[{"w": "测试", "s": offset, "e": end}])
-                )
+                Decoded(Utterance(offset, end, text, words=[{"w": text, "s": offset, "e": end}]))
             ]
 
         def close(self):
@@ -109,7 +110,11 @@ def test_live_dual_track_archives_standard_artifacts(monkeypatch, tmp_path):
 
     events = []
     coordinator = LiveSessionCoordinator(
-        {"diarization": {"provider": "single"}, "punctuation": {"provider": "rule"}},
+        {
+            "diarization": {"provider": "single"},
+            "punctuation": {"provider": "rule"},
+            "live": {"bleed_suppression": {"enabled": bleed_enabled}},
+        },
         session,
         events.append,
         dual_track=True,
@@ -119,12 +124,17 @@ def test_live_dual_track_archives_standard_artifacts(monkeypatch, tmp_path):
         coordinator.feed(track, PcmChunk(0, pcm))
     transcript = coordinator.finish()
     assert transcript is not None, coordinator.error
-    assert [u["speaker"] for u in transcript["utterances"]] == ["说话人A", "我"]
+    assert [u["speaker"] for u in transcript["utterances"]] == (
+        ["说话人A"] if bleed_enabled else ["说话人A", "我"]
+    )
     raw = json.loads((session.root / "asr_raw.json").read_text("utf-8"))
     assert "speaker" not in raw["utterances"][0]
-    assert raw["microphone"]["utterances"][0]["words"][0]["w"] == "测试"
+    assert raw["microphone"]["utterances"][0]["words"][0]["w"] == text
+    assert session.recording_paths()[1].is_file()
     logged = [
         json.loads(line) for line in (session.root / "events.jsonl").read_text("utf-8").splitlines()
     ]
-    assert [event for event in events if event["type"] == "asr.commit"] == logged
+    assert [event for event in events if event["type"].startswith("asr.")] == logged
+    mic = next(event for event in logged if event.get("track") == "microphone")
+    assert mic["suppressed_bleed"] is bleed_enabled
     assert session.transcript_md.is_file()

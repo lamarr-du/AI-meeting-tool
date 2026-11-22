@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -57,6 +58,14 @@ class SettingsDialog(QDialog):
         target_help = QLabel("影响新录音的电脑声音和麦克风；值越高，背景噪声也可能越明显。")
         target_help.setWordWrap(True)
         target_help.setObjectName("muted")
+        self.bleed_suppression = QCheckBox("过滤麦克风中的外放重复发言")
+        live = cfg.get("live") or {}
+        self.bleed_suppression.setChecked(
+            bool((live.get("bleed_suppression") or {}).get("enabled", True))
+        )
+        self.bleed_suppression.setToolTip(
+            "使用耳机时可关闭。被过滤的发言仍保存在音频和原始转写中。"
+        )
 
         browse = QPushButton("选择…")
         browse.clicked.connect(self.choose_folder)
@@ -90,6 +99,7 @@ class SettingsDialog(QDialog):
         layout.addRow("录音目标电平（RMS）", target)
         layout.addRow("", reset_target)
         layout.addRow(target_help)
+        layout.addRow(self.bleed_suppression)
         layout.addRow(buttons)
 
     def choose_folder(self) -> None:

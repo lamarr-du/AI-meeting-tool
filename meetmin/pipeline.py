@@ -264,7 +264,11 @@ class Pipeline:
         return raw
 
     def diarize(
-        self, session: Session, *, on_model_download: Callable[[bool], None] | None = None
+        self,
+        session: Session,
+        *,
+        on_model_download: Callable[[bool], None] | None = None,
+        suppressed_microphone: set[int] | None = None,
     ) -> dict:
         """从原始转写重建精简转写；绝不调用 ASR。"""
         import json
@@ -298,6 +302,28 @@ class Pipeline:
             for u in utterances:
                 u.speaker = "说话人A"
             speakers = ["说话人A"] if utterances else []
+        return self._publish_aligned_transcript(
+            session,
+            raw,
+            utterances,
+            speakers,
+            on_model_download=on_model_download,
+            error=error,
+            suppressed_microphone=suppressed_microphone,
+        )
+
+    def _publish_aligned_transcript(
+        self,
+        session: Session,
+        raw: dict,
+        utterances: list[Utterance],
+        speakers: list[str],
+        *,
+        on_model_download: Callable[[bool], None] | None = None,
+        error: str | None = None,
+        suppressed_microphone: set[int] | None = None,
+        speaker_names: dict[str, str] | None = None,
+    ) -> dict:
         local_whisper = (raw.get("asr") or {}).get("provider") == "faster_whisper"
         punctuator: Punctuator | None = None
         if local_whisper:
@@ -309,7 +335,9 @@ class Pipeline:
         if microphone := raw.get("microphone"):
             transcript["microphone"] = {k: v for k, v in microphone.items() if k != "utterances"}
             mic_utterances = [
-                Utterance.from_dict(u) for u in microphone["utterances"] if u["text"].strip()
+                Utterance.from_dict(u)
+                for index, u in enumerate(microphone["utterances"])
+                if u["text"].strip() and index not in (suppressed_microphone or ())
             ]
             for u in mic_utterances:
                 u.speaker = "我"
@@ -327,7 +355,9 @@ class Pipeline:
                 )
             )
         transcript["speakers"] = speakers
-        transcript["diarization"] = dict(dcfg)
+        transcript["diarization"] = dict(self.cfg.get("diarization") or {})
+        if speaker_names:
+            transcript["speaker_names"] = speaker_names
         if error is not None:
             transcript["diarization_status"] = {"status": "fallback", "error": error}
         transcript["utterances"] = [u.to_dict() for u in utterances]

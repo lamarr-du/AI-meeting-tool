@@ -39,7 +39,7 @@ python scripts/build_desktop.py
 
 构建默认包含 CUDA 12 和 cuDNN 9 运行库。脚本可从当前 Python 环境的 CUDA 版 PyTorch 中取 DLL，也支持通过 `--cuda-dir <目录>` 提供同一套运行库。从源码运行时，可用环境变量 `MEETMIN_CUDA_DLL_DIR` 指定 DLL 目录。仅构建 CPU 便携包时使用 `--cpu-only`。CUDA 仍需要机器上的 NVIDIA 驱动。
 
-双击 `dist/desktop/MeetMin/MeetMin.exe` 启动，复制到另一台电脑时请携带整个 `MeetMin` 文件夹。便携版包含 Python 和 Qt 运行时，Whisper 权重在首次使用时下载或读取已有缓存。便携版采用单说话人分组，双轨录音中的麦克风发言仍标记为「我」。
+双击 `dist/desktop/MeetMin/MeetMin.exe` 启动，复制到另一台电脑时请携带整个 `MeetMin` 文件夹。便携版包含 Python 和 Qt 运行时，Whisper 权重在首次使用时下载或读取已有缓存。具备 ONNX Runtime CPU 支持且 CAM++ 模型已缓存时，便携版也可录中分离说话人。
 
 从工程内启动便携版时，它和源码版共用工程的 `.cache/huggingface/hub`。独立运行时默认使用 `MeetMin.exe` 所在目录下的同名缓存路径。[模型缓存及路径配置](technical-reference.md#cpu--gpu-与模型缓存)
 
@@ -56,6 +56,8 @@ python scripts/evaluate_transcript.py data/sessions/example/label.txt data/d6/se
 字符错误率按忽略标点、空白和大小写后的编辑距离计算。术语召回按人工标注中的出现次数计分。说话人归属评分使用 SciPy（随 `diar` 额外依赖安装），按时间重合为预测标签匹配参考标签；标注段落的终点取下一段起点，最后一段取录音结束。归属错误率只统计转写覆盖到的时间，同时报告覆盖秒数以便核对漏转。
 
 实时转写可用已缓存的模型进行 1.0× 回放。输入为 16 kHz、16 位单声道 PCM WAV，双轨测试可加 `--microphone` 指定独立麦克风轨。终端会报告首次草稿、定稿延迟和归档耗时，产物默认写到 `data/live_replay`。
+
+开录时读取 `live.diarization.enabled` 和 `live.bleed_suppression.enabled`。说话人粗标、重聚类和改名记录在 `events.jsonl`，停录归档沿用实时标签。重新运行离线 `diarize` 时，仅复用模型、音频指纹和采样区间均匹配的录中声纹。使用耳机时可在桌面设置关闭外放重复发言过滤，原始音频和 `asr_raw.json` 始终保留双轨数据。
 
 ```powershell
 python -m scripts.replay_live_sim data/sessions/example/audio.wav --warm
