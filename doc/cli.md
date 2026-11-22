@@ -4,13 +4,13 @@
 
 ## 安装 CLI
 
-建议使用 **64 位 Python 3.12**。其他 Python 版本的安装情况取决于各依赖提供的版本和平台包。
+先安装 Miniconda 或 Anaconda，建议创建 **Python 3.12** 的 Conda 环境。其他 Python 版本的安装情况取决于各依赖提供的版本和平台包。已有项目内的 `.conda` 环境时，无需再次创建。
 
 Windows PowerShell，使用固定的核心依赖组合：
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
+conda create --prefix .\.conda python=3.12 pip
+conda activate .\.conda
 python -m pip install -c requirements-win-py312.lock .
 
 # 可选：旧版 SpeechBrain ECAPA 说话人分离（默认 CAM++ ONNX 已开箱可用，无需此依赖）
@@ -20,8 +20,8 @@ python -m pip install -c requirements-win-py312.lock ".[diar]"
 macOS / Linux，使用兼容版本范围：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+conda create --prefix ./.conda python=3.12 pip
+conda activate ./.conda
 python -m pip install .
 # 可选：旧版 SpeechBrain ECAPA 说话人分离（默认 CAM++ ONNX 已开箱可用）
 python -m pip install ".[diar]"
