@@ -90,6 +90,10 @@ QPushButton#refreshAudio:disabled, QToolButton:disabled, QComboBox:disabled, QLi
 QComboBox { padding-right: 24px; }
 QComboBox::drop-down { border: 0; width: 22px; }
 QComboBox::down-arrow { image: none; }
+QComboBox QAbstractItemView {
+    selection-background-color: #eee7fc;
+    selection-color: #432c89;
+}
 QToolButton#moreActions { padding-right: 24px; }
 QToolButton::menu-indicator { subcontrol-origin: padding; subcontrol-position: center right; }
 QListWidget#historyList { background: transparent; border: 0; outline: 0; }
