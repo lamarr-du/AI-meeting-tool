@@ -518,6 +518,12 @@ class MeetingWindow(QMainWindow):
         self.stop.setIcon(line_icon("stop", "#89253e"))
         self.stop.clicked.connect(self.request_stop)
         controls.addWidget(self.stop)
+        self.mute_microphone = QPushButton("禁言麦克风")
+        self.mute_microphone.setObjectName("muteMicrophone")
+        self.mute_microphone.setCheckable(True)
+        self.mute_microphone.setToolTip("仅控制 MeetMin 录制的麦克风音轨")
+        self.mute_microphone.toggled.connect(self.toggle_microphone_mute)
+        controls.addWidget(self.mute_microphone)
         self.record_hint = label("", "muted")
         self.record_hint.setWordWrap(True)
         controls.addWidget(self.record_hint, 1)
@@ -746,6 +752,9 @@ class MeetingWindow(QMainWindow):
         self.settings_button.setEnabled(ready)
         self.start.setEnabled(ready and self.loopback_available)
         self.stop.setEnabled(capturing)
+        self.mute_microphone.setVisible(
+            capturing and self.recorder is not None and self.recorder.dual_track
+        )
         self.import_button.setEnabled(ready)
         self.meeting_name.setEnabled(ready)
         self.live_enabled.setEnabled(ready)
@@ -901,6 +910,7 @@ class MeetingWindow(QMainWindow):
         )
         recorder = self.recorder = Pipeline(cfg).recorder(for_session=True)
         stop_requested = self.stop_requested = Event()
+        self.mute_microphone.setChecked(False)
         self.recorded_at = time.monotonic()
         self.show_meter({"microphone": {} if recorder.dual_track else None})
         live = self.live_enabled.isChecked()
@@ -931,6 +941,14 @@ class MeetingWindow(QMainWindow):
             self.set_status("正在保存录音…")
             self.update_controls()
 
+    def toggle_microphone_mute(self, muted: bool) -> None:
+        if self.recorder is not None and self.recording_active():
+            self.recorder.set_microphone_muted(muted)
+        self.mute_microphone.setText("解除麦克风禁言" if muted else "禁言麦克风")
+        _, caption, meter = self.tracks[1]
+        caption.setText("麦克风已禁言" if muted else "麦克风")
+        meter.setValue(0)
+
     def rename_live_speaker(self, speaker: int, name: str) -> None:
         if self.job is not None and self.recording_active():
             self.job.speaker_renames.put((speaker, name))
@@ -943,6 +961,8 @@ class MeetingWindow(QMainWindow):
         ):
             widget.setVisible(track is not None)
             if track is None:
+                continue
+            if name == "麦克风" and self.mute_microphone.isChecked():
                 continue
             no_data = track.get("no_data_sec", 0)
             duration = ts(track.get("duration_sec", 0))

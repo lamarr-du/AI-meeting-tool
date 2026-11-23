@@ -13,6 +13,7 @@ SAMPLE_RATE = 16000
 class PcmChunk:
     start: int
     pcm: bytes
+    muted: bool = False
 
 
 @dataclass(frozen=True)

@@ -54,6 +54,34 @@ def test_idle_closes_a_draft_without_synthesizing_pcm_or_duplicate_text():
     assert calls == [(2 * SAMPLE_RATE, 0.0)]
 
 
+def test_mute_ends_the_previous_turn_and_excludes_silence_from_inference():
+    vad_calls = []
+
+    def vad(audio):
+        vad_calls.append(audio.copy())
+        return [{"start": 0, "end": len(audio)}]
+
+    track = LiveTrack(ring_sec=60, endpoint_ms=600, max_window_sec=15, vad=vad)
+    samples = SAMPLE_RATE // 10
+    speech = np.ones(samples, dtype="<i2").tobytes()
+    silence = bytes(samples * 2)
+    track.feed(PcmChunk(0, speech))
+    track.feed(PcmChunk(samples, silence, muted=True))
+    track.feed(PcmChunk(2 * samples, silence, muted=True))
+    assert len(vad_calls) == 1
+    track.feed(PcmChunk(3 * samples, speech))
+    track.close()
+
+    for start in (0, 3 * samples):
+        window = track.next_window(SAMPLE_RATE)
+        assert window is not None and window.final
+        assert (window.start, window.end) == (start, start + samples)
+        track.decode(window, lambda audio, offset: [])
+    assert track.audio.end == 4 * samples
+    assert track.next_window(SAMPLE_RATE) is None
+    assert len(vad_calls) == 2 and all(np.all(audio) for audio in vad_calls)
+
+
 def test_offline_model_requires_the_tokenizer(monkeypatch, tmp_path):
     import huggingface_hub
 

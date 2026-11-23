@@ -46,6 +46,7 @@ class _Speech:
     floor: int
     decoded_to: int
     closed: bool = False
+    end_limit: int | None = None
     previous: list[dict] = field(default_factory=list)
 
 
@@ -76,6 +77,7 @@ class LiveTrack:
         self._speech: deque[_Speech] = deque()
         self._scanned = 0
         self._speech_end = 0
+        self._speech_floor = 0
 
     def feed(self, event: AudioEvent) -> None:
         if isinstance(event, IdleTick):
@@ -83,13 +85,21 @@ class LiveTrack:
                 self._scan()
             self._close_at(event.sample)
             return
+        if event.muted:
+            if self._speech_floor != self.audio.end:
+                self.close()
+                if self._speech:
+                    self._speech[-1].end_limit = self.audio.end
+            self.audio.append(event)
+            self._scanned = self._speech_floor = self.audio.end
+            return
         self.audio.append(event)
         if self.audio.end - self._scanned >= _SCAN_STEP:
             self._scan()
 
     def _scan(self) -> None:
         end = self.audio.end
-        start = max(self.audio.start, self._scanned - SAMPLE_RATE)
+        start = max(self.audio.start, self._speech_floor, self._scanned - SAMPLE_RATE)
         samples = self.audio.read(start, end)
         ranges = self.vad(samples) if np.any(samples) else []
         for region in ranges:
@@ -100,7 +110,9 @@ class LiveTrack:
             if not self._speech or self._speech[-1].closed:
                 # Repeated VAD scans can rediscover old audio. Retain pre-roll only
                 # from the gap preceding a genuinely new region.
-                first = max(self.audio.start, self._speech_end, onset - _PRE_ROLL)
+                first = max(
+                    self.audio.start, self._speech_floor, self._speech_end, onset - _PRE_ROLL
+                )
                 self._speech.append(_Speech(first, offset, first, first))
             else:
                 self._speech[-1].end = offset
@@ -129,7 +141,7 @@ class LiveTrack:
         start = max(region.start, region.floor - _PRE_ROLL)
         # If inference fell behind, decode queued short turns together. Keep
         # their intervening audio and let the punctuation model split them.
-        while region.closed and len(self._speech) > 1:
+        while region.closed and region.end_limit is None and len(self._speech) > 1:
             following = self._speech[1]
             if (
                 not following.closed
@@ -144,6 +156,8 @@ class LiveTrack:
             following.previous = region.previous
             region = following
         end = min(self.audio.end, region.end + _POST_ROLL)
+        if region.end_limit is not None:
+            end = min(end, region.end_limit)
         capped = region.end > start + self.max_window
         if not (region.closed or capped) and end - region.decoded_to < hop:
             return None

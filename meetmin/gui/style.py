@@ -73,6 +73,9 @@ QPushButton#stop {
 }
 QPushButton#stop:hover { background: #f2c5d5; }
 QPushButton#stop:focus { border-color: #a33151; }
+QPushButton#muteMicrophone:checked {
+    background: #f8d9e4; border-color: #a33151; color: #89253e;
+}
 QPushButton#newMeeting { text-align: left; }
 QPushButton#settingsButton { background: transparent; text-align: left; border-color: transparent; }
 QPushButton#settingsButton:hover { background: #ece5fa; }

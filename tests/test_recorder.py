@@ -805,6 +805,50 @@ def test_dual_recording_shares_boundaries_across_device_clocks(recording, monkey
     assert microphone.is_file()
 
 
+@pytest.mark.parametrize("rate", [16000, 44100, 48000])
+def test_microphone_mute_preserves_wav_and_live_timeline(recording, tmp_path, rate):
+    r = recording
+    r.rec.sample_rate = r.rec.output_sample_rate = 16000
+    mic = MicrophoneRecorder(clock=r.clock, sample_rate=rate, output_sample_rate=16000)
+    recorder = SessionRecorder(r.rec, mic)
+    events = {"loopback": [], "microphone": []}
+    recorder.set_audio_tap(lambda name, event: events[name].append(event))
+    session = Session(tmp_path, "muted")
+    recorder.start(session)
+    loopback, microphone = r.streams
+    for index in range(6):
+        start = index / 10
+        loopback.emit(start, value=3000, frames=1600)
+        if index == 2:
+            recorder.set_microphone_muted(True)
+        elif index == 4:
+            # Unmuting mid-buffer must still discard that buffer's captured audio.
+            recorder.set_microphone_muted(False)
+        microphone.emit(start, value=6000, frames=rate // 10)
+    recorder.stop()
+
+    loopback_wav, microphone_wav = session.recording_paths()
+    assert microphone_wav is not None
+    for track, path in (("loopback", loopback_wav), ("microphone", microphone_wav)):
+        audio = read_audio(path, 16000)
+        assert len(audio) == 9600
+        cursor = 0
+        muted = []
+        for event in events[track]:
+            if isinstance(event, PcmChunk):
+                assert event.start == cursor
+                samples = np.frombuffer(event.pcm, dtype="<i2")
+                np.testing.assert_array_equal(samples, audio[cursor : cursor + len(samples)])
+                muted.extend([event.muted] * len(samples))
+                cursor += len(samples)
+        expected = np.zeros(len(audio), dtype=bool)
+        if track == "microphone":
+            expected[3200:8000] = True
+        np.testing.assert_array_equal(muted, expected)
+        assert not audio[expected].any()
+        assert np.all(audio[~expected] > 1500)
+
+
 def test_failed_dual_overwrite_preserves_active_take_and_can_export(recording, tmp_path):
     r = recording
     session = Session(tmp_path, "dual")

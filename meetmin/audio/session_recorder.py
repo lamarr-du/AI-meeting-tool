@@ -40,6 +40,10 @@ class SessionRecorder:
     def dual_track(self) -> bool:
         return len(self._recorders) > 1
 
+    def set_microphone_muted(self, muted: bool) -> None:
+        if self.dual_track:
+            self._recorders[1].set_muted(muted)
+
     def set_audio_tap(self, callback: Callable[[str, AudioEvent], None] | None) -> None:
         if self._lock is not None:
             raise RuntimeError("只能在录音启动前设置实时音频分流")
@@ -196,6 +200,7 @@ class SessionRecorder:
         assert self._lock is not None
         self._lock.close()
         self._lock = None
+        self.set_microphone_muted(False)
 
 
 def recover_recording(session: Session, take: Path, output: Path | None) -> list[tuple[Path, dict]]:
