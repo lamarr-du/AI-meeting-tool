@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import time
 import wave
@@ -28,9 +29,15 @@ from .audio.session_recorder import SessionRecorder
 from .config import DEFAULT_TARGET_RMS
 from .diarization.align import UNKNOWN_NAME, assign_speakers, relabel
 from .diarization.live_recovery import restore_live_speaker_names
+from .diarization.voiceprints import (
+    Enrollment,
+    VoiceprintLibrary,
+    audio_fingerprint,
+    local_profiles,
+)
 from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
-from .speakers import rename_speakers, speaker_preview
+from .speakers import is_generated_speaker, is_person_name, rename_speakers, speaker_preview
 from .summarizer.llm_client import BaseLLM, Usage, get_llm
 from .summarizer.minutes import build_web_prompt, estimate_cost, generate_minutes
 from .textutil import ts
@@ -273,8 +280,6 @@ class Pipeline:
         restore_live_names: bool = False,
     ) -> dict:
         """从原始转写重建精简转写；绝不调用 ASR。"""
-        import json
-
         raw = json.loads(session._require("asr_raw.json").read_text(encoding="utf-8"))
         utterances = [Utterance.from_dict(u) for u in raw["utterances"] if u["text"].strip()]
         result = ASRResult(utterances=utterances, language=raw.get("language"))
@@ -328,6 +333,9 @@ class Pipeline:
             on_model_download=on_model_download,
             error=error,
             suppressed_microphone=suppressed_microphone,
+            voiceprint_audio_sha256=(
+                audio_fingerprint(audio16k) if audio16k is not None and error is None else None
+            ),
         )
 
     def _publish_aligned_transcript(
@@ -341,7 +349,42 @@ class Pipeline:
         error: str | None = None,
         suppressed_microphone: set[int] | None = None,
         speaker_names: dict[str, str] | None = None,
+        voiceprint_audio_sha256: str | None = None,
     ) -> dict:
+        profiles = None
+        if voiceprint_audio_sha256 is not None:
+            names = speaker_names or {}
+            labels = {name: label for label, name in names.items()}
+            profiles = local_profiles(
+                session.root / "embeddings.npz",
+                utterances,
+                voiceprint_audio_sha256,
+            )
+            if profiles:
+                candidates = {
+                    name: vector
+                    for name, vector in profiles["speakers"].items()
+                    if is_generated_speaker(name) and name not in labels
+                }
+                try:
+                    matches = self.voiceprint_library.match(
+                        profiles["model"], candidates, reserved=set(speakers) | set(names.values())
+                    )
+                except (OSError, ValueError, TypeError, OverflowError) as exc:
+                    self.progress(f"  ! 无法读取公共声纹库，继续保存转写：{exc}")
+                else:
+                    if matches:
+                        for utterance in utterances:
+                            if isinstance(utterance.speaker, str):
+                                utterance.speaker = matches.get(
+                                    utterance.speaker, utterance.speaker
+                                )
+                        speakers = [matches.get(speaker, speaker) for speaker in speakers]
+                        speaker_names = {**names, **matches}
+                        self.progress(f"  ✓ 公共声纹库识别：{'、'.join(matches.values())}")
+                profiles["speakers"] = {
+                    labels.get(name, name): vector for name, vector in profiles["speakers"].items()
+                }
         local_whisper = (raw.get("asr") or {}).get("provider") == "faster_whisper"
         punctuator: Punctuator | None = None
         if local_whisper:
@@ -376,6 +419,8 @@ class Pipeline:
         transcript["diarization"] = dict(self.cfg.get("diarization") or {})
         if speaker_names:
             transcript["speaker_names"] = speaker_names
+        if voiceprint_audio_sha256 is not None:
+            transcript["speaker_voiceprints"] = profiles
         if error is not None:
             transcript["diarization_status"] = {"status": "fallback", "error": error}
         transcript["utterances"] = [u.to_dict() for u in utterances]
@@ -446,7 +491,7 @@ class Pipeline:
             session.root, name=".transcript.lock", busy_message="此会话的转写正在由另一个命令更新"
         )
 
-    def rename_speakers(self, session: Session, assignments: list[str]) -> None:
+    def rename_speakers(self, session: Session, assignments: list[str] | dict[str, str]) -> None:
         with self._transcript_lock(session):
             original = session.load_transcript()
             updated = rename_speakers(original, assignments)
@@ -456,6 +501,61 @@ class Pipeline:
             self._save_transcript(session, updated)
             if corrected is not updated:
                 self._save_corrected_transcript(session, corrected)
+
+    @property
+    def voiceprint_library(self) -> VoiceprintLibrary:
+        configured = self.cfg.get("voiceprint_library_dir")
+        return VoiceprintLibrary(
+            Path(configured) if configured else Path(self.out_dir) / "voiceprints"
+        )
+
+    def enroll_voiceprints(self, session: Session) -> Enrollment:
+        with self._transcript_lock(session):
+            transcript = session.load_transcript()
+            profiles = transcript.get("speaker_voiceprints")
+            if "speaker_voiceprints" not in transcript:
+                profiles = self._legacy_voiceprints(session, transcript)
+            if not profiles:
+                raise ValueError("本场没有足够的声纹样本，请确认已完成本地说话人分离。")
+            names = transcript.get("speaker_names") or {}
+            candidates = {}
+            for label, vector in profiles["speakers"].items():
+                name = names.get(label, label)
+                if is_person_name(name):
+                    candidates[name] = vector
+            if not candidates:
+                raise ValueError("请先编辑说话人姓名，再登记到公共声纹库。")
+            return self.voiceprint_library.enroll(profiles["model"], candidates)
+
+    @staticmethod
+    def _legacy_voiceprints(session: Session, transcript: dict) -> dict | None:
+        cache = session.root / "embeddings.npz"
+        dcfg = transcript.get("diarization") or {}
+        if (
+            not cache.is_file()
+            or not dcfg.get("enabled", True)
+            or dcfg.get("provider") == "single"
+            or transcript.get("diarization_status", {}).get("status") == "fallback"
+            or (transcript.get("asr") or {}).get("provider") != "faster_whisper"
+        ):
+            return None
+        audio_path = transcript.get("audio_path")
+        if not audio_path or not Path(audio_path).is_file():
+            return None
+        microphone_name = (transcript.get("speaker_names") or {}).get("我", "我")
+        profiles = local_profiles(
+            cache,
+            [
+                Utterance.from_dict(row)
+                for row in transcript["utterances"]
+                if row.get("speaker") != microphone_name
+            ],
+            audio_fingerprint(to_mono_16k(audio_path)),
+        )
+        if profiles and profiles["model"].startswith("local:"):
+            # Older custom-model caches identify a path only. Rerun to fingerprint the model.
+            return None
+        return profiles
 
     def _diarize(
         self,

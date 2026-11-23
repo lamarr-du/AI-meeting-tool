@@ -5,6 +5,8 @@ output_dir: data
 # Whisper 和 SpeechBrain 权重均放在 huggingface/hub。
 # 可填写绝对路径，或相对于此配置文件的目录。asr.model_size 指向的本地模型优先。
 model_cache_dir: null
+# null 使用 <output_dir>/voiceprints。相对路径以本配置文件所在目录为基准。
+voiceprint_library_dir: null
 
 recorder:
   device: null        # 内录设备索引或名称片段；null = 默认输出设备的 loopback（python main.py devices 查看）

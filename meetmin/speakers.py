@@ -9,6 +9,17 @@ from .textutil import ts
 
 _GENERATED_NAME = re.compile(r"说话人([A-Z]|[0-9]+)")
 _UNKNOWN_NAMES = {UNKNOWN_NAME, "说话人?"}
+_RESERVED_NAMES = _UNKNOWN_NAMES | {"我", "全体", "说话人待定"}
+
+
+def is_generated_speaker(name: str) -> bool:
+    return _GENERATED_NAME.fullmatch(name) is not None
+
+
+def is_person_name(name: str) -> bool:
+    return bool(name and name == name.strip() and name.isprintable()) and (
+        name not in _RESERVED_NAMES and not is_generated_speaker(name)
+    )
 
 
 def _roster(transcript: dict) -> dict[str, str]:
@@ -48,19 +59,29 @@ def speaker_preview(transcript: dict) -> list[str]:
     return lines
 
 
-def rename_speakers(transcript: dict, assignments: list[str]) -> dict:
+def rename_speakers(transcript: dict, assignments: list[str] | dict[str, str]) -> dict:
     roster = _roster(transcript)
     updated = dict(roster)
     changed: set[str] = set()
-    for assignment in assignments:
-        selector, sep, name = assignment.partition("=")
+    pairs = (
+        assignments.items()
+        if isinstance(assignments, dict)
+        else (
+            (selector, name) for selector, _, name in (item.partition("=") for item in assignments)
+        )
+    )
+    for selector, name in pairs:
         selector, name = selector.strip(), name.strip()
-        if not sep or not selector or not name or not name.isprintable() or name in _UNKNOWN_NAMES:
-            raise ValueError(f"无效的改名项 {assignment!r}，请使用 A=姓名")
+        if not selector or not name or not name.isprintable() or name in _UNKNOWN_NAMES:
+            raise ValueError(f"无效的改名项 {selector}={name}，请使用 A=姓名")
         matches = []
         for label, current in roster.items():
             code = _GENERATED_NAME.fullmatch(label)
-            if selector in (label, current) or (code and selector.upper() == code[1]):
+            if isinstance(assignments, dict):
+                matched = current == selector
+            else:
+                matched = selector in (label, current) or bool(code and selector.upper() == code[1])
+            if matched:
                 matches.append(label)
         if len(matches) != 1:
             raise ValueError(f"说话人 {selector!r} 不存在或有歧义，请先运行 speakers list")

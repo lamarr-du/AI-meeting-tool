@@ -96,7 +96,9 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 
 修改 `config.yaml` 中的 `cluster_threshold`、`num_speakers`、`cluster_method`、`min_active_ratio`、`min_cluster_size`、`min_cluster_sec` 或 `min_group_sec` 后，同样只需重跑分离和纪要。原始转写不会被分离过程修改；失败的重跑不会自动清除上次已有的输出，须确认命令成功后再使用结果。
 
-`embeddings.npz` 包含归一化的 `embeddings`、窗口起止采样点 `starts` / `ends` 和 JSON 字符串 `metadata`（采样率、模型、切窗模式、窗口参数、语音区间与音频指纹）。可用 `numpy.load(path, allow_pickle=False)` 读取，作为后续声纹注册的数据基础；当前尚无声纹注册命令。音频、声纹模型、语音区间、切窗模式、窗口参数及最低能量阈值一致时复用嵌入；改变这些输入或删除文件会重新提取。仅改活跃度筛选、聚类或对齐参数不会重新提取。
+`embeddings.npz` 包含归一化的 `embeddings`、窗口起止采样点 `starts` / `ends` 和 JSON 字符串 `metadata`（采样率、模型、切窗模式、窗口参数、语音区间与音频指纹）。可用 `numpy.load(path, allow_pickle=False)` 读取。音频、声纹模型、语音区间、切窗模式、窗口参数及最低能量阈值一致时复用嵌入；改变这些输入或删除文件会重新提取。仅改活跃度筛选、聚类或对齐参数不会重新提取。
+
+公共声纹库默认保存在 `<output_dir>/voiceprints/speakers.json`，可通过 `voiceprint_library_dir` 指定目录。登记操作追加已有姓名之外的记录，已有姓名和声纹保留。文件保存姓名和声纹向量，会话中的原录音与全文仍保存在会话目录。匹配仅在同声纹模型下进行，低置信度或有歧义时保留会话标签。转写归档只读取公共库，写入由 GUI 的「登记到公共声纹库」或 `meetmin speakers enroll` 触发。登记来源是能完成本地说话人分离的主音轨，独立麦克风音轨保留「我」标签。
 
 本地声纹重跑仍需要原始音频，外部音频请保留在记录的绝对路径。Whisper 保留 `asr.word_timestamps: true` 才会请求词级数据；当前 DashScope 实现只解析句级数据。旧会话没有 `asr_raw.json` 时，需重新转写一次才能独立分离；已有 `transcript.json` 仍可用于生成纪要。
 

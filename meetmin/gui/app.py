@@ -56,9 +56,11 @@ from ..asr.model_download import ModelDownloadProgress
 from ..audio.loopback_recorder import RecordingError, list_loopback_devices, list_microphone_devices
 from ..audio.session_recorder import RECORDING_DIAGNOSTICS, SessionRecorder
 from ..config import MAX_TARGET_RMS, MIN_TARGET_RMS, deep_merge, load_config
+from ..diarization.voiceprints import Enrollment
 from ..live_pipeline import SpeakerRenames
 from ..pipeline import Pipeline
 from ..session import Session
+from ..speakers import is_generated_speaker, is_person_name
 from ..summarizer.llm_client import MockLLM, get_llm
 from ..textutil import ts
 from . import workflow
@@ -379,6 +381,11 @@ class MeetingWindow(QMainWindow):
         self.export_transcript.triggered.connect(lambda: self.export_file(self.transcript_path))
         self.export_minutes = menu.addAction("导出纪要…")
         self.export_minutes.triggered.connect(lambda: self.export_file(self.minutes_path))
+        menu.addSeparator()
+        self.edit_speaker = menu.addAction("编辑说话人姓名…")
+        self.edit_speaker.triggered.connect(self.edit_speaker_name)
+        self.enroll_speakers = menu.addAction("登记到公共声纹库…")
+        self.enroll_speakers.triggered.connect(self.enroll_speaker_voiceprints)
         menu.addSeparator()
         self.web_prompt = menu.addAction("导出 AI 网页提示词…")
         self.web_prompt.triggered.connect(self.export_prompt)
@@ -790,6 +797,8 @@ class MeetingWindow(QMainWindow):
         self.more.setEnabled(ready)
         self.export_transcript.setEnabled(self.transcript_path is not None)
         self.export_minutes.setEnabled(self.minutes_path is not None)
+        self.edit_speaker.setEnabled(ready and self.transcript_path is not None)
+        self.enroll_speakers.setEnabled(ready and self.transcript_path is not None)
         can_use_web = self.transcript_path is not None
         self.web_prompt.setEnabled(can_use_web)
         self.web_minutes.setEnabled(can_use_web)
@@ -1040,6 +1049,79 @@ class MeetingWindow(QMainWindow):
             self.generate.setEnabled(False)
         elif result.get("diarization_status", {}).get("status") == "fallback":
             self.set_status("转写已保存，内录说话人分离失败，已按单人显示。", "warning")
+
+    def edit_speaker_name(self) -> None:
+        session = self.session
+        if session is None:
+            return
+        try:
+            transcript = session.load_transcript()
+        except (OSError, ValueError) as exc:
+            self.set_status(f"无法读取转写 · {exc}", "error")
+            return
+        examples: dict[str, dict] = {}
+        for row in transcript["utterances"]:
+            name = row.get("speaker")
+            if isinstance(name, str) and (is_generated_speaker(name) or is_person_name(name)):
+                examples.setdefault(name, row)
+        if not examples:
+            self.set_status("本场没有可编辑姓名的说话人。", "warning")
+            return
+        current, accepted = QInputDialog.getItem(
+            self, "编辑说话人姓名", "说话人", list(examples), editable=False
+        )
+        if not accepted:
+            return
+        example = examples[current]
+        name, accepted = QInputDialog.getText(
+            self,
+            "编辑说话人姓名",
+            f"{current} · {ts(example['start'])}\n{example['text'][:100]}\n\n姓名",
+            text=current if is_person_name(current) else "",
+        )
+        name = name.strip()
+        if not accepted or name == current:
+            return
+        if not is_person_name(name):
+            self.set_status("请输入姓名。", "warning")
+            return
+        self.launch(
+            "正在保存说话人姓名…",
+            lambda job: Pipeline(self.cfg, progress=job.log.emit).rename_speakers(
+                session, {current: name}
+            ),
+            lambda _: self.set_status(f"已保存本场说话人姓名 · {name}", "success"),
+        )
+
+    def enroll_speaker_voiceprints(self) -> None:
+        session = self.session
+        if session is None:
+            return
+        library = Pipeline(self.cfg).voiceprint_library.path.resolve()
+        if (
+            QMessageBox.question(
+                self,
+                "登记到公共声纹库",
+                "将本场已命名且有足够样本的说话人姓名和声纹保存到下列位置，供后续会议自动识别。"
+                f"\n\n{library}",
+                defaultButton=QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self.launch(
+            "正在登记公共声纹…",
+            lambda job: Pipeline(self.cfg, progress=job.log.emit).enroll_voiceprints(session),
+            self.voiceprints_enrolled,
+        )
+
+    def voiceprints_enrolled(self, result: Enrollment) -> None:
+        messages = []
+        if result.added:
+            messages.append("已登记 " + "、".join(result.added))
+        if result.existing:
+            messages.append("已在库中 " + "、".join(result.existing))
+        self.set_status(" · ".join(messages), "success")
 
     def retry_transcription(self) -> None:
         session = self.session

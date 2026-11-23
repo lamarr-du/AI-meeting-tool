@@ -37,6 +37,19 @@ def new_session_id(prefix: str | None = None) -> str:
     )
 
 
+def write_json_safely(path: Path, obj) -> Path:
+    temporary = path.with_name("." + path.name + "." + secrets.token_hex(8) + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
 class Session:
     def __init__(self, output_dir: str | Path, session_id: str):
         if not session_id or session_id in (".", "..") or "/" in session_id or "\\" in session_id:
@@ -127,17 +140,7 @@ class Session:
     # ---- JSON ----
     def save_json(self, name: str, obj) -> Path:
         self.ensure()
-        p = self.root / name
-        temporary = self.root / ("." + name + "." + secrets.token_hex(8) + ".tmp")
-        try:
-            with temporary.open("x", encoding="utf-8") as f:
-                json.dump(obj, f, ensure_ascii=False, indent=1)
-                f.flush()
-                os.fsync(f.fileno())
-            temporary.replace(p)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return p
+        return write_json_safely(self.root / name, obj)
 
     def save_transcript(self, transcript: dict) -> Path:
         return self.save_json("transcript.json", transcript)

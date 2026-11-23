@@ -405,9 +405,12 @@ class LiveSessionCoordinator:
             )
             if voice is None or (self._voice_warning and not voice.turns):
                 return self.pipe.diarize(self.session, suppressed_microphone=self._suppressed)
+            audio_sha256: str | None
+            audio_sha256 = self._audio_hash.hexdigest()
             try:
-                voice.save_cache(self.session.root / "embeddings.npz", self._audio_hash.hexdigest())
+                voice.save_cache(self.session.root / "embeddings.npz", audio_sha256)
             except OSError as exc:
+                audio_sha256 = None
                 self._status(f"无法保存录中声纹缓存 · {exc}")
             utterances = voice.archive()
             utterances.extend(
@@ -430,6 +433,7 @@ class LiveSessionCoordinator:
                 speakers,
                 suppressed_microphone=self._suppressed,
                 speaker_names={speaker_name(key): name for key, name in voice.names.items()},
+                voiceprint_audio_sha256=audio_sha256,
             )
         except Exception as exc:
             self.error = str(exc)
