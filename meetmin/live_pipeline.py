@@ -83,7 +83,6 @@ class LiveSessionCoordinator:
                         "provider": "faster_whisper",
                         "profile": "auto",
                         "device": live.get("device", "auto"),
-                        "compute_type": None,
                         "model_size": live.get("model_size") or "large-v3-turbo",
                         "local_files_only": True,
                         "language": (cfg.get("asr") or {}).get("language") or "zh",
