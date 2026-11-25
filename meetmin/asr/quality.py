@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
+import zlib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import pairwise
@@ -13,6 +15,8 @@ from .base import Utterance
 _MAX_CLIP_SEC = 20
 _RETRY_MIN_LOGPROB = -0.8
 _TIME_EPSILON = 0.0001  # WAV 切片的起止点取整到采样帧
+_TEXT_LOOP = re.compile(r"(.{1,12}?)\1{5,}")
+LIVE_REVIEW_TEXT = "〔该段音频待确认〕"
 
 Span = tuple[float, float]
 
@@ -65,6 +69,22 @@ def _text_key(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())
 
 
+def live_repeat_reasons(
+    text: str, words: list[dict], threshold: float, *, compression_ratio: float = 0.0
+) -> tuple[str, ...]:
+    data = text.encode("utf-8")
+    ratio = max(compression_ratio, len(data) / len(zlib.compress(data)))
+    if ratio <= threshold:
+        return ()
+    reasons = []
+    # A high compression ratio alone can also come from valid repeated terms.
+    if _TEXT_LOOP.search(_text_key(text)):
+        reasons.append("text_loop")
+    if len(words) >= 12 and 4 * sum(w["s"] == w["e"] for w in words) >= len(words):
+        reasons.append("collapsed_timestamps")
+    return ("high_compression", *reasons) if reasons else ()
+
+
 def _is_repeat(left: Utterance, right: Utterance) -> bool:
     if right.start - left.end > 2:
         return False
@@ -107,9 +127,15 @@ def _speech_issues(gaps: list[Span], speech: list[Span], minimum: float) -> list
     return issues
 
 
-def _reject(
-    issue: _Issue, candidate: list[Decoded], kept: list[Decoded], options: QualityOptions
+def reject_replacement(
+    span: Span,
+    candidate: list[Decoded],
+    kept: list[Decoded],
+    options: QualityOptions,
+    *,
+    min_coverage: float = 0,
 ) -> str | None:
+    start, stop = span
     replacement = [row.utterance for row in candidate]
     if sum(len(_text_key(u.text)) for u in replacement) < 2:
         return "too_little_text"
@@ -125,9 +151,9 @@ def _reject(
         for row in candidate
     ):
         return "low_confidence"
-    end = issue.start
+    end = start
     for u in replacement:
-        if not (end - _TIME_EPSILON <= u.start < u.end <= issue.end + _TIME_EPSILON):
+        if not (end - _TIME_EPSILON <= u.start < u.end <= stop + _TIME_EPSILON):
             return "invalid_timing"
         if any(
             not (u.start - 0.001 <= word["s"] <= word["e"] <= u.end + 0.001)
@@ -142,7 +168,7 @@ def _reject(
         for b in kept_utterances
     ):
         return "overlaps_neighbor"
-    if issue.original and sum(u.end - u.start for u in replacement) < (issue.end - issue.start) / 2:
+    if sum(u.end - u.start for u in replacement) < (stop - start) * min_coverage:
         return "reduced_coverage"
     changed = {id(u) for u in replacement}
     combined = sorted(kept_utterances + replacement, key=lambda u: u.start)
@@ -216,7 +242,13 @@ def review(
             entry.update(status="failed", detail=f"{type(error).__name__}: {error}")
             continue
         kept = [row for row in rows if row is not issue.original]
-        if reason := _reject(issue, candidate, kept, options):
+        if reason := reject_replacement(
+            (issue.start, issue.end),
+            candidate,
+            kept,
+            options,
+            min_coverage=0.5 if issue.original else 0,
+        ):
             entry.update(status="rejected", detail=reason)
             continue
         rows = sorted(kept + candidate, key=lambda row: row.utterance.start)

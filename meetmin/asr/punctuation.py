@@ -16,6 +16,7 @@ from typing import Any
 
 from .base import Utterance
 from .punc_onnx import Punctuator
+from .quality import LIVE_REVIEW_TEXT
 
 _CHINESE_COMMA = re.compile(r"(?<=[\u3400-\u9fff])[ \t]*,[ \t]*|[ \t]*,[ \t]*(?=[\u3400-\u9fff])")
 _CLOSING_MARKS = "\"'”’」』）】》)]"
@@ -482,6 +483,8 @@ def group_paragraphs(
         prev_terminal = _ends_with_terminal_punct(_utterance_text(prev))
         should_split = (
             not same_speaker
+            or text == LIVE_REVIEW_TEXT
+            or _utterance_text(prev) == LIVE_REVIEW_TEXT
             or gap >= max_gap_sec
             or (cur_chars >= max_chars and (prev_terminal or gap >= 0.4))
             or (cur_dur >= max_duration_sec and (prev_terminal or gap >= 0.5))

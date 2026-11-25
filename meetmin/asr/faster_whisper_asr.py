@@ -313,7 +313,8 @@ class FasterWhisperASR(ASRProvider):
                     raise
             self._advance_fallback(*failure)
             self._load_with_fallback()
-            options.update(self.build_stream_options())
+            # 热词依赖新模型的 tokenizer，重跑参数继续沿用调用方的选择。
+            options["hotwords"] = self.build_stream_options()["hotwords"]
 
     def stream_metadata(self) -> dict:
         return {

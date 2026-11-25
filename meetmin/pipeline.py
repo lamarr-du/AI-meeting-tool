@@ -8,6 +8,7 @@ import os
 import time
 import wave
 from collections.abc import Callable
+from itertools import groupby
 from pathlib import Path
 from typing import Any, Literal, overload
 
@@ -21,6 +22,7 @@ from .asr.punctuation import (
     punctuate_chinese,
     reconstruct_sentences,
 )
+from .asr.quality import LIVE_REVIEW_TEXT
 from .asr.zh_convert import convert_utterances_to_simplified
 from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
@@ -455,6 +457,16 @@ class Pipeline:
     ) -> list[Utterance]:
         if not utterances:
             return utterances
+        if any(u.text == LIVE_REVIEW_TEXT for u in utterances):
+            formatted = []
+            for pending, rows in groupby(utterances, key=lambda u: u.text == LIVE_REVIEW_TEXT):
+                block = list(rows)
+                formatted.extend(
+                    block
+                    if pending
+                    else self._format_utterances(block, language, punctuator=punctuator)
+                )
+            return formatted
         pcfg = self.cfg.get("punctuation") or {}
         zh_like = is_zh_like(utterances, language)
         if zh_like and bool(pcfg.get("to_simplified", True)):

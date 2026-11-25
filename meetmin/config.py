@@ -59,6 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ring_buffer_sec": 60,
         "endpoint_silence_ms": 600,
         "flush_timeout_sec": 12,
+        "repair_max_clips": 6,  # 每场会议停录后的局部补转次数，0 仅标记可疑片段
         "diarization": {
             "enabled": True,
             "min_embed_sec": 1.5,

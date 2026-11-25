@@ -20,7 +20,8 @@ import numpy as np
 
 from .asr.base import ASRResult, Utterance
 from .asr.faster_whisper_asr import FasterWhisperASR
-from .asr.live_whisper import LiveTrack
+from .asr.live_whisper import LiveTrack, ReviewSpan, review_redecode
+from .asr.quality import LIVE_REVIEW_TEXT, QualityOptions
 from .asr.zh_convert import to_simplified
 from .audio.ring_buffer import SAMPLE_RATE, AudioEvent, PcmChunk
 from .config import deep_merge
@@ -52,6 +53,9 @@ class LiveSessionCoordinator:
         self.ring_sec = float(live.get("ring_buffer_sec", 60))
         self.endpoint_ms = int(live.get("endpoint_silence_ms", 600))
         self.flush_timeout = float(live.get("flush_timeout_sec", 12))
+        self.repair_max_clips = live.get("repair_max_clips", 6)
+        if type(self.repair_max_clips) is not int or self.repair_max_clips < 0:
+            raise ValueError("live.repair_max_clips 必须是非负整数")
         if not (
             0.3 <= self.hop <= self.slow_hop <= self.max_window <= 20
             and self.max_window + 2 <= self.ring_sec <= 300
@@ -101,11 +105,16 @@ class LiveSessionCoordinator:
         self.names = ("loopback", "microphone") if dual_track else ("loopback",)
         self._inbox: Queue[tuple[str, AudioEvent]] = Queue(maxsize=2048)
         self._input_done = Event()
+        self._live_done = Event()
         self._cancelled = Event()
         self._overflow = Event()
         self._thread = Thread(target=self._run, name="live-whisper", daemon=True)
         self._tracks: dict[str, LiveTrack] = {}
         self._utterances: dict[str, list[Utterance]] = {name: [] for name in self.names}
+        self._quality = QualityOptions.from_config(self.pipe.cfg["asr"].get("quality", {}))
+        self._deferred: dict[tuple[str, int], ReviewSpan] = {}
+        self._repair_reports: dict[str, list[dict]] = {name: [] for name in self.names}
+        self._replacements: dict[str, Utterance] = {}
         self._drafts = dict.fromkeys(self.names, "")
         self._metadata: dict = {}
         self.error: str | None = None
@@ -165,6 +174,7 @@ class LiveSessionCoordinator:
                     ring_sec=self.ring_sec,
                     endpoint_ms=self.endpoint_ms,
                     max_window_sec=self.max_window,
+                    compression_ratio_threshold=self._quality.compression_ratio_threshold,
                     vad=lambda audio: get_speech_timestamps(
                         audio,
                         min_speech_duration_ms=64,
@@ -188,13 +198,22 @@ class LiveSessionCoordinator:
                 self._voice_thread.start()
             self._consume(provider, options)
             self._metadata = provider.stream_metadata()
+            self._live_done.set()
+            if self._deferred and not self._cancelled.is_set():
+                audio, microphone = self.session.recording_paths()
+                self._replacements = self._repair_deferred(
+                    provider, options, {"loopback": audio, "microphone": microphone}
+                )
         except Exception as exc:
             self.error = str(exc)
             self._status(f"实时转写已暂停，录音继续保存 · {exc}")
             self.cancel()
         finally:
-            if provider is not None:
-                provider.close()
+            try:
+                if provider is not None:
+                    provider.close()
+            finally:
+                self._live_done.set()
 
     def _consume(self, provider: FasterWhisperASR, options: dict) -> None:
         punctuator = self.pipe._resolve_punctuator()
@@ -233,7 +252,7 @@ class LiveSessionCoordinator:
                 continue
             name, window = min(windows, key=lambda item: (not item[1].final, item[1].due))
             started = monotonic()
-            utterance, draft = self._tracks[name].decode(
+            result, draft = self._tracks[name].decode(
                 window, lambda audio, offset: provider.decode_window(audio, offset, options=options)
             )
             if self._cancelled.is_set():
@@ -245,8 +264,16 @@ class LiveSessionCoordinator:
             if device != self._metadata["effective_device"]:
                 self._metadata = provider.stream_metadata()
                 self._status(f"实时转写已切换至 {device.upper()}")
-            if utterance is not None:
-                self._commit(name, utterance, punctuator)
+            if isinstance(result, ReviewSpan):
+                self._deferred[name, len(self._utterances[name])] = result
+                self._commit(
+                    name,
+                    Utterance(result.start, result.end, LIVE_REVIEW_TEXT),
+                    punctuator,
+                    review=result,
+                )
+            elif result is not None:
+                self._commit(name, result, punctuator)
             if draft != self._drafts[name]:
                 self._drafts[name] = draft
                 self.emit({"type": "asr.interim", "track": name, "text": to_simplified(draft)})
@@ -257,7 +284,9 @@ class LiveSessionCoordinator:
             pcm = np.frombuffer(event.pcm, dtype="<i2").astype("<f4") / 32768.0
             self._audio_hash.update(pcm)
 
-    def _commit(self, name: str, utterance: Utterance, punctuator: Any) -> None:
+    def _commit(
+        self, name: str, utterance: Utterance, punctuator: Any, *, review: ReviewSpan | None = None
+    ) -> None:
         if name == "microphone":
             utterance.speaker = "我"
         display = Utterance.from_dict(utterance.to_dict())
@@ -270,7 +299,7 @@ class LiveSessionCoordinator:
         )
         index = len(self._utterances[name])
         segment_id = f"{name}-{index + 1}"
-        matched_microphones = self._bleed_matches(name, index, utterance)
+        matched_microphones = [] if review else self._bleed_matches(name, index, utterance)
         self._suppressed.update(matched_microphones)
         preview = " ".join(row["text"] for row in display_document["utterances"])
         event = {
@@ -284,6 +313,8 @@ class LiveSessionCoordinator:
             "suppressed_bleed": name == "microphone" and index in self._suppressed,
             "speaker_pending": name == "loopback" and self._voice_enabled,
         }
+        if review:
+            event["quality"] = {"status": "pending", "reasons": list(review.reasons)}
         self._publish_event(event)
         self._utterances[name].append(utterance)
         if name == "loopback":
@@ -296,7 +327,14 @@ class LiveSessionCoordinator:
                 )
             self._queue_voice(segment_id, utterance, preview)
 
-    def _bleed_matches(self, track: str, index: int, utterance: Utterance) -> list[int]:
+    def _bleed_matches(
+        self,
+        track: str,
+        index: int,
+        utterance: Utterance,
+        *,
+        repaired: set[str] | None = None,
+    ) -> list[int]:
         if not self._bleed_enabled:
             return []
         text = "".join(char for char in to_simplified(utterance.text).casefold() if char.isalnum())
@@ -309,6 +347,10 @@ class LiveSessionCoordinator:
         other = "microphone" if track == "loopback" else "loopback"
         matches = []
         for prior_index, start, prior_grams in self._recent[other]:
+            if repaired is not None and not (
+                f"{track}-{index + 1}" in repaired or f"{other}-{prior_index + 1}" in repaired
+            ):
+                continue
             delay = utterance.start - start if track == "microphone" else start - utterance.start
             mic_index = index if track == "microphone" else prior_index
             if (
@@ -380,8 +422,7 @@ class LiveSessionCoordinator:
         """录音成功封存后冲刷尾窗，再交给标准离线产物整理。"""
         self._input_done.set()
         deadline = monotonic() + self.flush_timeout
-        self._thread.join(self.flush_timeout)
-        if self._thread.is_alive():
+        if not self._live_done.wait(self.flush_timeout):
             self.error = "实时转写收尾超时"
             self.cancel()
         if self.error is not None:
@@ -395,6 +436,9 @@ class LiveSessionCoordinator:
                 self._status("录中声纹收尾超时，正在使用会后分离")
             else:
                 voice = self._voice
+        self._thread.join()  # 录后补转独立于实时尾窗时限，继续由同一个 CUDA 工作线程执行。
+        if self.error is not None:
+            return None
         try:
             audio, microphone = self.session.recording_paths()
             loopback_result = self._track_result("loopback", audio)
@@ -411,7 +455,7 @@ class LiveSessionCoordinator:
             except OSError as exc:
                 audio_sha256 = None
                 self._status(f"无法保存录中声纹缓存 · {exc}")
-            utterances = voice.archive()
+            utterances = voice.archive(self._replacements)
             utterances.extend(
                 replace(utterance, speaker=UNKNOWN_NAME)
                 for index, utterance in enumerate(self._utterances["loopback"], 1)
@@ -438,6 +482,69 @@ class LiveSessionCoordinator:
             self.error = str(exc)
             return None
 
+    def _repair_deferred(
+        self, provider: FasterWhisperASR, options: dict, paths: dict[str, Path | None]
+    ) -> dict[str, Utterance]:
+        replacements: dict[str, Utterance] = {}
+        if self.repair_max_clips:
+            self._status("正在补转可疑音频片段…")
+        options = {
+            **options,
+            "no_repeat_ngram_size": max(options.get("no_repeat_ngram_size", 0), 4),
+        }
+        for attempt, ((name, index), span) in enumerate(self._deferred.items()):
+            if self._cancelled.is_set():
+                break
+            segment_id = f"{name}-{index + 1}"
+            report = {
+                "segment_id": segment_id,
+                "start": round(span.start, 3),
+                "end": round(span.end, 3),
+                "reasons": list(span.reasons),
+                "status": "pending",
+            }
+            path = paths[name]
+            if attempt >= self.repair_max_clips:
+                report["detail"] = "retry_limit"
+            elif path is not None:
+                started = monotonic()
+                try:
+                    audio, offset = _read_repair_clip(path, span)
+                    decoded = provider.decode_window(audio, offset, options=options)
+                    result, reason = review_redecode(span, decoded, self._quality)
+                    if result is None:
+                        report["detail"] = reason
+                    else:
+                        result.speaker = self._utterances[name][index].speaker
+                        self._utterances[name][index] = replacements[segment_id] = result
+                        report["status"] = "accepted"
+                except Exception as exc:
+                    report["detail"] = f"{type(exc).__name__}: {exc}"
+                report["elapsed_sec"] = round(monotonic() - started, 3)
+            else:
+                report["detail"] = "audio_unavailable"
+            self._repair_reports[name].append(report)
+            self._publish_event({"type": "asr.repair", "track": name, **report})
+
+        if replacements and self._bleed_enabled:
+            # 对补转段补做串音比对，保留录中已确认的结果和原索引。
+            repaired = set(replacements)
+            for recent in self._recent.values():
+                recent.clear()
+            turns = sorted(
+                (u.start, name, index)
+                for name, rows in self._utterances.items()
+                for index, u in enumerate(rows)
+                if u.text != LIVE_REVIEW_TEXT
+            )
+            for _, name, index in turns:
+                self._suppressed.update(
+                    self._bleed_matches(
+                        name, index, self._utterances[name][index], repaired=repaired
+                    )
+                )
+        return replacements
+
     def _track_result(self, name: str, path: Path) -> tuple[Path, ASRResult, float]:
         with wave.open(str(path), "rb") as wav:
             frames = wav.getnframes()
@@ -449,4 +556,18 @@ class LiveSessionCoordinator:
             language=asr["language"],
             extra={**self._metadata, "live": True},
         )
+        if self._repair_reports[name]:
+            result.extra["live_quality"] = {"issues": self._repair_reports[name]}
         return path, result, frames / SAMPLE_RATE
+
+
+def _read_repair_clip(path: Path, span: ReviewSpan) -> tuple[np.ndarray, float]:
+    context = round(0.75 * SAMPLE_RATE)
+    with wave.open(str(path), "rb") as wav:
+        if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, SAMPLE_RATE):
+            raise ValueError("补转需要 16 kHz、16 位单声道 WAV")
+        start = max(0, round(span.start * SAMPLE_RATE) - context)
+        end = min(wav.getnframes(), round(span.end * SAMPLE_RATE) + context)
+        wav.setpos(start)
+        audio = np.frombuffer(wav.readframes(end - start), dtype="<i2").astype(np.float32)
+    return audio / 32768.0, start / SAMPLE_RATE

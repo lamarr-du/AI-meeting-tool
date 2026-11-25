@@ -146,6 +146,22 @@ def test_second_track_fallback_preserves_first_track_metadata(
     fallback.transcribe.assert_called_once()
 
 
+def test_live_fallback_keeps_the_repair_repetition_guard(monkeypatch):
+    first, second = Mock(), Mock()
+    first.transcribe.side_effect = RuntimeError("CUDA out of memory")
+    second.transcribe.return_value = ([], None)
+    module = ModuleType("faster_whisper")
+    module.WhisperModel = Mock(side_effect=[first, second])
+    monkeypatch.setitem(sys.modules, "faster_whisper", module)
+    monkeypatch.setattr("meetmin.doctor.gpu_status", lambda _: CudaStatus())
+    monkeypatch.setattr("meetmin.asr.faster_whisper_asr.memory_status", lambda: None)
+
+    provider = FasterWhisperASR({})
+    options = {**provider.build_stream_options(), "no_repeat_ngram_size": 4}
+    provider.decode_window(np.zeros(16000, dtype=np.float32), 0, options=options)
+    assert second.transcribe.call_args.kwargs["no_repeat_ngram_size"] == 4
+
+
 def test_download_error_does_not_trigger_cuda_fallback(monkeypatch):
     module = ModuleType("faster_whisper")
     module.WhisperModel = Mock()

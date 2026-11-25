@@ -59,6 +59,7 @@ live:
   ring_buffer_sec: 60
   endpoint_silence_ms: 600
   flush_timeout_sec: 12    # 等待 ASR 尾窗的时限，不含 WAV 合并和标准产物整理
+  repair_max_clips: 6      # 停录后最多补转的可疑片段数，0 仅标记
   diarization:
     enabled: true          # 录中用已缓存的 CAM++，停录沿用录中标签并保存声纹
   bleed_suppression:
