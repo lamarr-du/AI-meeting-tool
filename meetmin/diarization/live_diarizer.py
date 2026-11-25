@@ -440,7 +440,7 @@ class ProgressiveDiarizer:
         }
 
     def archive(self, replacements: dict[str, Utterance] | None = None) -> list[Utterance]:
-        result = []
+        result: list[Utterance] = []
         for segment_id, turn in self.turns.items():
             if replacements and segment_id in replacements:
                 utterance = replacements[segment_id]
