@@ -76,7 +76,7 @@ meetmin run --audio "recordings/meeting.m4a" -n review
 | `recover` | 从录音分段恢复；`-n` 必须是完整会话 ID，可用 `--take` 选择某次录音，`--output` 指定新文件（单轨）或新目录（双轨） |
 | `transcribe` | 保存原始转写；`-n` 会话 ID/前缀、`--audio` 本地音频、`--file-url` 云端音频 URL |
 | `diarize` | 从 `asr_raw.json` 重跑分离/对齐；必须提供 `-n` 会话 ID/前缀 |
-| `speakers` | 用 `list <会话>` 核对发言样本，或用 `rename <会话> A=姓名 B=姓名` 批量改名 |
+| `speakers` | 用 `list <会话>` 核对发言，`rename <会话> A=姓名 B=姓名` 改名，`enroll <会话>` 登记到公共声纹库 |
 | `summarize` | 从 `transcript.json` 生成纪要；`--export-web` 导出网页版提示词，`--import-web` 导入网页版结果 |
 | `run` | 自动完成全部流程；支持 `record` 的录音选项，也可用 `--audio` 处理已有音频 |
 
@@ -139,9 +139,10 @@ meetmin summarize -n weekly --import-web web-answer.md
 ```powershell
 meetmin speakers list weekly
 meetmin speakers rename weekly A=张三 B=李四
+meetmin speakers enroll weekly
 meetmin summarize -n weekly
 ```
 
-查看和改名前均会显示每人的最多三条最长发言及起始时间。改名会同步更新转写 JSON 和 Markdown，启用术语纠错时也会刷新纠错副本。连续改名可继续使用原标签如 `A`。重跑 `diarize` 会重新生成说话人标签，需根据新的发言样本核对姓名。
+查看和改名前均会显示每人的最多三条最长发言及起始时间。改名会同步更新转写 JSON 和 Markdown，启用术语纠错时也会刷新纠错副本。连续改名可继续使用原标签如 `A`。`enroll` 是可选操作。桌面端转写完成后，也可通过「更多操作」编辑姓名或登记到公共声纹库。后续会议在转写归档时自动匹配已有声纹，仍可按本场发言样本核对姓名。
 
 异常录音恢复见[录音反馈和预检](technical-reference.md#录音反馈和预检)，CUDA 与高级配置见[技术参考](technical-reference.md)。

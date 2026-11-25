@@ -5,6 +5,8 @@ output_dir: data
 # Whisper 和 SpeechBrain 权重均放在 huggingface/hub。
 # 可填写绝对路径，或相对于此配置文件的目录。asr.model_size 指向的本地模型优先。
 model_cache_dir: null
+# null 使用 <output_dir>/voiceprints。相对路径以本配置文件所在目录为基准。
+voiceprint_library_dir: null
 
 recorder:
   device: null        # 内录设备索引或名称片段；null = 默认输出设备的 loopback（python main.py devices 查看）
@@ -57,6 +59,7 @@ live:
   ring_buffer_sec: 60
   endpoint_silence_ms: 600
   flush_timeout_sec: 12    # 等待 ASR 尾窗的时限，不含 WAV 合并和标准产物整理
+  repair_max_clips: 6      # 停录后最多补转的可疑片段数，0 仅标记
   diarization:
     enabled: true          # 录中用已缓存的 CAM++，停录沿用录中标签并保存声纹
   bleed_suppression:

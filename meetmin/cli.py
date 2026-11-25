@@ -371,7 +371,16 @@ def cmd_speakers(args, cfg) -> None:
             for line in speaker_preview(session.load_transcript()):
                 print(line)
             return
-        Pipeline(cfg).rename_speakers(session, args.assignments)
+        pipe = Pipeline(cfg)
+        if args.speaker_cmd == "enroll":
+            result = pipe.enroll_voiceprints(session)
+            if result.added:
+                print(f"已登记：{'、'.join(result.added)}")
+            if result.existing:
+                print(f"已在库中：{'、'.join(result.existing)}")
+            print(f"公共声纹库：{pipe.voiceprint_library.path.resolve()}")
+            return
+        pipe.rename_speakers(session, args.assignments)
     except (OSError, ValueError, RuntimeError) as error:
         sys.exit(f"说话人处理失败：{error}")
     print(f"已更新说话人姓名。重新生成纪要：meetmin summarize -n {session.session_id}")
@@ -517,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--session", "-n", required=True)
     sp.set_defaults(fn=cmd_diarize)
 
-    sp = sub.add_parser("speakers", help="查看发言样本或修改说话人姓名")
+    sp = sub.add_parser("speakers", help="查看、修改或登记说话人")
     speaker_sub = sp.add_subparsers(dest="speaker_cmd", required=True)
     listing = speaker_sub.add_parser("list", help="列出说话人，每人显示最多三条发言")
     listing.add_argument("session", help="会话 ID 或名称前缀")
@@ -526,6 +535,9 @@ def build_parser() -> argparse.ArgumentParser:
     rename.add_argument("session", help="会话 ID 或名称前缀")
     rename.add_argument("assignments", nargs="+", metavar="标签=姓名", help="例如 A=张三 B=李四")
     rename.set_defaults(fn=cmd_speakers)
+    enroll = speaker_sub.add_parser("enroll", help="登记本场已命名的说话人到公共声纹库")
+    enroll.add_argument("session", help="会话 ID 或名称前缀")
+    enroll.set_defaults(fn=cmd_speakers)
 
     sp = sub.add_parser("summarize", help="步骤3：生成 AI 纪要")
     sp.add_argument("--session", "-n", default=None, help="缺省用最近一次会话")

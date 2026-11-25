@@ -6,13 +6,13 @@ import re
 import unicodedata
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 from ..audio.ring_buffer import SAMPLE_RATE, AudioEvent, AudioRingBuffer, IdleTick
 from .base import Utterance
-from .quality import Decoded
+from .quality import Decoded, QualityOptions, live_repeat_reasons, reject_replacement
 from .zh_convert import to_simplified
 
 _PRE_ROLL = SAMPLE_RATE // 4
@@ -39,6 +39,61 @@ def _stable_sentence(previous: list[dict], current: list[dict]) -> int:
     return stable
 
 
+def _words_in_span(utterance: Utterance, start: float, end: float) -> list[dict]:
+    words = []
+    for word in utterance.words or [
+        {"w": utterance.text, "s": utterance.start, "e": utterance.end}
+    ]:
+        begin, stop = word["s"], word["e"]
+        if (
+            stop >= begin
+            and stop > start
+            and start <= (begin + stop) / 2 <= end
+            and word["w"].strip()
+        ):
+            words.append({"w": word["w"], "s": max(start, begin), "e": min(end, stop)})
+    return words
+
+
+def _utterance(words: list[dict]) -> Utterance:
+    return Utterance(
+        words[0]["s"],
+        max(w["e"] for w in words),
+        "".join(w["w"] for w in words).strip(),
+        words=words,
+    )
+
+
+@dataclass(frozen=True)
+class ReviewSpan:
+    start: float
+    end: float
+    reasons: tuple[str, ...]
+
+
+def review_redecode(
+    span: ReviewSpan, decoded: list[Decoded], options: QualityOptions
+) -> tuple[Utterance | None, str | None]:
+    candidate = []
+    words = []
+    for row in decoded:
+        if not row.utterance.words:
+            continue  # 无法用词时间戳区分补转区间与两侧上下文。
+        inside = _words_in_span(row.utterance, span.start, span.end)
+        if not inside:
+            continue
+        words.extend(inside)
+        candidate.append(replace(row, utterance=_utterance(inside)))
+    if reason := reject_replacement(
+        (span.start, span.end), candidate, [], options, min_coverage=0.5
+    ):
+        return None, reason
+    result = _utterance(words)
+    if live_repeat_reasons(result.text, words, options.compression_ratio_threshold):
+        return None, "still_repeated"
+    return result, None
+
+
 @dataclass
 class _Speech:
     start: int
@@ -46,7 +101,9 @@ class _Speech:
     floor: int
     decoded_to: int
     closed: bool = False
+    end_limit: int | None = None
     previous: list[dict] = field(default_factory=list)
+    previous_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,14 +125,17 @@ class LiveTrack:
         endpoint_ms: int,
         max_window_sec: float,
         vad: Callable[[np.ndarray], list[dict]],
+        compression_ratio_threshold: float = QualityOptions().compression_ratio_threshold,
     ):
         self.audio = AudioRingBuffer(ring_sec)
         self.pause = round(endpoint_ms * SAMPLE_RATE / 1000)
         self.max_window = round(max_window_sec * SAMPLE_RATE)
         self.vad = vad
+        self.compression_ratio_threshold = compression_ratio_threshold
         self._speech: deque[_Speech] = deque()
         self._scanned = 0
         self._speech_end = 0
+        self._speech_floor = 0
 
     def feed(self, event: AudioEvent) -> None:
         if isinstance(event, IdleTick):
@@ -83,13 +143,21 @@ class LiveTrack:
                 self._scan()
             self._close_at(event.sample)
             return
+        if event.muted:
+            if self._speech_floor != self.audio.end:
+                self.close()
+                if self._speech:
+                    self._speech[-1].end_limit = self.audio.end
+            self.audio.append(event)
+            self._scanned = self._speech_floor = self.audio.end
+            return
         self.audio.append(event)
         if self.audio.end - self._scanned >= _SCAN_STEP:
             self._scan()
 
     def _scan(self) -> None:
         end = self.audio.end
-        start = max(self.audio.start, self._scanned - SAMPLE_RATE)
+        start = max(self.audio.start, self._speech_floor, self._scanned - SAMPLE_RATE)
         samples = self.audio.read(start, end)
         ranges = self.vad(samples) if np.any(samples) else []
         for region in ranges:
@@ -100,7 +168,9 @@ class LiveTrack:
             if not self._speech or self._speech[-1].closed:
                 # Repeated VAD scans can rediscover old audio. Retain pre-roll only
                 # from the gap preceding a genuinely new region.
-                first = max(self.audio.start, self._speech_end, onset - _PRE_ROLL)
+                first = max(
+                    self.audio.start, self._speech_floor, self._speech_end, onset - _PRE_ROLL
+                )
                 self._speech.append(_Speech(first, offset, first, first))
             else:
                 self._speech[-1].end = offset
@@ -129,7 +199,7 @@ class LiveTrack:
         start = max(region.start, region.floor - _PRE_ROLL)
         # If inference fell behind, decode queued short turns together. Keep
         # their intervening audio and let the punctuation model split them.
-        while region.closed and len(self._speech) > 1:
+        while region.closed and region.end_limit is None and len(self._speech) > 1:
             following = self._speech[1]
             if (
                 not following.closed
@@ -142,8 +212,11 @@ class LiveTrack:
             following.floor = region.floor
             following.decoded_to = region.decoded_to
             following.previous = region.previous
+            following.previous_reasons = region.previous_reasons
             region = following
         end = min(self.audio.end, region.end + _POST_ROLL)
+        if region.end_limit is not None:
+            end = min(end, region.end_limit)
         capped = region.end > start + self.max_window
         if not (region.closed or capped) and end - region.decoded_to < hop:
             return None
@@ -157,45 +230,58 @@ class LiveTrack:
 
     def decode(
         self, window: Window, decoder: Callable[[np.ndarray, float], list[Decoded]]
-    ) -> tuple[Utterance | None, str]:
+    ) -> tuple[Utterance | ReviewSpan | None, str]:
         region = self._speech[0]
-        if window.final and region.decoded_to >= region.end and region.previous:
-            words = region.previous
+        start = max(window.start, region.floor) / SAMPLE_RATE
+        end = window.end / SAMPLE_RATE
+        at_boundary = window.final or window.capped
+        if (
+            window.final
+            and region.decoded_to >= region.end
+            and (region.previous or region.previous_reasons)
+        ):
+            words, reasons = region.previous, region.previous_reasons
         else:
             samples = self.audio.read(window.start, window.end)
             decoded = decoder(samples, window.start / SAMPLE_RATE)
-            floor, end = region.floor / SAMPLE_RATE, window.end / SAMPLE_RATE
             words = []
+            reasons = ()
             for entry in decoded:
-                u = entry.utterance
-                for word in u.words or [{"w": u.text, "s": u.start, "e": u.end}]:
-                    begin = max(window.start / SAMPLE_RATE, word["s"])
-                    stop = min(end, word["e"])
-                    if stop > floor and (begin + stop) / 2 >= floor and word["w"].strip():
-                        words.append({"w": word["w"], "s": max(floor, begin), "e": stop})
-            if window.final and not words:
-                words = region.previous
+                inside = _words_in_span(entry.utterance, start, end)
+                words.extend(inside)
+                if inside and not reasons:
+                    reasons = live_repeat_reasons(
+                        "".join(w["w"] for w in inside),
+                        inside,
+                        self.compression_ratio_threshold,
+                        compression_ratio=entry.compression_ratio,
+                    )
+            if len(decoded) > 1 and not reasons:
+                reasons = live_repeat_reasons(
+                    "".join(w["w"] for w in words), words, self.compression_ratio_threshold
+                )
+            if not words:
+                if window.final:
+                    words = region.previous
+                reasons = region.previous_reasons
 
-        count = (
-            len(words)
-            if window.final or window.capped
-            else _stable_sentence(region.previous, words)
-        )
+        if reasons:
+            words = []
+
+        count = len(words) if at_boundary else _stable_sentence(region.previous, words)
         committed, pending = words[:count], words[count:]
-        utterance = None
+        result: Utterance | ReviewSpan | None = None
         if committed:
-            utterance = Utterance(
-                committed[0]["s"],
-                max(w["e"] for w in committed),
-                "".join(w["w"] for w in committed).strip(),
-                words=committed,
-            )
-            region.floor = round(utterance.end * SAMPLE_RATE)
+            result = _utterance(committed)
+            region.floor = round(result.end * SAMPLE_RATE)
+        elif reasons and at_boundary and start < end:
+            result = ReviewSpan(start, end, reasons)
         if window.capped:
             # Make progress even if the decoder returned no words near the window edge.
             region.floor = max(region.floor, window.end)
         region.previous = pending
+        region.previous_reasons = () if at_boundary else reasons
         region.decoded_to = window.end
         if window.final:
             self._speech.popleft()
-        return utterance, "".join(w["w"] for w in pending).strip()
+        return result, "".join(w["w"] for w in pending).strip()

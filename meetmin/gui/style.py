@@ -73,6 +73,9 @@ QPushButton#stop {
 }
 QPushButton#stop:hover { background: #f2c5d5; }
 QPushButton#stop:focus { border-color: #a33151; }
+QPushButton#muteMicrophone:checked {
+    background: #f8d9e4; border-color: #a33151; color: #89253e;
+}
 QPushButton#newMeeting { text-align: left; }
 QPushButton#settingsButton { background: transparent; text-align: left; border-color: transparent; }
 QPushButton#settingsButton:hover { background: #ece5fa; }
@@ -87,6 +90,10 @@ QPushButton#refreshAudio:disabled, QToolButton:disabled, QComboBox:disabled, QLi
 QComboBox { padding-right: 24px; }
 QComboBox::drop-down { border: 0; width: 22px; }
 QComboBox::down-arrow { image: none; }
+QComboBox QAbstractItemView {
+    selection-background-color: #eee7fc;
+    selection-color: #432c89;
+}
 QToolButton#moreActions { padding-right: 24px; }
 QToolButton::menu-indicator { subcontrol-origin: padding; subcontrol-position: center right; }
 QListWidget#historyList { background: transparent; border: 0; outline: 0; }

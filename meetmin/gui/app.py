@@ -56,10 +56,11 @@ from ..asr.model_download import ModelDownloadProgress
 from ..audio.loopback_recorder import RecordingError, list_loopback_devices, list_microphone_devices
 from ..audio.session_recorder import RECORDING_DIAGNOSTICS, SessionRecorder
 from ..config import MAX_TARGET_RMS, MIN_TARGET_RMS, deep_merge, load_config
+from ..diarization.voiceprints import Enrollment
 from ..live_pipeline import SpeakerRenames
 from ..pipeline import Pipeline
 from ..session import Session
-from ..speakers import speaker_roster
+from ..speakers import is_generated_speaker, is_person_name, speaker_roster
 from ..summarizer.llm_client import MockLLM, get_llm
 from ..textutil import ts
 from . import workflow
@@ -383,6 +384,11 @@ class MeetingWindow(QMainWindow):
         self.export_minutes = menu.addAction("导出纪要…")
         self.export_minutes.triggered.connect(lambda: self.export_file(self.minutes_path))
         menu.addSeparator()
+        self.edit_speaker = menu.addAction("编辑说话人姓名…")
+        self.edit_speaker.triggered.connect(self.edit_speaker_name)
+        self.enroll_speakers = menu.addAction("登记到公共声纹库…")
+        self.enroll_speakers.triggered.connect(self.enroll_speaker_voiceprints)
+        menu.addSeparator()
         self.copy_web_prompt = menu.addAction("复制 AI 网页提示词")
         self.copy_web_prompt.triggered.connect(self.copy_prompt)
         self.web_prompt = menu.addAction("导出 AI 网页提示词…")
@@ -526,6 +532,12 @@ class MeetingWindow(QMainWindow):
         self.stop.setIcon(line_icon("stop", "#89253e"))
         self.stop.clicked.connect(self.request_stop)
         controls.addWidget(self.stop)
+        self.mute_microphone = QPushButton("禁言麦克风")
+        self.mute_microphone.setObjectName("muteMicrophone")
+        self.mute_microphone.setCheckable(True)
+        self.mute_microphone.setToolTip("仅控制 MeetMin 录制的麦克风音轨")
+        self.mute_microphone.toggled.connect(self.toggle_microphone_mute)
+        controls.addWidget(self.mute_microphone)
         self.record_hint = label("", "muted")
         self.record_hint.setWordWrap(True)
         controls.addWidget(self.record_hint, 1)
@@ -754,6 +766,9 @@ class MeetingWindow(QMainWindow):
         self.settings_button.setEnabled(ready)
         self.start.setEnabled(ready and self.loopback_available)
         self.stop.setEnabled(capturing)
+        self.mute_microphone.setVisible(
+            capturing and self.recorder is not None and self.recorder.dual_track
+        )
         self.import_button.setEnabled(ready)
         self.meeting_name.setEnabled(ready)
         self.live_enabled.setEnabled(ready)
@@ -793,6 +808,8 @@ class MeetingWindow(QMainWindow):
         self.more.setEnabled(ready)
         self.export_transcript.setEnabled(self.transcript_path is not None)
         self.export_minutes.setEnabled(self.minutes_path is not None)
+        self.edit_speaker.setEnabled(ready and self.transcript_path is not None)
+        self.enroll_speakers.setEnabled(ready and self.transcript_path is not None)
         can_use_web = self.transcript_path is not None
         self.copy_web_prompt.setEnabled(can_use_web)
         self.web_prompt.setEnabled(can_use_web)
@@ -915,6 +932,7 @@ class MeetingWindow(QMainWindow):
         )
         recorder = self.recorder = Pipeline(cfg).recorder(for_session=True)
         stop_requested = self.stop_requested = Event()
+        self.mute_microphone.setChecked(False)
         self.recorded_at = time.monotonic()
         self.show_meter({"microphone": {} if recorder.dual_track else None})
         live = self.live_enabled.isChecked()
@@ -944,6 +962,14 @@ class MeetingWindow(QMainWindow):
             self.stop_requested.set()
             self.set_status("正在保存录音…")
             self.update_controls()
+
+    def toggle_microphone_mute(self, muted: bool) -> None:
+        if self.recorder is not None and self.recording_active():
+            self.recorder.set_microphone_muted(muted)
+        self.mute_microphone.setText("解除麦克风禁言" if muted else "禁言麦克风")
+        _, caption, meter = self.tracks[1]
+        caption.setText("麦克风已禁言" if muted else "麦克风")
+        meter.setValue(0)
 
     def rename_live_speaker(self, speaker: int, name: str) -> None:
         if self.job is not None and self.recording_active():
@@ -985,6 +1011,8 @@ class MeetingWindow(QMainWindow):
         ):
             widget.setVisible(track is not None)
             if track is None:
+                continue
+            if name == "麦克风" and self.mute_microphone.isChecked():
                 continue
             no_data = track.get("no_data_sec", 0)
             duration = ts(track.get("duration_sec", 0))
@@ -1062,6 +1090,79 @@ class MeetingWindow(QMainWindow):
             self.generate.setEnabled(False)
         elif result.get("diarization_status", {}).get("status") == "fallback":
             self.set_status("转写已保存，内录说话人分离失败，已按单人显示。", "warning")
+
+    def edit_speaker_name(self) -> None:
+        session = self.session
+        if session is None:
+            return
+        try:
+            transcript = session.load_transcript()
+        except (OSError, ValueError) as exc:
+            self.set_status(f"无法读取转写 · {exc}", "error")
+            return
+        examples: dict[str, dict] = {}
+        for row in transcript["utterances"]:
+            name = row.get("speaker")
+            if isinstance(name, str) and (is_generated_speaker(name) or is_person_name(name)):
+                examples.setdefault(name, row)
+        if not examples:
+            self.set_status("本场没有可编辑姓名的说话人。", "warning")
+            return
+        current, accepted = QInputDialog.getItem(
+            self, "编辑说话人姓名", "说话人", list(examples), editable=False
+        )
+        if not accepted:
+            return
+        example = examples[current]
+        name, accepted = QInputDialog.getText(
+            self,
+            "编辑说话人姓名",
+            f"{current} · {ts(example['start'])}\n{example['text'][:100]}\n\n姓名",
+            text=current if is_person_name(current) else "",
+        )
+        name = name.strip()
+        if not accepted or name == current:
+            return
+        if not is_person_name(name):
+            self.set_status("请输入姓名。", "warning")
+            return
+        self.launch(
+            "正在保存说话人姓名…",
+            lambda job: Pipeline(self.cfg, progress=job.log.emit).rename_speakers(
+                session, {current: name}
+            ),
+            lambda _: self.set_status(f"已保存本场说话人姓名 · {name}", "success"),
+        )
+
+    def enroll_speaker_voiceprints(self) -> None:
+        session = self.session
+        if session is None:
+            return
+        library = Pipeline(self.cfg).voiceprint_library.path.resolve()
+        if (
+            QMessageBox.question(
+                self,
+                "登记到公共声纹库",
+                "将本场已命名且有足够样本的说话人姓名和声纹保存到下列位置，供后续会议自动识别。"
+                f"\n\n{library}",
+                defaultButton=QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self.launch(
+            "正在登记公共声纹…",
+            lambda job: Pipeline(self.cfg, progress=job.log.emit).enroll_voiceprints(session),
+            self.voiceprints_enrolled,
+        )
+
+    def voiceprints_enrolled(self, result: Enrollment) -> None:
+        messages = []
+        if result.added:
+            messages.append("已登记 " + "、".join(result.added))
+        if result.existing:
+            messages.append("已在库中 " + "、".join(result.existing))
+        self.set_status(" · ".join(messages), "success")
 
     def retry_transcription(self) -> None:
         session = self.session

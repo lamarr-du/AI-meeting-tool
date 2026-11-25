@@ -439,12 +439,21 @@ class ProgressiveDiarizer:
             "pin_anchor": True,
         }
 
-    def archive(self) -> list[Utterance]:
-        return [
-            replace(piece, speaker=self.display_name(piece.speaker))
-            for turn in self.turns.values()
-            for piece in turn.pieces
-        ]
+    def archive(self, replacements: dict[str, Utterance] | None = None) -> list[Utterance]:
+        result: list[Utterance] = []
+        for segment_id, turn in self.turns.items():
+            if replacements and segment_id in replacements:
+                utterance = replacements[segment_id]
+                turn = replace(
+                    turn,
+                    utterance=utterance,
+                    pieces=[replace(utterance, speaker=turn.pieces[0].speaker)],
+                )
+                self._assign_pieces(turn)
+            result.extend(
+                replace(piece, speaker=self.display_name(piece.speaker)) for piece in turn.pieces
+            )
+        return result
 
     def save_cache(self, path: Path, audio_sha256: str) -> None:
         if self.records:

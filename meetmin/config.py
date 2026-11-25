@@ -15,6 +15,7 @@ MAX_TARGET_RMS = 0.3
 DEFAULT_CONFIG: dict[str, Any] = {
     "output_dir": "data",  # 会话产物目录：<output_dir>/sessions/<session_id>/
     "model_cache_dir": None,  # 默认工程或独立便携版目录下的 .cache
+    "voiceprint_library_dir": None,  # 默认 <output_dir>/voiceprints
     "recorder": {
         "device": None,  # 内录设备索引或名称片段；null=默认输出设备的 loopback
         "channels": None,  # null=跟随设备（最多取 2）
@@ -58,6 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ring_buffer_sec": 60,
         "endpoint_silence_ms": 600,
         "flush_timeout_sec": 12,
+        "repair_max_clips": 6,  # 每场会议停录后的局部补转次数，0 仅标记可疑片段
         "diarization": {
             "enabled": True,
             "min_embed_sec": 1.5,
@@ -167,6 +169,10 @@ def load_config(path: str | Path | None = None) -> dict:
         if not isinstance(cache_dir, str) or not cache_dir.strip():
             raise ValueError("model_cache_dir 必须是目录路径或 null")
         cfg["model_cache_dir"] = str(config_dir / Path(cache_dir).expanduser())
+    if (voiceprint_dir := cfg.get("voiceprint_library_dir")) is not None:
+        if not isinstance(voiceprint_dir, str) or not voiceprint_dir.strip():
+            raise ValueError("voiceprint_library_dir 必须是目录路径或 null")
+        cfg["voiceprint_library_dir"] = str(config_dir / Path(voiceprint_dir).expanduser())
     asr = cfg.get("asr")
     if isinstance(asr, dict) and isinstance(model := asr.get("model_size"), str):
         local_model = config_dir / Path(model).expanduser()

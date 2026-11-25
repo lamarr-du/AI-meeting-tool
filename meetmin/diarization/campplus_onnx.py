@@ -171,7 +171,8 @@ class CampplusOnnxDiarizer(Diarizer):
     def _model_signature(self) -> str:
         configured = self.dcfg.get("model_path")
         if configured:
-            return f"local:{Path(configured).expanduser().resolve()}"
+            digest = hashlib.sha256(Path(configured).expanduser().read_bytes()).hexdigest()
+            return f"campplus_onnx:sha256:{digest}"
         return CAMPPLUS_MODEL_ID
 
     def diarize(self, audio16k: np.ndarray, *, speech_spans=None, cache_path=None) -> list[dict]:

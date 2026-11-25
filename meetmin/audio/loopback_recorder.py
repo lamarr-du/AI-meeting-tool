@@ -11,6 +11,7 @@ import math
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,7 @@ class _AudioBlock:
     frames: int
     timing: dict
     received_at: float
+    muted: bool = False
 
 
 class _AdaptiveLevel:
@@ -253,6 +255,8 @@ class LoopbackRecorder:
         self._resampler: Any = None
         self.audio_tap: Callable[[AudioEvent], None] | None = None
         self._output_samples = 0
+        self._muted_ranges: deque[tuple[int, int]] = deque()
+        self._mute_until = -math.inf
         self.chunk_ms = max(20, int(chunk_ms))
         self.silence_threshold = float(silence_threshold)
         self.target_rms = float(target_rms)
@@ -306,6 +310,14 @@ class LoopbackRecorder:
 
     def _now(self) -> float:
         return self._clock() if self._clock is not None else time.monotonic()
+
+    @property
+    def muted(self) -> bool:
+        return self._mute_until == math.inf
+
+    def set_muted(self, muted: bool) -> None:
+        if muted != self.muted:
+            self._mute_until = math.inf if muted else self._now()
 
     def _fail(self, error: Exception) -> None:
         # SimpleQueue has no bounded-capacity wait. Keep exceptions inside the callback,
@@ -400,6 +412,7 @@ class LoopbackRecorder:
         self._received_frames = 0
         self._padded_frames = 0
         self._output_samples = 0
+        self._muted_ranges.clear()
         with self._level_lock:
             self._frames = self._silent_frames = self._active_frames = 0
             self._level = 0.0
@@ -495,7 +508,21 @@ class LoopbackRecorder:
                 if data is None or len(data) != expected_bytes:
                     raise RuntimeError("音频回调数据长度与帧数不符")
                 received = self._now()
-                self._queue.put_nowait(_AudioBlock(data, frame_count, time_info, received))
+                # Discard a callback block if it still contains samples from before unmute.
+                mute_until = self._mute_until
+                muted = mute_until == math.inf
+                if not muted and mute_until != -math.inf:
+                    capture_start = received - frame_count / self.sample_rate_actual
+                    adc = _Timeline._timestamp(time_info.get("input_buffer_adc_time"))
+                    origin = self._timeline.stream_origin if self._timeline is not None else None
+                    if adc is not None and origin is not None:
+                        device_start = self._started_at + (adc - origin)
+                        if abs(capture_start - device_start) <= 0.5:
+                            capture_start = min(capture_start, device_start)
+                    muted = capture_start < mute_until - 1e-9
+                self._queue.put_nowait(
+                    _AudioBlock(b"" if muted else data, frame_count, time_info, received, muted)
+                )
                 self._last_data_time = received
                 self._received_frames += frame_count
         except queue.Full:
@@ -574,6 +601,15 @@ class LoopbackRecorder:
             position = min(position, end)
             frames = min(frames, max(0, end - position))
         self._pad_to(position)
+        if block.muted and frames:
+            if self._level_control is not None:
+                self._level_control.add_silence(frames)
+            self._write_output(bytes(frames * self.channels_actual * 2), muted=True)
+            with self._level_lock:
+                self._frames += frames
+                self._level = 0.0
+                self._silent_frames = 0
+            return
         data = block.data[: frames * self.channels_actual * self._capture_sample_width]
         if data:
             if self._level_control is not None:
@@ -581,9 +617,17 @@ class LoopbackRecorder:
             self._write_output(data)
             self._update_level(data, record_arrival=False)
 
-    def _write_output(self, data: bytes) -> None:
+    def _write_output(self, data: bytes, *, muted: bool = False) -> None:
         assert self._wf is not None
         samples = np.frombuffer(data, dtype="<i2").reshape(-1, self.channels_actual)
+        if muted:
+            # Resampling is delayed and can carry adjacent speech into a silent span.
+            rate = self.sample_rate_actual
+            start = (self._frames * self._wf.rate + rate // 2) // rate
+            end = ((self._frames + len(samples)) * self._wf.rate + rate // 2) // rate
+            if self._muted_ranges and self._muted_ranges[-1][1] == start:
+                start, _ = self._muted_ranges.pop()
+            self._muted_ranges.append((start, end))
         if self._wf.channels == 1 and self.channels_actual > 1:
             samples = np.rint(samples.astype(np.float32).mean(axis=1)).astype(np.int16)
         elif self._wf.channels == 1:
@@ -593,12 +637,32 @@ class LoopbackRecorder:
         self._write_pcm(self._wf, samples)
 
     def _write_pcm(self, writer: SegmentedWriter, samples: np.ndarray) -> None:
+        end = self._output_samples + len(samples)
+        while self._muted_ranges and self._muted_ranges[0][0] < end:
+            start, stop = self._muted_ranges[0]
+            before = max(0, start - self._output_samples)
+            if before:
+                self._publish_pcm(writer, samples[:before])
+                samples = samples[before:]
+            count = min(stop, end) - self._output_samples
+            if count > 0:
+                self._publish_pcm(writer, np.zeros_like(samples[:count]), muted=True)
+                samples = samples[count:]
+            if stop > end:
+                break
+            self._muted_ranges.popleft()
+        if len(samples):
+            self._publish_pcm(writer, samples)
+
+    def _publish_pcm(
+        self, writer: SegmentedWriter, samples: np.ndarray, *, muted: bool = False
+    ) -> None:
         pcm = samples.astype("<i2", copy=False).tobytes()
         writer.writeframesraw(pcm)
-        if self.audio_tap is not None and pcm:
-            start = self._output_samples
-            self._output_samples += len(samples)
-            self._send_audio(PcmChunk(start, pcm))
+        start = self._output_samples
+        self._output_samples += len(samples)
+        if self.audio_tap is not None:
+            self._send_audio(PcmChunk(start, pcm, muted=muted))
 
     def _send_audio(self, event: AudioEvent) -> None:
         callback = self.audio_tap
