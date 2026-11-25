@@ -60,7 +60,7 @@ from ..diarization.voiceprints import Enrollment
 from ..live_pipeline import SpeakerRenames
 from ..pipeline import Pipeline
 from ..session import Session
-from ..speakers import is_generated_speaker, is_person_name
+from ..speakers import is_generated_speaker, is_person_name, speaker_roster
 from ..summarizer.llm_client import MockLLM, get_llm
 from ..textutil import ts
 from . import workflow
@@ -372,6 +372,8 @@ class MeetingWindow(QMainWindow):
         self.retry.clicked.connect(self.retry_transcription)
         self.generate = QPushButton("生成纪要")
         self.generate.clicked.connect(self.generate_minutes)
+        self.rename_speaker = QPushButton("标记说话人")
+        self.rename_speaker.clicked.connect(self.rename_transcript_speaker)
         self.more = QToolButton()
         self.more.setObjectName("moreActions")
         self.more.setText("更多操作")
@@ -387,15 +389,20 @@ class MeetingWindow(QMainWindow):
         self.enroll_speakers = menu.addAction("登记到公共声纹库…")
         self.enroll_speakers.triggered.connect(self.enroll_speaker_voiceprints)
         menu.addSeparator()
+        self.copy_web_prompt = menu.addAction("复制 AI 网页提示词")
+        self.copy_web_prompt.triggered.connect(self.copy_prompt)
         self.web_prompt = menu.addAction("导出 AI 网页提示词…")
         self.web_prompt.triggered.connect(self.export_prompt)
-        self.web_minutes = menu.addAction("导入 AI 网页纪要…")
+        self.web_minutes = menu.addAction("粘贴 AI 网页纪要…")
         self.web_minutes.triggered.connect(self.import_minutes)
+        self.web_minutes_file = menu.addAction("从文件导入 AI 网页纪要…")
+        self.web_minutes_file.triggered.connect(self.import_minutes_file)
         menu.addSeparator()
         self.open_folder = menu.addAction("打开会话文件夹")
         self.open_folder.triggered.connect(self.open_session_folder)
         self.more.setMenu(menu)
         actions.addWidget(self.retry)
+        actions.addWidget(self.rename_speaker)
         actions.addWidget(self.generate)
         actions.addWidget(self.more)
 
@@ -790,6 +797,10 @@ class MeetingWindow(QMainWindow):
         )
         show_actions = self.session is not None and not running
         self.generate.setVisible(show_actions)
+        self.rename_speaker.setVisible(show_actions and self.transcript_path is not None)
+        self.rename_speaker.setEnabled(
+            ready and self.session is not None and (self.session.root / "transcript.json").is_file()
+        )
         self.generate.setEnabled(ready and self.transcript_path is not None)
         self.generate.setText("重新生成纪要" if self.minutes_path is not None else "生成纪要")
         style_property(self.generate, "primaryAction", self.minutes_path is None)
@@ -800,8 +811,10 @@ class MeetingWindow(QMainWindow):
         self.edit_speaker.setEnabled(ready and self.transcript_path is not None)
         self.enroll_speakers.setEnabled(ready and self.transcript_path is not None)
         can_use_web = self.transcript_path is not None
+        self.copy_web_prompt.setEnabled(can_use_web)
         self.web_prompt.setEnabled(can_use_web)
         self.web_minutes.setEnabled(can_use_web)
+        self.web_minutes_file.setEnabled(can_use_web)
 
     def launch(
         self,
@@ -961,6 +974,34 @@ class MeetingWindow(QMainWindow):
     def rename_live_speaker(self, speaker: int, name: str) -> None:
         if self.job is not None and self.recording_active():
             self.job.speaker_renames.put((speaker, name))
+
+    def rename_transcript_speaker(self) -> None:
+        session = self.session
+        if session is None or self.job is not None:
+            return
+        try:
+            roster = speaker_roster(session.load_transcript())
+            if not roster:
+                QMessageBox.information(self, "标记说话人", "转写中暂无可标记的说话人。")
+                return
+            names = list(roster.values())
+            current, accepted = QInputDialog.getItem(
+                self, "标记说话人", "选择转写中的说话人", names, 0, False
+            )
+            if not accepted:
+                return
+            name, accepted = QInputDialog.getText(self, "标记说话人", "姓名", text=current)
+            if not accepted:
+                return
+            Pipeline(self.cfg).rename_speaker(session, current, name)
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.warning(self, "标记失败", str(error))
+            return
+        self.render_session()
+        message = "说话人姓名已保存。"
+        if self.minutes_path is not None:
+            message += "已有纪要不会自动更新，请重新生成纪要。"
+        self.set_status(message, "success")
 
     def show_meter(self, status: dict) -> None:
         if self.stop_requested is None:
@@ -1198,6 +1239,20 @@ class MeetingWindow(QMainWindow):
             except OSError as error:
                 self.set_status(f"导出失败：{error}", "error")
 
+    def copy_prompt(self) -> None:
+        session = self.session
+        assert session is not None
+
+        def copied(prompt: str) -> None:
+            QApplication.clipboard().setText(prompt)
+            self.set_status("AI 网页提示词已复制，可粘贴到 AI 网页。", "success")
+
+        self.launch(
+            "正在整理 AI 网页提示词…",
+            lambda job: Pipeline(self.cfg, progress=job.log.emit).web_prompt(session),
+            copied,
+        )
+
     def export_prompt(self) -> None:
         session = self.session
         assert session is not None
@@ -1232,22 +1287,50 @@ class MeetingWindow(QMainWindow):
     def import_minutes(self) -> None:
         session = self.session
         assert session is not None
+        text = ""
+        while True:
+            text, accepted = QInputDialog.getMultiLineText(
+                self, "粘贴 AI 网页纪要", "请输入或粘贴 AI 网页生成的纪要（支持 Markdown）：", text
+            )
+            if not accepted:
+                return
+            if not text.strip():
+                QMessageBox.warning(self, "无法导入", "请输入或粘贴纪要内容。")
+                continue
+            if not self.confirm_minutes_replacement():
+                continue
+            break
+        overwrite = self.minutes_path is not None
+        self.launch(
+            "正在导入纪要…",
+            lambda job: Pipeline(self.cfg, progress=job.log.emit).import_web_minutes_text(
+                session, text, overwrite=overwrite
+            ),
+            lambda _result: self.tabs.setCurrentWidget(self.minutes),
+        )
+
+    def confirm_minutes_replacement(self) -> bool:
+        return (
+            self.minutes_path is None
+            or QMessageBox.question(
+                self,
+                "替换纪要",
+                "要用导入的内容替换当前纪要吗？",
+                defaultButton=QMessageBox.StandardButton.No,
+            )
+            == QMessageBox.StandardButton.Yes
+        )
+
+    def import_minutes_file(self) -> None:
+        session = self.session
+        assert session is not None
         filename, _ = QFileDialog.getOpenFileName(
             self, "导入 AI 网页纪要", "", "文本文件 (*.md *.txt);;全部文件 (*)"
         )
         if not filename:
             return
         overwrite = self.minutes_path is not None
-        if (
-            overwrite
-            and QMessageBox.question(
-                self,
-                "替换纪要",
-                "要用导入的文件替换当前纪要吗？",
-                defaultButton=QMessageBox.StandardButton.No,
-            )
-            != QMessageBox.StandardButton.Yes
-        ):
+        if not self.confirm_minutes_replacement():
             return
         self.launch(
             "正在导入纪要…",

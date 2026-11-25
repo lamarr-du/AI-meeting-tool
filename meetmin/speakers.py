@@ -36,6 +36,11 @@ def _roster(transcript: dict) -> dict[str, str]:
     return {previous_labels.get(name, name): name for name in names}
 
 
+def speaker_roster(transcript: dict) -> dict[str, str]:
+    """Return stable speaker labels and their current display names."""
+    return _roster(transcript)
+
+
 def speaker_preview(transcript: dict) -> list[str]:
     roster = _roster(transcript)
     if not roster:
@@ -90,6 +95,24 @@ def rename_speakers(transcript: dict, assignments: list[str] | dict[str, str]) -
             raise ValueError(f"重复指定说话人 {selector!r}")
         changed.add(label)
         updated[label] = name
+    return _apply_names(transcript, roster, updated, changed)
+
+
+def rename_speaker(transcript: dict, current: str, name: str) -> dict:
+    """Rename an exact current display name, without parsing a CLI assignment."""
+    roster = _roster(transcript)
+    matches = [label for label, value in roster.items() if value == current]
+    name = name.strip()
+    if len(matches) != 1:
+        raise ValueError("说话人不存在或有歧义，请重新选择。")
+    if not name or not name.isprintable() or name in _UNKNOWN_NAMES:
+        raise ValueError("请输入有效的说话人姓名。")
+    label = matches[0]
+    updated = {**roster, label: name}
+    return _apply_names(transcript, roster, updated, {label})
+
+
+def _apply_names(transcript: dict, roster: dict, updated: dict, changed: set[str]) -> dict:
     if len(set(updated.values())) != len(updated):
         raise ValueError("改名后有重名，请为每位说话人指定不同姓名")
 

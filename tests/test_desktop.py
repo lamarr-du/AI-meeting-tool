@@ -121,6 +121,61 @@ def test_imported_audio_remains_available_after_original_moves(tmp_path):
     assert workflow.metadata(restored)["title"] == "计划会议"
 
 
+def test_finished_transcript_speaker_names_persist_and_refresh(tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+
+    from meetmin.config import DEFAULT_CONFIG, deep_merge
+    from meetmin.gui import app
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(app.MeetingWindow, "refresh_devices", lambda self: None)
+    cfg = deep_merge(DEFAULT_CONFIG, {"output_dir": str(tmp_path)})
+    pipe = Pipeline(cfg)
+    session = pipe.new_session("imported")
+    transcript = {
+        "session_id": session.session_id,
+        "duration": 2,
+        "speakers": ["说话人A", "说话人B"],
+        "utterances": [
+            {"start": 0, "end": 1, "speaker": "说话人A", "text": "你好"},
+            {"start": 1, "end": 2, "speaker": "说话人B", "text": "好的"},
+        ],
+    }
+    pipe._save_transcript(session, transcript)
+    pipe._save_corrected_transcript(session, transcript)
+    session.save_text("minutes.md", "原纪要")
+    window = app.MeetingWindow(
+        cfg, QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    )
+    window.refresh_history(session)
+    monkeypatch.setattr(app.QInputDialog, "getItem", lambda *a, **k: ("说话人A", True))
+    monkeypatch.setattr(app.QInputDialog, "getText", lambda *a, **k: ("张三", True))
+    try:
+        assert window.rename_speaker.isEnabled()
+        window.rename_transcript_speaker()
+        assert session.load_transcript()["utterances"][0]["speaker"] == "张三"
+        assert "张三" in window.transcript.reader.toPlainText()
+        assert "张三" in (session.root / "transcript_corrected.md").read_text(encoding="utf-8")
+        assert "重新生成纪要" in window.stage.text()
+        assert session.minutes_md.read_text(encoding="utf-8") == "原纪要"
+        window.render_session()
+        assert "张三" in window.transcript.reader.toPlainText()
+
+        monkeypatch.setattr(app.QInputDialog, "getItem", lambda *a, **k: ("张三", True))
+        monkeypatch.setattr(app.QInputDialog, "getText", lambda *a, **k: ("说话人B", True))
+        warnings = []
+        monkeypatch.setattr(app.QMessageBox, "warning", lambda *a: warnings.append(a[2]))
+        window.rename_transcript_speaker()
+        assert warnings and "重名" in warnings[0]
+        assert session.load_transcript()["utterances"][0]["speaker"] == "张三"
+    finally:
+        window.close()
+        application.processEvents()
+
+
 @pytest.mark.parametrize("device_failed", [False, True])
 def test_recording_stops_and_finalizes_on_button_or_device_failure(device_failed):
     stopped = Event()

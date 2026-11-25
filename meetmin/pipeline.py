@@ -39,7 +39,13 @@ from .diarization.voiceprints import (
 )
 from .glossary_correction import correct_transcript
 from .session import Session, new_session_id
-from .speakers import is_generated_speaker, is_person_name, rename_speakers, speaker_preview
+from .speakers import (
+    is_generated_speaker,
+    is_person_name,
+    rename_speaker,
+    rename_speakers,
+    speaker_preview,
+)
 from .summarizer.llm_client import BaseLLM, Usage, get_llm
 from .summarizer.minutes import build_web_prompt, estimate_cost, generate_minutes
 from .textutil import ts
@@ -504,10 +510,19 @@ class Pipeline:
         )
 
     def rename_speakers(self, session: Session, assignments: list[str] | dict[str, str]) -> None:
+        self._rename_speakers(session, lambda transcript: rename_speakers(transcript, assignments))
+
+    def rename_speaker(self, session: Session, current: str, name: str) -> None:
+        self._rename_speakers(session, lambda transcript: rename_speaker(transcript, current, name))
+
+    def _rename_speakers(self, session: Session, rename: Callable[[dict], dict]) -> None:
         with self._transcript_lock(session):
             original = session.load_transcript()
-            updated = rename_speakers(original, assignments)
+            updated = rename(original)
             corrected = self._glossary_correction(updated)
+            corrected_path = session.root / "transcript_corrected.json"
+            if corrected is updated and corrected_path.is_file():
+                corrected = rename(json.loads(corrected_path.read_text(encoding="utf-8")))
             for line in speaker_preview(original):
                 self.progress(line)
             self._save_transcript(session, updated)
@@ -693,19 +708,27 @@ class Pipeline:
             return self._correct_glossary(session, session.load_transcript())
 
     # ---------------- (3) AI 纪要 ----------------
-    def export_web_prompt(self, session: Session, *, overwrite: bool = False) -> Path:
+    def web_prompt(self, session: Session) -> str:
         transcript = self._load_minutes_transcript(session)
-        prompt = build_web_prompt(transcript, config=self.cfg)
+        return build_web_prompt(transcript, config=self.cfg)
+
+    def export_web_prompt(self, session: Session, *, overwrite: bool = False) -> Path:
+        prompt = self.web_prompt(session)
         return session.save_text_safely("minutes_web_prompt.txt", prompt, overwrite=overwrite)
 
     def import_web_minutes(
         self, session: Session, source: str | Path, *, overwrite: bool = False
     ) -> Path:
-        # Validate the session before accepting a result associated with it.
+        text = Path(source).read_text(encoding="utf-8-sig")
+        return self.import_web_minutes_text(session, text, overwrite=overwrite)
+
+    def import_web_minutes_text(
+        self, session: Session, text: str, *, overwrite: bool = False
+    ) -> Path:
         session.load_transcript()
-        text = Path(source).read_text(encoding="utf-8-sig").strip()
+        text = text.strip()
         if not text:
-            raise ValueError("导入文件为空，未写入纪要。")
+            raise ValueError("纪要内容为空，未写入纪要。")
         content = "> 由用户从 AI 网页导入；请对照转写核对行动项和数字。\n\n" + text + "\n"
         return session.save_text_safely("minutes.md", content, overwrite=overwrite)
 

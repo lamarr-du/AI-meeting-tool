@@ -63,7 +63,9 @@ def test_opt_in_enrollment_matches_later_archive_without_overwriting(tmp_path):
     assert not pipe.voiceprint_library.path.parent.exists()
     with pytest.raises(ValueError, match="先编辑"):
         pipe.enroll_voiceprints(first)
-    pipe.rename_speakers(first, {"说话人A": "甲"})
+    pipe.rename_speakers(first, {"说话人A": "临时姓名"})
+    pipe.rename_speaker(first, "临时姓名", "甲")
+    assert first.load_transcript()["speaker_names"]["说话人A"] == "甲"
     assert not pipe.voiceprint_library.path.exists()
     assert pipe.enroll_voiceprints(first).added == ["甲"]
     registered = pipe.voiceprint_library.path.read_bytes()
