@@ -37,6 +37,12 @@ def _journal(path: Path) -> None:
         },
         {"type": "speaker.rename", "speaker_id": 1, "display_name": "主持人"},
         {"type": "speaker.rename", "speaker_id": 2, "display_name": "嘉宾"},
+        {
+            "type": "speaker.rename",
+            "speaker_id": 1,
+            "display_name": "说话人B",
+            "pin_anchor": False,
+        },
     ]
     path.write_text("\n".join(json.dumps(event) for event in events) + '\n{"type":', "utf-8")
 

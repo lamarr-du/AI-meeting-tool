@@ -155,8 +155,11 @@ class _Timeline:
         self.bridge_limit = 2 * chunk_frames
         self.bridged_frames = 0
         self.repaired_blocks = 0
+        self.last_timestamp_overlap: dict | None = None
 
-    def position(self, block: _AudioBlock, cursor: int) -> int:
+    def position(
+        self, block: _AudioBlock, cursor: int, following: _AudioBlock | None = None
+    ) -> int:
         adc = self._timestamp(block.timing.get("input_buffer_adc_time"))
         current = self._timestamp(block.timing.get("current_time"))
         valid = adc is not None and current is not None and adc <= current
@@ -173,19 +176,82 @@ class _Timeline:
             ):
                 return self._bridge_timestamp(block, cursor, adc, current)
             assert seconds is not None
-            self.previous_adc = adc
-            self.previous_callback = current
-            self.previous_received = block.received_at
-            self.bridged_frames = 0
         else:
             # Arrival timing is approximate: scheduler delays are indistinguishable from gaps.
             seconds = block.received_at - self.start - block.frames / self.rate
         target = max(0, round(seconds * self.rate))
         delta = target - cursor
         if delta < -self.tolerance:
-            raise RuntimeError("音频块严重重叠或迟到，无法可靠保持时间轴")
+            if self.mode != "device" or not self._confirm_overlap(
+                block, following, cursor, target, seconds, current
+            ):
+                raise RuntimeError("音频块严重重叠或迟到，无法可靠保持时间轴")
+            self.repaired_blocks += 1
+        if self.mode == "device":
+            self.previous_adc = adc
+            self.previous_callback = current
+            self.previous_received = block.received_at
+            self.bridged_frames = 0
         # WASAPI timestamps have jitter; contiguous blocks must not acquire tiny gaps each time.
         return target if delta > self.tolerance or cursor == 0 else cursor
+
+    def _confirm_overlap(
+        self,
+        block: _AudioBlock,
+        following: _AudioBlock | None,
+        cursor: int,
+        target: int,
+        seconds: float,
+        current: float | None,
+    ) -> bool:
+        # The next block must anchor the timeline at the end of this block's PCM.
+        # Callback cadence alone cannot distinguish a timestamp error from a real gap.
+        origin = self.stream_origin
+        assert origin is not None
+        next_timing = following.timing if following is not None else {}
+        next_adc = self._timestamp(next_timing.get("input_buffer_adc_time"))
+        next_current = self._timestamp(next_timing.get("current_time"))
+        next_seconds = next_adc - origin if next_adc is not None else None
+        expected = cursor + block.frames
+        confirmed = (
+            following is not None
+            and next_adc is not None
+            and next_current is not None
+            and next_adc <= next_current
+            and next_seconds is not None
+            and -0.5 <= next_seconds <= following.received_at - self.start + 0.5
+            and abs(round(next_seconds * self.rate) - expected) <= self.tolerance
+            and cursor - target <= block.frames + self.tolerance
+            and self.bridged_frames + block.frames <= self.bridge_limit
+            and self._callbacks_are_continuous(
+                block, current, self.previous_received, self.previous_callback
+            )
+            and self._callbacks_are_continuous(following, next_current, block.received_at, current)
+        )
+        self.last_timestamp_overlap = {
+            "repaired": confirmed,
+            "cursor_frames": cursor,
+            "target_frames": target,
+            "block_frames": block.frames,
+            "previous_adc_sec": self.previous_adc - origin
+            if self.previous_adc is not None
+            else None,
+            "previous_callback_sec": (
+                self.previous_callback - origin if self.previous_callback is not None else None
+            ),
+            "previous_arrival_sec": (
+                self.previous_received - self.start if self.previous_received is not None else None
+            ),
+            "adc_sec": seconds,
+            "callback_sec": current - origin if current is not None else None,
+            "arrival_sec": block.received_at - self.start,
+            "next_adc_sec": next_seconds,
+            "next_callback_sec": next_current - origin if next_current is not None else None,
+            "next_arrival_sec": following.received_at - self.start
+            if following is not None
+            else None,
+        }
+        return confirmed
 
     @staticmethod
     def _timestamp(value: object) -> float | None:
@@ -193,25 +259,37 @@ class _Timeline:
             return float(value)
         return None
 
-    def _bridge_timestamp(
-        self, block: _AudioBlock, cursor: int, adc: float | None, current: float | None
-    ) -> int:
-        assert self.previous_received is not None
+    def _callbacks_are_continuous(
+        self,
+        block: _AudioBlock,
+        current: float | None,
+        previous_received: float | None,
+        previous_callback: float | None,
+    ) -> bool:
+        if previous_received is None:
+            return False
         limit = (block.frames + self.tolerance) / self.rate
         # A callback can arrive late on the Python thread. Either clock can
         # confirm consecutive packets, but neither can justify inventing a gap.
-        arrival_step = block.received_at - self.previous_received
+        arrival_step = block.received_at - previous_received
         callback_step = (
-            current - self.previous_callback
-            if current is not None and self.previous_callback is not None
+            current - previous_callback
+            if current is not None and previous_callback is not None
             else math.inf
         )
-        continuous = 0 <= arrival_step <= limit or (
+        return 0 <= arrival_step <= limit or (
             0 <= arrival_step <= 0.5 and 0 < callback_step <= limit
         )
+
+    def _bridge_timestamp(
+        self, block: _AudioBlock, cursor: int, adc: float | None, current: float | None
+    ) -> int:
+        limit = (block.frames + self.tolerance) / self.rate
         if (
             self.bridged_frames + block.frames > self.bridge_limit
-            or not continuous
+            or not self._callbacks_are_continuous(
+                block, current, self.previous_received, self.previous_callback
+            )
             or (
                 adc is not None
                 and self.previous_adc is not None
@@ -565,7 +643,7 @@ class LoopbackRecorder:
                     continue
                 # Hold the last block so stop() can trim samples past the stop boundary.
                 if pending is not None:
-                    self._write_block(pending)
+                    self._write_block(pending, following=block)
                 pending = block
             if pending is not None:
                 self._write_block(pending)
@@ -592,9 +670,9 @@ class LoopbackRecorder:
                 self._frames += frames
                 self._padded_frames += frames
 
-    def _write_block(self, block: _AudioBlock) -> None:
+    def _write_block(self, block: _AudioBlock, *, following: _AudioBlock | None = None) -> None:
         assert self._timeline is not None and self._wf is not None
-        position = self._timeline.position(block, self._frames)
+        position = self._timeline.position(block, self._frames, following)
         frames = block.frames
         if self._stop_at is not None:
             end = self._stop_frame()
@@ -762,6 +840,9 @@ class LoopbackRecorder:
                 "timing_mode": self._timeline.mode if self._timeline is not None else "pending",
                 "repaired_timestamp_blocks": (
                     self._timeline.repaired_blocks if self._timeline is not None else 0
+                ),
+                "last_timestamp_overlap": (
+                    self._timeline.last_timestamp_overlap if self._timeline is not None else None
                 ),
                 "finalized": self._finalized,
                 "cleanup_pending": self._thread is not None

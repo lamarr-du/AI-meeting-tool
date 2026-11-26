@@ -6,6 +6,7 @@ import math
 import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ from .clustering import (
     rms,
     save_embedding_cache,
 )
+from .voiceprints import VoiceprintMatcher
 
 
 @dataclass
@@ -110,6 +112,8 @@ class ProgressiveDiarizer:
         self.turns: dict[str, _Turn] = {}
         self.centroids: dict[int, np.ndarray] = {}
         self.names: dict[int, str] = {}
+        self.voiceprint_matcher: VoiceprintMatcher | None = None
+        self._voiceprint_names: dict[int, str] = {}
         self.aliases: dict[int, int] = {}
         self._next_id = 0
         self._speech_seconds = 0.0
@@ -411,7 +415,41 @@ class ProgressiveDiarizer:
     def display_name(self, speaker) -> str:
         if not isinstance(speaker, int):
             return UNKNOWN_NAME
-        return self.names.get(speaker, speaker_name(speaker))
+        return self.names.get(speaker) or self._voiceprint_names.get(speaker, speaker_name(speaker))
+
+    @cached_property
+    def model_signature(self) -> str:
+        return self.embedder._model_signature()
+
+    @property
+    def speaker_names(self) -> dict[int, str]:
+        return {**self._voiceprint_names, **self.names}
+
+    def match_voiceprints(self) -> list[dict]:
+        matches = (
+            self.voiceprint_matcher.match(
+                {
+                    speaker: center
+                    for speaker, center in self.centroids.items()
+                    if speaker not in self.names and np.any(center)
+                },
+                reserved=set(self.names.values()),
+            )
+            if self.voiceprint_matcher is not None
+            else {}
+        )
+        previous = self._voiceprint_names
+        self._voiceprint_names = matches
+        return [
+            {
+                "type": "speaker.rename",
+                "speaker_id": speaker,
+                "display_name": self.display_name(speaker),
+                "pin_anchor": False,
+            }
+            for speaker in sorted(previous.keys() | matches.keys())
+            if speaker not in self.names and previous.get(speaker) != matches.get(speaker)
+        ]
 
     def rename(self, speaker: int, name: str) -> dict:
         while speaker in self.aliases:
@@ -458,7 +496,7 @@ class ProgressiveDiarizer:
     def save_cache(self, path: Path, audio_sha256: str) -> None:
         if self.records:
             signature = build_cache_signature(
-                model=self.embedder._model_signature(),
+                model=self.model_signature,
                 mode="live_commit",
                 win_sec=self.window_sec,
                 hop_sec=0.0,

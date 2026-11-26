@@ -131,10 +131,12 @@ class LiveTranscriptModel(QAbstractListModel):
         for part in parts:
             self._insert(part)
 
-    def rename(self, speaker: int, name: str) -> None:
+    def rename(self, speaker: int, name: str, *, pin_anchor: bool = True) -> None:
         for index, item in enumerate(self._rows):
             if item.speaker == speaker:
-                self._change(index, replace(item, name=name, provisional=False))
+                self._change(
+                    index, replace(item, name=name, provisional=item.provisional and not pin_anchor)
+                )
 
 
 class _UtteranceDelegate(QStyledItemDelegate):
@@ -285,7 +287,9 @@ class LiveTranscriptView(QWidget):
             label = self.drafts[event["track"]]
             label.setText(f"{_SPEAKERS[event['track']]} · {event['text']}" if event["text"] else "")
         elif kind == "speaker.rename":
-            self.model.rename(event["speaker_id"], event["display_name"])
+            self.model.rename(
+                event["speaker_id"], event["display_name"], pin_anchor=event.get("pin_anchor", True)
+            )
         elif kind in (
             "asr.commit",
             "diarization.assign",
