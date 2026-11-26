@@ -279,3 +279,25 @@ def test_desktop_can_reuse_legacy_cli_external_audio(tmp_path):
     audio.touch()
     session.save_json("asr_raw.json", {"audio_path": str(audio)})
     assert workflow.available_audio(session) == (True, audio)
+
+
+def test_default_desktop_config_falls_back_to_repo_config_and_respects_user_override(tmp_path):
+    pytest.importorskip("PySide6")
+    from meetmin.gui.app import _load_default_desktop_config
+
+    repo_root = Path(__file__).resolve().parents[1]
+    empty_appdata = tmp_path / "appdata"
+    empty_appdata.mkdir()
+    fallback_cfg = _load_default_desktop_config(empty_appdata)
+    assert fallback_cfg["recorder"]["microphone"] is True
+    assert fallback_cfg["asr"]["glossary"]["path"] == str(repo_root / "glossary.yaml")
+    assert fallback_cfg["asr"]["glossary"]["correction_path"] == str(repo_root / "glossary.yaml")
+
+    custom_config = empty_appdata / "config.yaml"
+    custom_config.write_text(
+        "asr:\n  beam_size: 3\nrecorder:\n  microphone: false\n", encoding="utf-8"
+    )
+    override_cfg = _load_default_desktop_config(empty_appdata)
+    assert override_cfg["asr"]["beam_size"] == 3
+    assert override_cfg["recorder"]["microphone"] is False
+    assert override_cfg["asr"]["glossary"]["path"] is None

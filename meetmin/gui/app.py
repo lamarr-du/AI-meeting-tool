@@ -1381,6 +1381,32 @@ class MeetingWindow(QMainWindow):
             event.accept()
 
 
+def _load_default_desktop_config(app_data: Path) -> dict:
+    """无 --config 启动时优先读用户数据目录配置，不存在则回退读取工程或便携包目录的 config.yaml。"""
+    user_config = app_data / "config.yaml"
+    if user_config.is_file():
+        return load_config(user_config)
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates = [exe_dir, *exe_dir.parents]
+    else:
+        repo_root = Path(__file__).resolve().parents[2]
+        candidates = []
+        if (repo_root / "pyproject.toml").is_file() and (
+            repo_root / "meetmin" / "config.py"
+        ).is_file():
+            candidates.append(repo_root)
+        candidates.append(Path.cwd())
+
+    fallback = next(
+        (base / "config.yaml" for base in candidates if (base / "config.yaml").is_file()), None
+    )
+    cfg = load_config(fallback if fallback is not None else user_config)
+    cfg["recorder"]["microphone"] = True
+    return cfg
+
+
 def run(config: Path | None) -> int:
     app = QApplication([])
     app.setOrganizationName("MeetMin")
@@ -1400,9 +1426,7 @@ def run(config: Path | None) -> int:
                 QStandardPaths.StandardLocation.AppLocalDataLocation
             )
             output = Path(data) / "data"
-            cfg = load_config(Path(data) / "config.yaml")
-            if not (Path(data) / "config.yaml").is_file():
-                cfg["recorder"]["microphone"] = True
+            cfg = _load_default_desktop_config(Path(data))
         cfg["output_dir"] = settings.value("output_dir", str(output), type=str)
         target_rms = cast(
             float, settings.value("target_rms", cfg["recorder"]["target_rms"], type=float)

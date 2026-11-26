@@ -41,6 +41,24 @@ python -m meetmin.gui
 
 </details>
 
+## 自定义术语与私有姓名词表
+
+仓库自带的 `config.yaml` 默认启用项目根目录下的通用技术术语表 `glossary.yaml`（桌面版从项目目录启动与命令行均自动读取），用于在转写前向 Whisper 提供专业词汇提示，并在转写后对常见同音误听生成可审计的纠错结果（桌面端自动优先展示纠错版转写）。
+
+如需补充**团队参会人真实姓名、内部项目代号**等不便上传到 GitHub 的敏感词条，可在项目根目录（与 `glossary.yaml` 同目录）新建 `glossary.local.yaml`。该文件已加入 `.gitignore` 不会被提交，运行时会自动与 `glossary.yaml` 合并生效：
+
+```yaml
+# glossary.local.yaml（仅保存在本机）
+terms:
+  - term: 张三
+    aliases:
+      - 小张
+    needs_context: false   # 无歧义专有名词设为 false 可直接替换 3 字及以内的同音误听
+    mishearings:
+      - 张山
+      - 章三
+```
+
 ## 命令行（备选）
 
 从源码安装桌面版后即可使用 CLI。以下 Windows 示例会转写已有音频并导出 AI 网页提示词，无需纪要 API Key。
