@@ -8,8 +8,10 @@ import math
 import zipfile
 from bisect import bisect_right
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 
@@ -23,6 +25,7 @@ from .clustering import SR
 _MIN_SIMILARITY = 0.72
 _MIN_MARGIN = 0.08
 _EMBEDDING_DIM = 192
+_Speaker = TypeVar("_Speaker", str, int)
 
 
 @dataclass(frozen=True)
@@ -145,6 +148,39 @@ def local_profiles(path: Path, utterances: list[Utterance], audio_sha256: str) -
     return {"model": model, "speakers": profiles} if profiles else None
 
 
+class VoiceprintMatcher:
+    """A snapshot of the registered voices for one embedding model."""
+
+    def __init__(self, people: dict[str, list[float]]):
+        self.names = list(people)
+        self.registered = np.stack([_unit_vector(people[name]) for name in self.names])
+
+    def match(
+        self, profiles: Mapping[_Speaker, object], *, reserved: set[str]
+    ) -> dict[_Speaker, str]:
+        if not profiles:
+            return {}
+        labels = list(profiles)
+        local = np.stack([_unit_vector(profiles[label]) for label in labels])
+        scores = local @ self.registered.T
+        matches = {}
+        for row, label in enumerate(labels):
+            order = np.argsort(scores[row])[::-1]
+            best = int(order[0])
+            score = float(scores[row, best])
+            runner_up = float(scores[row, order[1]]) if len(order) > 1 else -1.0
+            competing = max(
+                (float(scores[i, best]) for i in range(len(labels)) if i != row), default=-1.0
+            )
+            if (
+                self.names[best] not in reserved
+                and score >= _MIN_SIMILARITY
+                and score - max(runner_up, competing) >= _MIN_MARGIN
+            ):
+                matches[label] = self.names[best]
+        return matches
+
+
 class VoiceprintLibrary:
     def __init__(self, directory: Path):
         self.path = directory / "speakers.json"
@@ -166,31 +202,15 @@ class VoiceprintLibrary:
                 _unit_vector(vector)
         return models
 
-    def match(self, model: str, profiles: dict, *, reserved: set[str]) -> dict[str, str]:
-        people = self._load().get(model, {})
-        if not people or not profiles:
-            return {}
-        names = list(people)
-        labels = list(profiles)
-        registered = np.stack([_unit_vector(people[name]) for name in names])
-        local = np.stack([_unit_vector(profiles[label]) for label in labels])
-        scores = local @ registered.T
-        matches = {}
-        for row, label in enumerate(labels):
-            order = np.argsort(scores[row])[::-1]
-            best = int(order[0])
-            score = float(scores[row, best])
-            runner_up = float(scores[row, order[1]]) if len(order) > 1 else -1.0
-            competing = max(
-                (float(scores[i, best]) for i in range(len(labels)) if i != row), default=-1.0
-            )
-            if (
-                names[best] not in reserved
-                and score >= _MIN_SIMILARITY
-                and score - max(runner_up, competing) >= _MIN_MARGIN
-            ):
-                matches[label] = names[best]
-        return matches
+    def matcher(self, model: str) -> VoiceprintMatcher | None:
+        people = self._load().get(model)
+        return VoiceprintMatcher(people) if people else None
+
+    def match(
+        self, model: str, profiles: Mapping[str, object], *, reserved: set[str]
+    ) -> dict[str, str]:
+        matcher = self.matcher(model)
+        return matcher.match(profiles, reserved=reserved) if matcher is not None else {}
 
     def enroll(self, model: str, profiles: dict) -> Enrollment:
         self.path.parent.mkdir(parents=True, exist_ok=True)

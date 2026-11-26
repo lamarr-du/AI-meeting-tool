@@ -121,6 +121,59 @@ def test_imported_audio_remains_available_after_original_moves(tmp_path):
     assert workflow.metadata(restored)["title"] == "计划会议"
 
 
+def test_live_speaker_name_refreshes_existing_rows_without_pinning(monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from meetmin.gui.live_transcript import LiveTranscriptView
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    view = LiveTranscriptView()
+    try:
+        for segment, start in (("loopback-1", 0), ("loopback-2", 2000)):
+            view.apply_event(
+                {
+                    "type": "asr.commit",
+                    "segment_id": segment,
+                    "track": "loopback",
+                    "start_ms": start,
+                    "text": "发言",
+                    "speaker_pending": True,
+                }
+            )
+            view.apply_event(
+                {
+                    "type": "diarization.assign",
+                    "segment_id": segment,
+                    "parts": [
+                        {
+                            "start_ms": start,
+                            "speaker_id": 1,
+                            "display_name": "说话人B",
+                            "provisional": True,
+                            "text": "发言",
+                        }
+                    ],
+                }
+            )
+        view.apply_event(
+            {
+                "type": "speaker.rename",
+                "speaker_id": 1,
+                "display_name": "登记姓名",
+                "pin_anchor": False,
+            }
+        )
+        assert [(row.name, row.provisional) for row in view.model._rows] == [
+            ("登记姓名", True),
+            ("登记姓名", True),
+        ]
+    finally:
+        view.close()
+        application.processEvents()
+
+
 def test_finished_transcript_speaker_names_persist_and_refresh(tmp_path, monkeypatch):
     pytest.importorskip("PySide6")
     from PySide6.QtCore import QSettings

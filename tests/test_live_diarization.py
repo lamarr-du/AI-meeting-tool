@@ -1,4 +1,6 @@
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 
 import numpy as np
 
@@ -12,8 +14,11 @@ from meetmin.diarization.clustering import (
     save_embedding_cache,
 )
 from meetmin.diarization.live_diarizer import ProgressiveDiarizer, VoiceTurn
+from meetmin.diarization.voiceprints import VoiceprintLibrary
 from meetmin.live_pipeline import LiveSessionCoordinator
 from meetmin.session import Session
+
+VECTORS = np.eye(2, 192, dtype=np.float32)
 
 
 class Encoder:
@@ -21,9 +26,10 @@ class Encoder:
         pass
 
     def embed_waveforms(self, wavs):
-        return np.stack(
-            [np.array([1, 0] if np.mean(wav) > 0 else [0, 1], dtype=np.float32) for wav in wavs]
-        )
+        return np.stack([VECTORS[0 if np.mean(wav) > 0 else 1] for wav in wavs])
+
+    def _model_signature(self):
+        return "test-campplus"
 
 
 def _diarizer(monkeypatch, **overrides):
@@ -72,6 +78,93 @@ def test_live_voice_reconciles_a_mixed_turn_after_first_speaker_is_named(monkeyp
     assert [word["w"] for segment in mixed for word in segment.words] == [
         f"字{i}" for i in range(5)
     ]
+
+
+def test_live_voice_worker_matches_public_names_before_stop_and_keeps_manual_edit(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("meetmin.diarization.live_diarizer.CampplusOnnxDiarizer", Encoder)
+    cfg = deep_merge(DEFAULT_CONFIG, {"output_dir": str(tmp_path)})
+    session = Session(tmp_path, "live-voiceprints").ensure()
+    updates = Queue()
+    coordinator = LiveSessionCoordinator(cfg, session, updates.put, dual_track=True)
+    library = coordinator.pipe.voiceprint_library
+    library.enroll("test-campplus", {"登记姓名": VECTORS[1]})
+    original = library.path.read_bytes()
+    worker = Thread(target=coordinator._run_voice, daemon=True)
+    worker.start()
+    try:
+        coordinator._voice_inbox.put(_turn("a1", 0, (0.1,)))
+        coordinator._voice_inbox.put(_turn("a2", 2, (0.1,)))
+        coordinator._voice_inbox.put(_turn("b1", 4, (-0.1,)))
+        assert updates.get(timeout=2)["parts"][0]["display_name"] == "说话人A"
+        assert updates.get(timeout=2)["parts"][0]["display_name"] == "说话人A"
+        assert updates.get(timeout=2)["parts"][0]["display_name"] == "说话人B"
+        assert updates.get(timeout=2) == {
+            "type": "speaker.rename",
+            "speaker_id": 1,
+            "display_name": "登记姓名",
+            "pin_anchor": False,
+        }
+        assert not coordinator._voice_done.is_set()
+        assert not coordinator._voice.turns["b1"].locked
+
+        coordinator._voice_inbox.put(_turn("b2", 6, (-0.1,)))
+        assert updates.get(timeout=2)["parts"][0]["display_name"] == "登记姓名"
+
+        coordinator._speaker_renames.put((1, "手动姓名"))
+        manual = updates.get(timeout=2)
+        assert manual["display_name"] == "手动姓名" and manual["pin_anchor"]
+        coordinator._voice_inbox.put(_turn("b3", 8, (-0.1,)))
+        assert updates.get(timeout=2)["parts"][0]["display_name"] == "手动姓名"
+    finally:
+        coordinator._voice_done.set()
+        worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert coordinator._voice.speaker_names == {1: "手动姓名"}
+    assert [row.speaker for row in coordinator._voice.archive()] == [
+        "说话人A",
+        "说话人A",
+        "手动姓名",
+        "手动姓名",
+        "手动姓名",
+    ]
+    assert library.path.read_bytes() == original
+
+
+def test_live_voiceprint_name_is_withdrawn_if_two_clusters_compete(monkeypatch, tmp_path):
+    voice = _diarizer(monkeypatch)
+    library = VoiceprintLibrary(tmp_path)
+    library.enroll("test-campplus", {"登记姓名": VECTORS[0]})
+    voice.voiceprint_matcher = library.matcher(voice.model_signature)
+    voice.add(_turn("a", 0, (0.1,)))
+    assert voice.match_voiceprints()[0]["display_name"] == "登记姓名"
+    assert voice.archive()[0].speaker == "登记姓名"
+
+    voice.add(_turn("b", 2, (-0.1,)))
+    voice.centroids[1] = VECTORS[0]  # A later re-clustering can produce competing candidates.
+    assert voice.match_voiceprints()[0]["display_name"] == "说话人A"
+    assert voice.speaker_names == {}
+    assert [row.speaker for row in voice.archive()] == ["说话人A", "说话人B"]
+
+
+def test_invalid_public_library_does_not_stop_live_diarization(monkeypatch, tmp_path):
+    monkeypatch.setattr("meetmin.diarization.live_diarizer.CampplusOnnxDiarizer", Encoder)
+    cfg = deep_merge(DEFAULT_CONFIG, {"output_dir": str(tmp_path)})
+    session = Session(tmp_path, "invalid-library").ensure()
+    events = []
+    coordinator = LiveSessionCoordinator(cfg, session, events.append, dual_track=False)
+    path = coordinator.pipe.voiceprint_library.path
+    path.parent.mkdir()
+    path.write_text("{", encoding="utf-8")
+
+    coordinator._voice_inbox.put(_turn("a", 0, (0.1,)))
+    coordinator._voice_done.set()
+    coordinator._run_voice()
+    assert "无法读取公共声纹库" in events[0]["message"]
+    assert events[1]["type"] == "diarization.assign"
+    assert events[1]["parts"][0]["display_name"] == "说话人A"
+    assert coordinator._voice_warning is None
 
 
 def test_two_named_speakers_keep_their_identity_when_clustering_collides(monkeypatch):

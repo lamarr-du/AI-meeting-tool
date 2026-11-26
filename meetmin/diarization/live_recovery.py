@@ -47,7 +47,7 @@ def _named_intervals(path: Path) -> list[dict]:
                     and 0 <= start < end
                 ):
                     commits[segment] = (start, end)
-            elif kind == "speaker.rename":
+            elif kind == "speaker.rename" and event.get("pin_anchor", True):
                 speaker, name = event.get("speaker_id"), event.get("display_name")
                 if (
                     type(speaker) is int

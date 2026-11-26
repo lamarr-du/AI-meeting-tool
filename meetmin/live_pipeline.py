@@ -394,6 +394,12 @@ class LiveSessionCoordinator:
                 self.pipe.cfg, model_cache_dir=self.pipe.cfg.get("model_cache_dir")
             )
             self._voice = voice
+            try:
+                voice.voiceprint_matcher = self.pipe.voiceprint_library.matcher(
+                    voice.model_signature
+                )
+            except (OSError, ValueError, TypeError, OverflowError) as exc:
+                self._status(f"无法读取公共声纹库，继续录中说话人分离 · {exc}")
             while not self._voice_cancelled.is_set():
                 while not self._speaker_renames.empty():
                     speaker, name = self._speaker_renames.get_nowait()
@@ -401,22 +407,40 @@ class LiveSessionCoordinator:
                         self._publish_event(voice.rename(speaker, name))
                     except ValueError as exc:
                         self._status(str(exc))
+                    else:
+                        self._publish_voiceprint_matches(voice)
                 try:
                     job = self._voice_inbox.get(timeout=0.05)
                 except Empty:
                     if self._voice_done.is_set() and self._speaker_renames.empty():
                         if event := voice.reconcile():
                             self._publish_event(event)
+                        self._publish_voiceprint_matches(voice)
                         return
                     continue
                 for event in voice.add(job):
                     if not self._voice_cancelled.is_set():
                         self._publish_event(event)
+                self._publish_voiceprint_matches(voice)
         except Exception as exc:
             self._voice_warning = f"录中说话人分离已暂停 · {exc}"
             self._status(self._voice_warning)
         finally:
             self._voice_cancelled.set()
+
+    def _publish_voiceprint_matches(self, voice: ProgressiveDiarizer) -> None:
+        if self._voice_cancelled.is_set():
+            return
+        try:
+            matches = voice.match_voiceprints()
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._status(f"无法匹配公共声纹，继续录中说话人分离 · {exc}")
+            voice.voiceprint_matcher = None
+            matches = voice.match_voiceprints()
+        for event in matches:
+            if self._voice_cancelled.is_set():
+                break
+            self._publish_event(event)
 
     def finish(self) -> dict | None:
         """录音成功封存后冲刷尾窗，再交给标准离线产物整理。"""
@@ -475,7 +499,9 @@ class LiveSessionCoordinator:
                 utterances,
                 speakers,
                 suppressed_microphone=self._suppressed,
-                speaker_names={speaker_name(key): name for key, name in voice.names.items()},
+                speaker_names={
+                    speaker_name(key): name for key, name in voice.speaker_names.items()
+                },
                 voiceprint_audio_sha256=audio_sha256,
             )
         except Exception as exc:
