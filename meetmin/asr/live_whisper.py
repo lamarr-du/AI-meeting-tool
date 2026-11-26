@@ -72,7 +72,11 @@ class ReviewSpan:
 
 
 def review_redecode(
-    span: ReviewSpan, decoded: list[Decoded], options: QualityOptions
+    span: ReviewSpan,
+    decoded: list[Decoded],
+    options: QualityOptions,
+    *,
+    language: str | None = None,
 ) -> tuple[Utterance | None, str | None]:
     candidate = []
     words = []
@@ -85,7 +89,7 @@ def review_redecode(
         words.extend(inside)
         candidate.append(replace(row, utterance=_utterance(inside)))
     if reason := reject_replacement(
-        (span.start, span.end), candidate, [], options, min_coverage=0.5
+        (span.start, span.end), candidate, [], options, min_coverage=0.5, language=language
     ):
         return None, reason
     result = _utterance(words)

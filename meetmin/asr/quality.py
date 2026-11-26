@@ -11,11 +11,26 @@ from dataclasses import asdict, dataclass
 from itertools import pairwise
 
 from .base import Utterance
+from .zh_convert import to_simplified
 
 _MAX_CLIP_SEC = 20
 _RETRY_MIN_LOGPROB = -0.8
 _TIME_EPSILON = 0.0001  # WAV 切片的起止点取整到采样帧
 _TEXT_LOOP = re.compile(r"(.{1,12}?)\1{5,}")
+_HALLUCINATION_PHRASE = re.compile(
+    r"^(?:"
+    r"谢谢大家|谢谢观看|感谢观看|谢谢收看|谢谢聆听|感谢收看|"
+    r"谢谢|大家|好美|我的好美|啊我的好美|"
+    r"字幕由.*|字幕制作.*|请不吝点赞.*|点赞订阅.*|订阅.*频道|明镜与点点|"
+    r"sleepy\s*state|thank\s+you(?:\s+for\s+watching)?|thanks\s+for\s+watching|"
+    r"subtitles?\s+by.*|amara\.org.*|"
+    r".*ありがとう.*|.*ご視聴.*|.*チャンネル登録.*|.*감사합니다.*"
+    r")$",
+    re.IGNORECASE,
+)
+_NON_ZH_EN_SCRIPT = re.compile(
+    r"[\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af\u1100-\u11ff\u0400-\u04ff\u0600-\u06ff\u0e00-\u0e7f]"
+)
 LIVE_REVIEW_TEXT = "〔该段音频待确认〕"
 
 Span = tuple[float, float]
@@ -55,6 +70,56 @@ class Decoded:
     compression_ratio: float = 0.0
     avg_logprob: float = 0.0
     no_speech_prob: float = 0.0
+    mean_word_prob: float | None = None
+
+
+def is_silence_hallucination(
+    row: Decoded, *, band_ratio: float | None = None, language: str | None = None
+) -> bool:
+    """鉴别静音/低频底噪触发的 Whisper 幻觉短句（兼顾 large-v3-turbo no_speech_prob 恒近 0 与跨语种假名致幻特性）。"""
+    text = row.utterance.text.strip()
+    if not text:
+        return True
+    dur = max(0.0, row.utterance.end - row.utterance.start)
+    normalized = re.sub(
+        r"[\s，。！？、,.!?\"'“”‘’（）()—…·]+",
+        " ",
+        unicodedata.normalize("NFKC", to_simplified(text)),
+    ).strip()
+    compact = normalized.replace(" ", "")
+    if not compact:
+        return True
+
+    # 0. 中文转写模式下，Whisper 在底噪/静音段常漂移出日文假名或韩文谚文字幕（如“ありがとうございました”、“スピーシェイ”）
+    if language and language.lower().startswith("zh"):
+        foreign_chars = len(_NON_ZH_EN_SCRIPT.findall(compact))
+        if foreign_chars > 0 and foreign_chars * 2 >= len(compact):
+            return True
+
+    # 1. 命中典型中英日韩字幕/静音幻觉短语的孤立短片段，收紧置信度与人声频带门槛
+    if (
+        dur <= 3.5
+        and len(compact) <= 16
+        and (
+            _HALLUCINATION_PHRASE.fullmatch(normalized) or _HALLUCINATION_PHRASE.fullmatch(compact)
+        )
+    ):
+        if (
+            row.no_speech_prob >= 0.55
+            or row.avg_logprob < -0.55
+            or (row.mean_word_prob is not None and row.mean_word_prob < 0.58)
+            or (band_ratio is not None and band_ratio < 0.15)
+        ):
+            return True
+
+    # 2. 通用极低置信度或纯超低频嗡鸣导致的短乱码幻觉
+    if row.no_speech_prob >= 0.75 and row.avg_logprob < -0.70:
+        return True
+    if row.avg_logprob < -1.05 and (row.mean_word_prob is None or row.mean_word_prob < 0.38):
+        return True
+    if dur <= 2.5 and band_ratio is not None and band_ratio < 0.10 and row.avg_logprob < -0.65:
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -134,6 +199,7 @@ def reject_replacement(
     options: QualityOptions,
     *,
     min_coverage: float = 0,
+    language: str | None = None,
 ) -> str | None:
     start, stop = span
     replacement = [row.utterance for row in candidate]
@@ -148,6 +214,7 @@ def reject_replacement(
             and math.isfinite(row.no_speech_prob)
             and row.no_speech_prob <= 0.6
         )
+        or is_silence_hallucination(row, language=language)
         for row in candidate
     ):
         return "low_confidence"
@@ -185,6 +252,8 @@ def review(
     options: QualityOptions,
     speech_spans: Callable[[], list[Span]],
     retry: Callable[[float, float], list[Decoded]],
+    *,
+    language: str | None = None,
 ) -> tuple[list[Utterance], dict]:
     if options.mode == "off":
         return [row.utterance for row in decoded], {"mode": "off"}
@@ -248,6 +317,7 @@ def review(
             kept,
             options,
             min_coverage=0.5 if issue.original else 0,
+            language=language,
         ):
             entry.update(status="rejected", detail=reason)
             continue

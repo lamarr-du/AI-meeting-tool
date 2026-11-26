@@ -16,18 +16,19 @@ from typing import Any
 
 import numpy as np
 
-from ..audio.dsp import TARGET_SR
+from ..audio.dsp import TARGET_SR, highpass_speech, speech_band_ratio
 from ..glossary import glossary_hotwords, load_terms, select_terms
 from ..model_cache import configure_xet_cache, hub_cache_dir
 from .base import ASRProvider, ASRResult, Utterance
 from .model_download import ModelDownloadProgress, cached_model, download_model
 from .profile import memory_status, select_profile
-from .quality import Decoded, QualityOptions, Span, review
+from .quality import Decoded, QualityOptions, Span, is_silence_hallucination, review
 
 _VAD_PARAMETERS = {
-    "min_silence_duration_ms": 600,
+    "threshold": 0.55,
+    "min_silence_duration_ms": 500,
     "min_speech_duration_ms": 250,
-    "speech_pad_ms": 100,
+    "speech_pad_ms": 120,
 }
 _QUALITY_VAD_PARAMETERS = {"min_silence_duration_ms": 400}
 
@@ -35,16 +36,26 @@ _QUALITY_VAD_PARAMETERS = {"min_silence_duration_ms": 400}
 def _speech_spans(audio: np.ndarray) -> list[Span]:
     from faster_whisper.vad import get_speech_timestamps
 
-    # 不把 Silero 的边缘补齐样本计成有声缺口。
-    chunks = get_speech_timestamps(audio, **_QUALITY_VAD_PARAMETERS, speech_pad_ms=0)
+    # 先滤除超低频底噪，再检测语音段；不把 Silero 的边缘补齐样本计成有声缺口。
+    chunks = get_speech_timestamps(
+        highpass_speech(audio, TARGET_SR), **_QUALITY_VAD_PARAMETERS, speech_pad_ms=0
+    )
     return [(chunk["start"] / TARGET_SR, chunk["end"] / TARGET_SR) for chunk in chunks]
 
 
 def _decoded(segment: Any, offset: float = 0.0) -> Decoded:
+    raw_words = list(segment.words or [])
     words = [
         {"w": w.word, "s": round(float(w.start) + offset, 3), "e": round(float(w.end) + offset, 3)}
-        for w in (segment.words or [])
+        for w in raw_words
     ]
+    probs = [
+        float(prob)
+        for w in raw_words
+        if isinstance((prob := getattr(w, "probability", None)), (int, float))
+        and math.isfinite(prob)
+    ]
+    mean_word_prob = sum(probs) / len(probs) if probs else None
     return Decoded(
         Utterance(
             start=float(segment.start) + offset,
@@ -55,7 +66,18 @@ def _decoded(segment: Any, offset: float = 0.0) -> Decoded:
         compression_ratio=float(getattr(segment, "compression_ratio", 0.0)),
         avg_logprob=float(getattr(segment, "avg_logprob", 0.0)),
         no_speech_prob=float(getattr(segment, "no_speech_prob", 0.0)),
+        mean_word_prob=mean_word_prob,
     )
+
+
+def _segment_band_ratio(audio: np.ndarray, start_sec: float, end_sec: float) -> float | None:
+    if len(audio) < 32 or float(np.ptp(audio)) <= 1e-7:
+        return None
+    a = max(0, min(len(audio), round(start_sec * TARGET_SR)))
+    b = max(a, min(len(audio), round(end_sec * TARGET_SR)))
+    if b - a < 32:
+        return None
+    return speech_band_ratio(audio[a:b], TARGET_SR)
 
 
 def _decode_guards(config: dict, word_timestamps: bool) -> dict[str, Any]:
@@ -300,13 +322,29 @@ class FasterWhisperASR(ASRProvider):
         options, _, _ = self._decode_options()
         return {**options, "vad_filter": False, "temperature": 0.0}
 
+    def _preprocess_for_model(self, audio: np.ndarray) -> np.ndarray:
+        model_cls = getattr(self, "_model_class", None)
+        if isinstance(model_cls, type) and isinstance(self.model, model_cls):
+            return highpass_speech(audio, TARGET_SR)
+        return audio
+
     def decode_window(
         self, audio: np.ndarray, offset: float, *, options: dict[str, Any]
     ) -> list[Decoded]:
+        clean_audio = self._preprocess_for_model(audio)
+        target_lang = options.get("language")
         while True:
             try:
-                segments, _ = self.model.transcribe(audio, **options)
-                return [_decoded(segment, offset) for segment in segments if segment.text.strip()]
+                segments, _ = self.model.transcribe(clean_audio, **options)
+                results: list[Decoded] = []
+                for segment in segments:
+                    if not segment.text.strip():
+                        continue
+                    row = _decoded(segment, offset)
+                    band = _segment_band_ratio(audio, float(segment.start), float(segment.end))
+                    if not is_silence_hallucination(row, band_ratio=band, language=target_lang):
+                        results.append(row)
+                return results
             except (OSError, RuntimeError) as error:
                 failure = self._cuda_failure(error)
                 if failure is None:
@@ -342,13 +380,18 @@ class FasterWhisperASR(ASRProvider):
 
         options, glossary, decode_guards = self._decode_options()
         quality_options = QualityOptions.from_config(self.acfg.get("quality", {}))
-        segments, info = self.model.transcribe(audio, **options)
+        model_audio = self._preprocess_for_model(audio)
+        segments, info = self.model.transcribe(model_audio, **options)
         detected_language = getattr(info, "language", None)
         decoded = []
         duration = len(audio) / TARGET_SR
         total = float(getattr(info, "duration", 0.0) or duration)
+        effective_lang = detected_language or options.get("language")
         for seg in segments:
-            decoded.append(_decoded(seg))
+            row = _decoded(seg)
+            band = _segment_band_ratio(audio, float(seg.start), float(seg.end))
+            if not is_silence_hallucination(row, band_ratio=band, language=effective_lang):
+                decoded.append(row)
             if progress_cb:
                 progress_cb(float(seg.end), total)
 
@@ -363,12 +406,17 @@ class FasterWhisperASR(ASRProvider):
 
         def retry(start: float, end: float) -> list[Decoded]:
             first, last = round(start * TARGET_SR), round(end * TARGET_SR)
-            clips, _ = self.model.transcribe(audio[first:last], **retry_options)
+            clips, _ = self.model.transcribe(model_audio[first:last], **retry_options)
             return [_decoded(seg, first / TARGET_SR) for seg in clips if seg.text.strip()]
 
         review_started = time.monotonic()
         utterances, quality_report = review(
-            decoded, duration, quality_options, lambda: _speech_spans(audio), retry
+            decoded,
+            duration,
+            quality_options,
+            lambda: _speech_spans(audio),
+            retry,
+            language=effective_lang,
         )
         if quality_options.mode != "off":
             quality_report["elapsed_sec"] = round(time.monotonic() - review_started, 3)

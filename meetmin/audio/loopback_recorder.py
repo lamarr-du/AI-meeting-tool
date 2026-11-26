@@ -129,6 +129,15 @@ class _AdaptiveLevel:
             # Taper off boost near the microphone noise floor without gating the signal.
             boost_fraction = max(0.0, min(1.0, (level - self.noise_floor) / self.noise_floor))
             gain_limit = 1.0 + (self.max_gain - 1.0) * boost_fraction
+        elif self.rate >= 8000 and frames >= 64 and level < 0.001:
+            # 抑制无人发言间隙的超低频电源/空调漂移底噪（< ~110 Hz）被数千倍放大导致静音幻觉；
+            # 恒定幅值合成信号（diff_rms == 0）或含人声谐波的轻声语音不受影响。
+            shaped = samples.reshape(frames, -1)
+            diff_rms = rms(np.diff(shaped, axis=0))
+            min_speech_slope = 2.0 * math.sin(math.pi * 110.0 / self.rate) * level
+            if 0.0 < diff_rms < min_speech_slope:
+                ratio = diff_rms / max(min_speech_slope, 1e-12)
+                gain_limit = min(self.max_gain, 1.0 + 3.0 * (ratio**4))
         # Leave peak headroom when boosting and pass normal-level audio through at unity gain.
         gain = max(1.0, min(self.target_rms / self.reference, gain_limit, 0.95 / peak))
         if self.gain is not None and gain > self.gain:

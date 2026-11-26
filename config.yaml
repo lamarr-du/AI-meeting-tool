@@ -29,21 +29,21 @@ asr:
   cuda_peak_mib: null        # 当前模型、计算类型及配置在目标 GPU 上的实测峰值
   beam_size: 1
   condition_on_previous_text: false  # 关闭前文条件；设为 true 恢复以前的行为
-  no_repeat_ngram_size: 0    # 全局禁重复 token n-gram，0 关闭
+  no_repeat_ngram_size: 4    # 全局禁重复 token n-gram，阻断复读死循环；0 关闭
   repetition_penalty: 1.0   # 全局重复惩罚，1.0 为无惩罚
-  hallucination_silence_threshold: null  # 秒，启用时需要 word_timestamps
+  hallucination_silence_threshold: 1.0  # 秒，跳过静音后的幻觉片段；启用时需要 word_timestamps
   quality:
-    mode: detect             # "off" 关闭 | detect 仅记录疑点 | retry 有限局部重试
+    mode: retry              # "off" 关闭 | detect 仅记录疑点 | retry 有限局部重试
     min_speech_gap_sec: 1.5
     compression_ratio_threshold: 2.4
     max_retries: 6           # 每条音轨的局部重试次数上限
   punctuation_prompt: null   # language 为 zh 时可选填，例如 "好的，我们继续。"
   hotwords: null             # 可填少量已确认的术语，和标点提示合并传给 faster-whisper
   glossary:
-    path: null              # 填 glossary.yaml 启用，相对本配置文件
+    path: glossary.yaml     # 启用识别前术语提示，相对本配置文件
     terms: null             # 可填标准写法列表，按提供的顺序优先发送
-    max_terms: 20
-    correction_path: null   # 填 glossary.yaml 启用转写后确定性纠错，可与识别前提示独立使用
+    max_terms: 24
+    correction_path: glossary.yaml  # 启用转写后确定性术语纠错，可与识别前提示独立使用
   word_timestamps: true      # 说话人分离对齐需要
   hf_endpoint: null          # 国内下不动模型时改: https://hf-mirror.com
   hf_disable_xet: true       # 规避 Xet 重建服务 401；需要 Xet 时设 false

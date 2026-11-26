@@ -58,6 +58,10 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[._,/+:-][A-Za-z0-9]+)*[+%#]*|[@#%&]|[\u
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _ASCII_WORD_START = re.compile(r"^[A-Za-z0-9_@]")
 _ASCII_WORD_END = re.compile(r"[A-Za-z0-9_+%#]$")
+_ASCII_CONNECTOR_END = re.compile(r"[A-Za-z0-9][._/-:+]$")
+_PURE_DIGITS = re.compile(r"^\d+$")
+_TRAILING_DECIMAL_DOT = re.compile(r"[A-Za-z0-9]\.$")
+_LEADING_ALNUM = re.compile(r"^[A-Za-z0-9]")
 
 
 @dataclass
@@ -131,7 +135,7 @@ def _interpolate_tokens(
 
 
 def _coalesce_whisper_words(words: list[dict], u: Utterance) -> list[tuple[str, int, int]]:
-    """合并 Whisper BPE 拆分出来的同一英文词片（如 're' + 'view' -> 'review'，' patch' 保持独立）。"""
+    """合并 Whisper BPE 拆分出来的同一英文/数字词片（如 're'+'view'->'review'，'0.'+'6'->'0.6'，'u.'+'j'+'son'->'u.json'）。"""
     merged: list[tuple[str, int, int]] = []
     for item in words:
         raw_w = str(item.get("w") or "")
@@ -144,8 +148,18 @@ def _coalesce_whisper_words(words: list[dict], u: Utterance) -> list[tuple[str, 
         if (
             merged
             and not has_leading_space
-            and _ASCII_WORD_END.search(merged[-1][0])
+            and (
+                _ASCII_WORD_END.search(merged[-1][0]) or _ASCII_CONNECTOR_END.search(merged[-1][0])
+            )
             and _ASCII_WORD_START.search(stripped)
+        ):
+            prev_w, prev_st, prev_ed = merged[-1]
+            merged[-1] = (prev_w + stripped, prev_st, max(prev_ed, ed))
+        elif (
+            merged
+            and not has_leading_space
+            and _ASCII_WORD_END.search(merged[-1][0])
+            and stripped in ".,/-:+"
         ):
             prev_w, prev_st, prev_ed = merged[-1]
             merged[-1] = (prev_w + stripped, prev_st, max(prev_ed, ed))
@@ -336,23 +350,49 @@ def reconstruct_sentences(
     spk_rate_ema: dict[str | int | None, float] = {}
     blocks: list[list[TokenSpan]] = []
     cur: list[TokenSpan] = []
+    prev_had_trailing_dot = False
 
     for u in utterances:
         new_tokens = tokenize_utterance(u)
         if not new_tokens:
             continue
+        raw_stripped = u.text.strip()
+        curr_trailing_dot = bool(_TRAILING_DECIMAL_DOT.search(raw_stripped))
         _update_rate_ema(new_tokens, spk_rate_ema)
         if not cur:
             cur = new_tokens
+            prev_had_trailing_dot = curr_trailing_dot
             continue
         curr_spk = cur[0].speaker
         gap_ms = new_tokens[0].start_ms - cur[-1].end_ms
+        # 修复实时滑窗硬切在小数点或扩展名点号处（如前一窗末尾 '0.' + 后一窗开头 '6米' -> '0.6'）
+        if (
+            prev_had_trailing_dot
+            and u.speaker == curr_spk
+            and gap_ms < 800
+            and cur[-1].is_ascii
+            and new_tokens[0].is_ascii
+            and _LEADING_ALNUM.search(raw_stripped)
+        ):
+            cur[-1] = TokenSpan(
+                f"{cur[-1].text}.{new_tokens[0].text}",
+                cur[-1].start_ms,
+                max(cur[-1].end_ms, new_tokens[0].end_ms),
+                curr_spk,
+                True,
+            )
+            new_tokens = new_tokens[1:]
+            if not new_tokens:
+                prev_had_trailing_dot = curr_trailing_dot
+                continue
+            gap_ms = new_tokens[0].start_ms - cur[-1].end_ms
         commit_pause_ms = _adaptive_commit_pause_ms(cur, new_tokens, spk_rate_ema)
         if u.speaker != curr_spk or gap_ms >= commit_pause_ms:
             blocks.append(cur)
             cur = new_tokens
         else:
             cur.extend(new_tokens)
+        prev_had_trailing_dot = curr_trailing_dot
     if cur:
         blocks.append(cur)
 
@@ -365,9 +405,17 @@ def reconstruct_sentences(
         ctx = left_context if (left_context_tokens > 0 and blk_spk == prev_speaker) else []
         full_tokens = ctx + [t.text for t in block]
         full_tags = punctuator.predict_tags(full_tokens)
-        blk_tags = full_tags[len(ctx) : len(ctx) + len(block)]
+        blk_tags = list(full_tags[len(ctx) : len(ctx) + len(block)])
         if len(blk_tags) < len(block):
             blk_tags.extend([""] * (len(block) - len(blk_tags)))
+        for idx_t in range(len(block) - 1):
+            if (
+                blk_tags[idx_t] == "。"
+                and _PURE_DIGITS.fullmatch(block[idx_t].text)
+                and _PURE_DIGITS.fullmatch(block[idx_t + 1].text)
+                and block[idx_t + 1].start_ms - block[idx_t].end_ms < 250
+            ):
+                blk_tags[idx_t] = ""
         reconstructed.extend(
             _split_block_to_sentences(
                 block,

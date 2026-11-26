@@ -23,6 +23,7 @@ from .asr.faster_whisper_asr import FasterWhisperASR
 from .asr.live_whisper import LiveTrack, ReviewSpan, review_redecode
 from .asr.quality import LIVE_REVIEW_TEXT, QualityOptions
 from .asr.zh_convert import to_simplified
+from .audio.dsp import highpass_speech
 from .audio.ring_buffer import SAMPLE_RATE, AudioEvent, PcmChunk
 from .config import deep_merge
 from .diarization.align import UNKNOWN_NAME, speaker_name
@@ -176,10 +177,11 @@ class LiveSessionCoordinator:
                     max_window_sec=self.max_window,
                     compression_ratio_threshold=self._quality.compression_ratio_threshold,
                     vad=lambda audio: get_speech_timestamps(
-                        audio,
-                        min_speech_duration_ms=64,
-                        min_silence_duration_ms=160,
-                        speech_pad_ms=0,
+                        highpass_speech(audio, SAMPLE_RATE),
+                        threshold=0.55,
+                        min_speech_duration_ms=180,
+                        min_silence_duration_ms=200,
+                        speech_pad_ms=40,
                     ),
                 )
                 for name in self.names
@@ -537,7 +539,12 @@ class LiveSessionCoordinator:
                 try:
                     audio, offset = _read_repair_clip(path, span)
                     decoded = provider.decode_window(audio, offset, options=options)
-                    result, reason = review_redecode(span, decoded, self._quality)
+                    result, reason = review_redecode(
+                        span,
+                        decoded,
+                        self._quality,
+                        language=self.pipe.cfg["asr"].get("language"),
+                    )
                     if result is None:
                         report["detail"] = reason
                     else:

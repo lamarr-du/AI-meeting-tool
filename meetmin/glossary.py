@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 
 
-def load_glossary(path: Path) -> list[dict]:
+def _load_single_glossary(path: Path) -> list[dict]:
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, yaml.YAMLError) as error:
@@ -21,6 +21,15 @@ def load_glossary(path: Path) -> list[dict]:
         if not isinstance(term, str) or not term.strip():
             raise ValueError(f"术语表 {path} 的第 {index} 条需要提供非空 term")
         entries.append({**entry, "term": term.strip()})
+    return entries
+
+
+def load_glossary(path: Path) -> list[dict]:
+    entries = _load_single_glossary(path)
+    if path.name == "glossary.yaml":
+        local_path = path.with_name("glossary.local.yaml")
+        if local_path.is_file():
+            entries.extend(_load_single_glossary(local_path))
     return entries
 
 

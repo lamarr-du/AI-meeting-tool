@@ -333,6 +333,28 @@ def test_loopback_boost_preserves_stereo_balance_and_peak_headroom(recording):
     assert stereo[4800, 1] == round(-0.95 * 32768)
 
 
+def test_loopback_suppresses_sub_100hz_hum_amplification_while_boosting_quiet_voice():
+    recorder = LoopbackRecorder(target_rms=0.05)
+    sr = 48000
+    t = np.arange(4800, dtype=np.float32) / sr
+
+    # 极微弱 50 Hz 电源哼声（RMS ~ 0.0002）：不应被暴力拉高到 target_rms=0.05
+    hum_50 = (0.00028 * np.sin(2 * np.pi * 50.0 * t)).astype("<f4")
+    ctrl_hum = recorder._create_level_control(sr, {"isLoopbackDevice": True})
+    assert ctrl_hum is not None
+    out_hum = np.frombuffer(ctrl_hum.to_pcm(hum_50.tobytes(), len(hum_50)), dtype="<i2") / 32768.0
+    assert float(np.sqrt(np.mean(out_hum**2))) < 0.01
+
+    # 同等微弱幅度的 500 Hz 真实人声频段：应正常全额增益补偿到接近 target_rms=0.05
+    voice_500 = (0.00028 * np.sin(2 * np.pi * 500.0 * t)).astype("<f4")
+    ctrl_voice = recorder._create_level_control(sr, {"isLoopbackDevice": True})
+    assert ctrl_voice is not None
+    out_voice = (
+        np.frombuffer(ctrl_voice.to_pcm(voice_500.tobytes(), len(voice_500)), dtype="<i2") / 32768.0
+    )
+    assert float(np.sqrt(np.mean(out_voice**2))) == pytest.approx(0.05, abs=0.003)
+
+
 def test_session_recording_saves_and_recovers_16k_mono_tracks(recording, tmp_path):
     r = recording
     recorder = Pipeline(

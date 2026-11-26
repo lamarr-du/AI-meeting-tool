@@ -64,6 +64,23 @@ def test_resample_length_and_energy():
     assert 0.3 < dsp.rms(y) < 0.9
 
 
+def test_highpass_speech_suppresses_sub_80hz_hum_and_preserves_voice_band():
+    sr = 16000
+    t = np.arange(sr * 2, dtype=np.float32) / sr
+    hum_50hz = 0.08 * np.sin(2 * math.pi * 50 * t)
+    voice_600hz = 0.08 * np.sin(2 * math.pi * 600 * t)
+    mixed = (hum_50hz + voice_600hz).astype(np.float32)
+
+    assert dsp.speech_band_ratio(hum_50hz, sr) < 0.02
+    assert dsp.speech_band_ratio(voice_600hz, sr) > 0.95
+
+    filtered_hum = dsp.highpass_speech(hum_50hz, sr)
+    filtered_mixed = dsp.highpass_speech(mixed, sr)
+    assert dsp.rms(filtered_hum) < 0.01
+    # 零相位滤波不应改变 600 Hz 主语音分量的相位与幅度
+    assert np.max(np.abs(filtered_mixed[200:-200] - voice_600hz[200:-200])) < 0.005
+
+
 def test_wav_roundtrip():
     with _TmpDir() as td:
         p = Path(td) / "a.wav"
@@ -1356,6 +1373,81 @@ def test_tokenize_utterance_coalesces_whisper_bpe_and_preserves_special_tokens()
     assert "v1.2" in texts
     assert "1,024" in texts
     assert "large-v3-turbo" in texts
+
+    # Whisper 将小数与扩展名拆成 '0.' + '6' 或 'Vidu.' + 'j' + 'son' 时应无损合并
+    u3 = Utterance(
+        start=10.0,
+        end=12.0,
+        text="更新了Vidu.json且距离0.6米",
+        speaker="说话人A",
+        words=[
+            {"w": "更新了", "s": 10.0, "e": 10.4},
+            {"w": "V", "s": 10.4, "e": 10.5},
+            {"w": "idu.", "s": 10.5, "e": 10.7},
+            {"w": "j", "s": 10.7, "e": 10.8},
+            {"w": "son", "s": 10.8, "e": 11.0},
+            {"w": "且距离", "s": 11.0, "e": 11.3},
+            {"w": "0.", "s": 11.3, "e": 11.5},
+            {"w": "6", "s": 11.5, "e": 11.7},
+            {"w": "米", "s": 11.7, "e": 12.0},
+        ],
+    )
+    spans3 = tokenize_utterance(u3)
+    texts3 = [s.text for s in spans3]
+    assert "Vidu.json" in texts3
+    assert "0.6" in texts3
+
+
+def test_reconstruct_sentences_stitches_cross_window_decimals_and_keeps_words_atomic():
+    from meetmin.asr.punctuation import reconstruct_sentences
+
+    class AggressivePeriodPunc:
+        name = "aggressive"
+
+        def predict_tags(self, tokens: list[str]) -> list[str]:
+            tags = [""] * len(tokens)
+            if tags:
+                tags[-1] = "。"
+            return tags
+
+    # 实时滑窗切在 '0.' 与 '6米' 之间时应自动缝合为 '0.6'
+    u_a = Utterance(
+        0.0,
+        1.0,
+        "它不在0.",
+        speaker="说话人A",
+        words=[{"w": "它不在", "s": 0.0, "e": 0.7}, {"w": "0.", "s": 0.7, "e": 1.0}],
+    )
+    u_b = Utterance(
+        1.05,
+        2.0,
+        "6米范围内",
+        speaker="说话人A",
+        words=[{"w": "6", "s": 1.05, "e": 1.25}, {"w": "米范围内", "s": 1.25, "e": 2.0}],
+    )
+    reconstructed = reconstruct_sentences(
+        [u_a, u_b], language="zh", punctuator=AggressivePeriodPunc()
+    )
+    assert len(reconstructed) == 1
+    assert "0.6 米" in reconstructed[0].text
+
+    # 说话人边界刚好落在单个英文单词 BPE 子词中间（如 ' com' + 'ment'）时，禁止把单词劈成两半
+    segments = [{"start": 0.0, "end": 1.5, "label": 0}, {"start": 1.5, "end": 3.0, "label": 1}]
+    u_split = Utterance(
+        0.5,
+        2.8,
+        "看有什么 comment 没有",
+        words=[
+            {"w": "看有什么", "s": 0.5, "e": 1.35},
+            {"w": " com", "s": 1.38, "e": 1.49},
+            {"w": "ment", "s": 1.51, "e": 1.65},
+            {"w": "没有", "s": 2.1, "e": 2.8},
+        ],
+    )
+    assigned = assign_speakers([u_split], segments, min_group_sec=0.2)
+    joined_texts = [item.text for item in assigned]
+    assert any("comment" in t for t in joined_texts)
+    assert not any(t.endswith("com") or t.startswith("ment") for t in joined_texts)
 
 
 def test_reconstruct_sentences_merges_code_switch_and_tracks_timestamps():

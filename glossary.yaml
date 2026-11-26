@@ -1,31 +1,41 @@
 terms:
+  # --- 核心 ISP / 算法 / 硬件高频模块（按识别前 hotwords 注入优先级排序） ---
   - term: demosaic
+    aliases:
+      - DMSC
     mishearings:
       - 迪马斯克
       - 迪马森克
       - 迪马赛克
       - 迪马塞克
-  - term: bypass
+      - 迪玛塞克
+      - DMSEC
+
+  - term: remosaic
     mishearings:
-      - 拍片上
-      - 拍不上
-      - 单拍不
-      - 拍摄上
-      - type 上
-  - term: white level
+      - 瑞玛赛克
+      - 瑞马赛克
+      - 里马尔索
+
+  - term: VDPP
     mishearings:
-      - 外他 level
-      - 外特来往
-      - Wet Level
-      - wattlevel
-  - term: constrain
+      - VDBB
+
+  - term: SCPP
     mishearings:
-      - 坑寸
-      - 坑村
-      - kontrains
-  - term: workaround
+      - ICPP
+
+  - term: SSPP
+
+  - term: YSC
     mishearings:
-      - walk around
+      - YAC
+      - WiseGaler
+      - VSkyler
+      - 瓦埃西
+
+  - term: AINR
+
   - term: DRC Stat
     aliases:
       - DRCST
@@ -34,6 +44,266 @@ terms:
       - DRC STD
       - drcstata
       - DRCState
+      - DLCST
+      - DLCAPT
+
+  - term: DRC
+    aliases:
+      - drc04
+      - drc09
+      - drc10
+    mishearings:
+      - DLCLINX
+
+  - term: REAE
+    needs_context: false
+    mishearings:
+      - 锐义
+      - 雷一
+      - REA
+
+  - term: LSC
+
+  - term: BLC
+    aliases:
+      - BLC07
+
+  - term: FBC
+    mishearings:
+      - LBC
+
+  - term: deepCABAC
+    mishearings:
+      - DeepCup Web
+      - Deep CABAC
+
+  - term: GDC
+    mishearings:
+      - GTC
+
+  - term: EIS
+    mishearings:
+      - ESBuffer
+      - ESMesh
+
+  - term: SAT
+
+  - term: MATF
+    mishearings:
+      - MHF
+      - RATF
+
+  - term: LCE
+
+  - term: C model
+    aliases:
+      - CModel
+    needs_context: false
+    mishearings:
+      - Cmod
+      - SIMO
+      - 新毛子
+
+  - term: PSNR
+    mishearings:
+      - PSLR
+
+  - term: guided filter
+    mishearings:
+      - GADD 的 Filtre
+      - GADD的Filtre
+
+  - term: ablation
+    mishearings:
+      - Avulation
+
+  - term: baseline
+    needs_context: false
+    mishearings:
+      - Basedline
+      - Benson 案
+      - Benson案
+      - 对斯坦
+
+  - term: sharpen
+    needs_context: false
+    mishearings:
+      - Shashan
+      - Shopin
+      - SharpN
+      - SAPNOTS
+      - 沙本
+      - 沙汉
+      - 沙粉
+      - 夏分
+
+  - term: grain
+    mishearings:
+      - Graner
+      - Rainby
+
+  - term: Live View
+    aliases:
+      - LiveView
+    mishearings:
+      - 来 VIO
+      - 来VIO
+      - LiveU
+
+  - term: IAC4
+    mishearings:
+      - IACC
+
+  - term: A300
+
+  - term: A500
+
+  - term: bypass
+    needs_context: false
+    mishearings:
+      - 拍片上
+      - 拍不上
+      - 派不上
+      - 单拍不
+      - 拍摄上
+      - type 上
+
+  - term: constrain
+    needs_context: false
+    mishearings:
+      - 坑寸
+      - 坑村
+      - kontrains
+
+  # --- 更多 ISP 模块、数值格式与通用技术术语纠错 ---
+  - term: rfus
+    needs_context: false
+    mishearings:
+      - 阿非诱子
+      - 阿菲兰
+
+  - term: align05
+    mishearings:
+      - 瓦兰 05
+      - 瓦兰05
+
+  - term: align_bin
+    needs_context: false
+    mishearings:
+      - 瓦兰病
+      - 俄兰斌
+
+  - term: align_det
+    mishearings:
+      - 瓦兰 detect
+      - Olan Detects
+
+  - term: gamma 和反 gamma
+    mishearings:
+      - 感冒和反感冒
+      - 噶麻和反噶麻
+
+  - term: 反 gamma
+    needs_context: false
+    mishearings:
+      - 反感冒
+      - 反噶麻
+
+  - term: 2D LUT
+    mishearings:
+      - 2DLAT
+
+  - term: 3D LUT
+    mishearings:
+      - 3DLUK
+      - 3DLADDG
+
+  - term: Lens Shading
+    mishearings:
+      - Less Shading
+
+  - term: Mesh flow
+
+  - term: RANSAC
+    mishearings:
+      - Ransack
+
+  - term: video.json
+    mishearings:
+      - Vidu.json
+      - VideJSense
+
+  - term: Binary EXE
+    mishearings:
+      - BundaryEXE
+
+  - term: white level
+    mishearings:
+      - 外他 level
+      - 外特来往
+      - Wet Level
+      - wattlevel
+
+  - term: workaround
+    mishearings:
+      - walk around
+
+  - term: int8
+    needs_context: false
+    mishearings:
+      - 印的 8
+      - 印的8
+      - 印度 8
+      - 印度8
+
+  - term: int16
+    needs_context: false
+    mishearings:
+      - 印的 16
+      - 印的16
+      - 印度 16
+      - 印度16
+
+  - term: 16x
+    needs_context: false
+    mishearings:
+      - 水流叉
+      - 石榴叉
+
+  - term: 熵编码
+    needs_context: false
+    mishearings:
+      - 上编码
+      - 上边码
+
+  - term: 码流
+    needs_context: false
+    mishearings:
+      - 马力欧
+      - 瓦流
+
+  - term: 鲁棒性
+    needs_context: false
+    mishearings:
+      - 鲁邦性
+
+  - term: 伪色
+    needs_context: false
+    mishearings:
+      - 尾色
+
+  - term: 伪彩
+    needs_context: false
+    mishearings:
+      - 尾彩
+
+  - term: 图集
+    needs_context: true
+    mishearings:
+      - 突击
+      - 图级
+      - 图记
+
   - term: "@"
     mishearings:
       - 爱他
