@@ -133,6 +133,7 @@ class SessionRecorder:
                         "no_data_sec",
                         "timing_mode",
                         "repaired_timestamp_blocks",
+                        "last_timestamp_overlap",
                         "stream_restart_attempts",
                         "stream_restarts",
                         "error",

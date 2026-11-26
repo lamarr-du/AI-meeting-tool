@@ -657,6 +657,80 @@ def test_adc_ahead_of_callback_does_not_abort_contiguous_audio(recording):
     np.testing.assert_array_equal(read_audio(r.path), np.full(300, 1000))
 
 
+def test_live_timestamp_overlap_keeps_dual_tracks_and_real_gaps(recording, tmp_path):
+    r = recording
+    r.rec.sample_rate = 16000
+    recorder = SessionRecorder(r.rec, MicrophoneRecorder(clock=r.clock, sample_rate=16000))
+    live_repair = threading.Event()
+
+    def tap(track, event):
+        if track == "loopback" and isinstance(event, PcmChunk) and event.start == 1600:
+            live_repair.set()
+
+    recorder.set_audio_tap(tap)
+    session = Session(tmp_path, "repaired-overlap")
+    recorder.start(session)
+    loopback, microphone = r.streams
+    for index in range(7):
+        position = index / 10
+        if index in (0, 2, 6):
+            loopback.emit(position, value=1000 + index * 1000, frames=1600)
+        elif index == 1:
+            loopback.emit(0.04, value=2000, frames=1600, received=10.2)
+        microphone.emit(position, value=6000, frames=1600)
+        if index == 2:
+            repaired_while_recording = live_repair.wait(1)
+
+    info = recorder.stop()
+    assert repaired_while_recording
+    assert info["repaired_timestamp_blocks"] == 1
+    assert info["padded_sec"] == pytest.approx(0.3)
+    assert info["microphone"]["repaired_timestamp_blocks"] == 0
+    loopback_wav, microphone_wav = session.recording_paths()
+    assert microphone_wav is not None
+    np.testing.assert_array_equal(
+        read_audio(loopback_wav, 16000),
+        np.repeat([1000, 2000, 3000, 0, 7000], [1600, 1600, 1600, 4800, 1600]),
+    )
+    np.testing.assert_array_equal(read_audio(microphone_wav, 16000), np.full(11200, 6000))
+    entry = json.loads((session.root / RECORDING_DIAGNOSTICS).read_text("utf-8").splitlines()[-1])
+    assert entry["event"] == "recording.stopped"
+    overlap = entry["tracks"]["loopback"]["last_timestamp_overlap"]
+    assert overlap["repaired"] is True
+    assert (overlap["cursor_frames"], overlap["target_frames"]) == (1600, 640)
+    assert overlap["adc_sec"] == pytest.approx(0.04)
+    assert overlap["next_adc_sec"] == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize(
+    ("next_position", "next_received"),
+    [(None, None), (0.12, 10.3), (0.29, 10.3), (0.2, 10.8)],
+    ids=["no-anchor", "continued-overlap", "gap", "late-callback"],
+)
+def test_overlapping_timestamp_without_contiguous_anchor_preserves_written_audio(
+    recording, next_position, next_received
+):
+    r = recording
+    r.rec.start(r.path)
+    stream = r.streams[-1]
+    stream.emit(0, value=1000)
+    stream.emit(0.04, value=2000, received=10.2)
+    if next_position is not None:
+        stream.emit(next_position, value=3000, received=next_received)
+
+    with pytest.raises(RecordingError, match="严重重叠") as error:
+        r.rec.stop()
+
+    info = error.value.info
+    assert info["repaired_timestamp_blocks"] == 0
+    overlap = info["last_timestamp_overlap"]
+    assert overlap["repaired"] is False
+    assert overlap["next_adc_sec"] == (
+        pytest.approx(next_position) if next_position is not None else None
+    )
+    np.testing.assert_array_equal(recover_failed(r.path), np.full(100, 1000))
+
+
 @pytest.mark.parametrize("position", [-1, 0.02, 10000])
 def test_broken_timestamps_do_not_silently_drop_or_pad_audio(recording, position):
     r = recording
