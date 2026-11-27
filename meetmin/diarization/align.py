@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from bisect import bisect_right
 from dataclasses import replace
 from math import isclose
@@ -12,6 +13,8 @@ from ..textutil import smart_join
 UNKNOWN = -999
 UNKNOWN_NAME = "未知"
 _MAX_NEAREST_GAP_SEC = 0.75
+_ASCII_CONT_LEFT = re.compile(r"[A-Za-z0-9._/-]$")
+_ASCII_CONT_RIGHT = re.compile(r"^[A-Za-z0-9._/-]")
 
 
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
@@ -77,6 +80,26 @@ def _word_span(w: dict, u: Utterance) -> tuple[float, float]:
     return s, max(s, e)
 
 
+def _group_atomic_words(words: list[dict], u: Utterance) -> list[list[dict]]:
+    """将 Whisper 拆分的同一英文/小数 BPE 子词绑定为不可切分原子组，防止换人点劈开单词（如 com+ment、i+Phone、0.+6）。"""
+    units: list[list[dict]] = []
+    for w in words:
+        raw = str(w.get("w") or "")
+        stripped = raw.strip()
+        if (
+            units
+            and stripped
+            and not raw[:1].isspace()
+            and _ASCII_CONT_LEFT.search(str(units[-1][-1].get("w") or "").strip())
+            and _ASCII_CONT_RIGHT.search(stripped)
+            and _word_span(w, u)[0] - _word_span(units[-1][-1], u)[1] <= 0.25
+        ):
+            units[-1].append(w)
+        else:
+            units.append([w])
+    return units
+
+
 def assign_speakers(
     utterances: list[Utterance],
     segments: list[dict],
@@ -102,24 +125,27 @@ def assign_speakers(
             out.append(replace(u, speaker=base))
             continue
 
-        # 逐词取说话人，落在两段之间的空隙词沿用句级多数
-        word_labels = []
-        for w in u.words:
-            s, e = _word_span(w, u)
+        # 按原子词组取说话人，落在两段之间的空隙词沿用句级多数
+        units = _group_atomic_words(u.words, u)
+        if len(units) < 2:
+            out.append(replace(u, speaker=base))
+            continue
+
+        groups: list[list] = []
+        for unit in units:
+            s = _word_span(unit[0], u)[0]
+            e = _word_span(unit[-1], u)[1]
             mid = (s + e) / 2
             lab = (
                 _speaker_at_point_sorted(mid, segments, seg_starts)
                 if sorted_fast
                 else speaker_at_point(mid, segments)
             )
-            word_labels.append(base if lab is None else lab)
-
-        groups: list[list] = []
-        for w, lab in zip(u.words, word_labels):
-            if groups and groups[-1][0] == lab:
-                groups[-1][1].append(w)
+            resolved = base if lab is None else lab
+            if groups and groups[-1][0] == resolved:
+                groups[-1][1].extend(unit)
             else:
-                groups.append([lab, [w]])
+                groups.append([resolved, list(unit)])
 
         # 平滑：过短的说话人片段并入相邻片段（优先并入前段）
         changed = True
@@ -150,7 +176,11 @@ def assign_speakers(
             continue
 
         for lab, ws in groups:
-            text = smart_join([w.get("w", "") for w in ws])
+            atomic = [
+                "".join(str(item.get("w") or "").strip() for item in unit)
+                for unit in _group_atomic_words(ws, u)
+            ]
+            text = smart_join(atomic)
             if not text:
                 continue
             out.append(

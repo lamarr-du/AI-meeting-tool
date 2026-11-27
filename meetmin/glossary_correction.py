@@ -49,12 +49,13 @@ def _rules(entries: list[dict]) -> list[_Rule]:
             if alias.casefold() != term.casefold():
                 register(_Rule(alias, alias, "case"))
     for entry in entries:
-        needs_context = entry.get("needs_context", False)
-        if type(needs_context) is not bool:
+        explicit_context = entry.get("needs_context")
+        if explicit_context is not None and type(explicit_context) is not bool:
             raise ValueError(f"术语 {entry['term']!r} 的 needs_context 必须是布尔值")
         for source in _strings(entry, "mishearings"):
             short_han = bool(_HAN.search(source)) and sum(c.isalnum() for c in source) <= 3
-            register(_Rule(source, entry["term"], "mishearing", needs_context or short_han))
+            effective_needs_context = short_han if explicit_context is None else explicit_context
+            register(_Rule(source, entry["term"], "mishearing", effective_needs_context))
     return sorted(rules.values(), key=lambda rule: len(rule.source), reverse=True)
 
 

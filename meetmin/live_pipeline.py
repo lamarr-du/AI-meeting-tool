@@ -22,7 +22,9 @@ from .asr.base import ASRResult, Utterance
 from .asr.faster_whisper_asr import FasterWhisperASR
 from .asr.live_whisper import LiveTrack, ReviewSpan, review_redecode
 from .asr.quality import LIVE_REVIEW_TEXT, QualityOptions
+from .asr.whisper_scheduler import Priority, SchedulingError, WaitTime, WhisperScheduler
 from .asr.zh_convert import to_simplified
+from .audio.dsp import highpass_speech
 from .audio.ring_buffer import SAMPLE_RATE, AudioEvent, PcmChunk
 from .config import deep_merge
 from .diarization.align import UNKNOWN_NAME, speaker_name
@@ -45,6 +47,7 @@ class LiveSessionCoordinator:
         *,
         dual_track: bool,
         renames: SpeakerRenames | None = None,
+        scheduler: WhisperScheduler | None = None,
     ):
         live = cfg.get("live") or {}
         self.hop = float(live.get("hop_sec", 1.8))
@@ -103,6 +106,16 @@ class LiveSessionCoordinator:
         self.session = session
         self.emit = emit
         self.names = ("loopback", "microphone") if dual_track else ("loopback",)
+        self._scheduler = scheduler
+        self._wait_time = WaitTime() if scheduler is not None else None
+        self._archiving = Event()
+        self._capacity = round(self.ring_sec * SAMPLE_RATE)
+        reserve = round(min(self.max_window, self.ring_sec / 3) * SAMPLE_RATE)
+        self._high_water = self._capacity - reserve
+        self._low_water = self._high_water - reserve
+        self._catching_up = False
+        self._received = dict.fromkeys(self.names, 0)
+        self._oldest_needed = dict.fromkeys(self.names, 0)
         self._inbox: Queue[tuple[str, AudioEvent]] = Queue(maxsize=2048)
         self._input_done = Event()
         self._live_done = Event()
@@ -149,6 +162,12 @@ class LiveSessionCoordinator:
     def feed(self, track: str, event: AudioEvent) -> None:
         if self._cancelled.is_set() or self._overflow.is_set():
             return
+        if self._scheduler is not None and isinstance(event, PcmChunk):
+            end = event.start + len(event.pcm) // 2
+            self._received[track] = end
+            if end - self._oldest_needed[track] > self._capacity:
+                self._overflow.set()
+                return
         try:
             self._inbox.put_nowait((track, event))
         except Full:
@@ -159,6 +178,31 @@ class LiveSessionCoordinator:
         self._cancelled.set()
         self._voice_cancelled.set()
 
+    def archive_started(self) -> None:
+        self._archiving.set()
+
+    def _check_input(self) -> None:
+        if self._overflow.is_set():
+            raise SchedulingError("实时音频积压超出缓冲区")
+        if self._cancelled.is_set():
+            raise SchedulingError("实时转写已停止")
+
+    def _lag_samples(self) -> int:
+        return max(self._received[name] - self._oldest_needed[name] for name in self.names)
+
+    def _inference_priority(self) -> Priority:
+        if self._archiving.is_set():
+            return Priority.BACKGROUND
+        threshold = self._low_water if self._catching_up else self._high_water
+        return Priority.CATCH_UP if self._lag_samples() >= threshold else Priority.LIVE
+
+    def close(self) -> None:
+        """Wait for the model owner and the voice worker after cancelling input."""
+        self.cancel()
+        self._thread.join()
+        if self._voice_thread is not None:
+            self._voice_thread.join()
+
     def _status(self, message: str) -> None:
         if not self._cancelled.is_set():
             self.emit({"type": "live.status", "message": message})
@@ -168,7 +212,7 @@ class LiveSessionCoordinator:
         try:
             from faster_whisper.vad import get_speech_timestamps
 
-            self._status("正在加载本地实时转写模型…")
+            self._status("正在准备实时转写模型…")
             self._tracks = {
                 name: LiveTrack(
                     ring_sec=self.ring_sec,
@@ -176,16 +220,29 @@ class LiveSessionCoordinator:
                     max_window_sec=self.max_window,
                     compression_ratio_threshold=self._quality.compression_ratio_threshold,
                     vad=lambda audio: get_speech_timestamps(
-                        audio,
-                        min_speech_duration_ms=64,
-                        min_silence_duration_ms=160,
-                        speech_pad_ms=0,
+                        highpass_speech(audio, SAMPLE_RATE),
+                        threshold=0.55,
+                        min_speech_duration_ms=180,
+                        min_silence_duration_ms=200,
+                        speech_pad_ms=40,
                     ),
                 )
                 for name in self.names
             }
+            options_for_scheduler: dict[str, Any] = (
+                {
+                    "scheduler": self._scheduler,
+                    "live_priority": self._inference_priority,
+                    "check_input": self._check_input,
+                    "wait_time": self._wait_time,
+                }
+                if self._scheduler is not None
+                else {}
+            )
             provider = FasterWhisperASR(
-                self.pipe.cfg["asr"], model_cache_dir=self.pipe.cfg.get("model_cache_dir")
+                self.pipe.cfg["asr"],
+                model_cache_dir=self.pipe.cfg.get("model_cache_dir"),
+                **options_for_scheduler,
             )
             options = provider.build_stream_options()
             self._metadata = provider.stream_metadata()
@@ -205,8 +262,9 @@ class LiveSessionCoordinator:
                     provider, options, {"loopback": audio, "microphone": microphone}
                 )
         except Exception as exc:
-            self.error = str(exc)
-            self._status(f"实时转写已暂停，录音继续保存 · {exc}")
+            self.error = self.error or str(exc)
+            resume = "，停录后自动转写" if self._scheduler is not None else ""
+            self._status(f"实时转写已暂停，录音继续保存{resume} · {exc}")
             self.cancel()
         finally:
             try:
@@ -226,7 +284,9 @@ class LiveSessionCoordinator:
                 except Empty:
                     break
                 self._feed_track(name, event)
-            if self._overflow.is_set():
+            if self._scheduler is not None:
+                provider.check_available()
+            elif self._overflow.is_set():
                 raise RuntimeError("实时音频已积压，保存的 WAV 可用于重新转写")
             if not closing and self._input_done.is_set() and self._inbox.empty():
                 for track in self._tracks.values():
@@ -235,11 +295,22 @@ class LiveSessionCoordinator:
 
             active = sum(track.has_speech for track in self._tracks.values())
             hop_seconds = min(self.slow_hop, max(self.hop, decode_seconds * active * 1.2))
+            catching_up = (
+                self._scheduler is not None and self._inference_priority() == Priority.CATCH_UP
+            )
+            if catching_up != self._catching_up:
+                self._catching_up = catching_up
+                self._status(
+                    "实时转写正在追赶录音…"
+                    if catching_up
+                    else f"实时转写 · {self._metadata['effective_device'].upper()}"
+                )
             hop = round(hop_seconds * SAMPLE_RATE)
             windows = [
                 (name, window)
                 for name, track in self._tracks.items()
                 if (window := track.next_window(hop)) is not None
+                and (not catching_up or window.final or window.capped)
             ]
             if not windows:
                 if closing:
@@ -250,11 +321,14 @@ class LiveSessionCoordinator:
                     continue
                 self._feed_track(name, event)
                 continue
-            name, window = min(windows, key=lambda item: (not item[1].final, item[1].due))
+            name, window = min(
+                windows, key=lambda item: (not (item[1].final or item[1].capped), item[1].due)
+            )
             started = monotonic()
             result, draft = self._tracks[name].decode(
                 window, lambda audio, offset: provider.decode_window(audio, offset, options=options)
             )
+            self._oldest_needed[name] = self._tracks[name].oldest_needed_sample
             if self._cancelled.is_set():
                 return
             elapsed = monotonic() - started
@@ -279,7 +353,9 @@ class LiveSessionCoordinator:
                 self.emit({"type": "asr.interim", "track": name, "text": to_simplified(draft)})
 
     def _feed_track(self, name: str, event: AudioEvent) -> None:
-        self._tracks[name].feed(event)
+        track = self._tracks[name]
+        track.feed(event)
+        self._oldest_needed[name] = track.oldest_needed_sample
         if self._voice_enabled and name == "loopback" and isinstance(event, PcmChunk):
             pcm = np.frombuffer(event.pcm, dtype="<i2").astype("<f4") / 32768.0
             self._audio_hash.update(pcm)
@@ -444,11 +520,21 @@ class LiveSessionCoordinator:
 
     def finish(self) -> dict | None:
         """录音成功封存后冲刷尾窗，再交给标准离线产物整理。"""
+        self.archive_started()
         self._input_done.set()
         deadline = monotonic() + self.flush_timeout
-        if not self._live_done.wait(self.flush_timeout):
-            self.error = "实时转写收尾超时"
-            self.cancel()
+        if self._wait_time is None:
+            if not self._live_done.wait(self.flush_timeout):
+                self.error = "实时转写收尾超时"
+                self.cancel()
+        else:
+            started_wait = self._wait_time.seconds()
+            while not self._live_done.wait(0.05):
+                if monotonic() >= deadline + self._wait_time.seconds() - started_wait:
+                    self.error = "实时转写收尾超时"
+                    self.cancel()
+                    break
+            deadline += self._wait_time.seconds() - started_wait
         if self.error is not None:
             return None
         self._voice_done.set()
@@ -537,13 +623,20 @@ class LiveSessionCoordinator:
                 try:
                     audio, offset = _read_repair_clip(path, span)
                     decoded = provider.decode_window(audio, offset, options=options)
-                    result, reason = review_redecode(span, decoded, self._quality)
+                    result, reason = review_redecode(
+                        span,
+                        decoded,
+                        self._quality,
+                        language=self.pipe.cfg["asr"].get("language"),
+                    )
                     if result is None:
                         report["detail"] = reason
                     else:
                         result.speaker = self._utterances[name][index].speaker
                         self._utterances[name][index] = replacements[segment_id] = result
                         report["status"] = "accepted"
+                except SchedulingError:
+                    raise
                 except Exception as exc:
                     report["detail"] = f"{type(exc).__name__}: {exc}"
                 report["elapsed_sec"] = round(monotonic() - started, 3)

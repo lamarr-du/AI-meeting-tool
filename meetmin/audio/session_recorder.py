@@ -151,7 +151,8 @@ class SessionRecorder:
         except OSError:
             logging.getLogger("meetmin").warning("无法写入会话录音诊断日志", exc_info=True)
 
-    def stop(self) -> dict:
+    def stop(self, *, on_device_released: Callable[[], None] | None = None) -> dict:
+        """关闭音频设备，随后合并并发布 WAV。"""
         if self._lock is None:
             raise RuntimeError("未在录音")
         end = self._recorders[0]._now()
@@ -162,6 +163,13 @@ class SessionRecorder:
 
         # Stop both producers before draining the queues and merging either WAV.
         closed = [recorder._close_stream() for recorder in self._prepared]
+        if on_device_released is not None and all(closed):
+            released = [recorder._release_device() for recorder in self._prepared]
+            if all(released):
+                try:
+                    on_device_released()
+                except Exception:
+                    logging.getLogger("meetmin").exception("无法通知音频设备已释放")
         errors = []
         tracks = []
         for recorder, can_finish, (track, _) in zip(self._prepared, closed, TRACKS):

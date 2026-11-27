@@ -72,7 +72,11 @@ class ReviewSpan:
 
 
 def review_redecode(
-    span: ReviewSpan, decoded: list[Decoded], options: QualityOptions
+    span: ReviewSpan,
+    decoded: list[Decoded],
+    options: QualityOptions,
+    *,
+    language: str | None = None,
 ) -> tuple[Utterance | None, str | None]:
     candidate = []
     words = []
@@ -85,7 +89,7 @@ def review_redecode(
         words.extend(inside)
         candidate.append(replace(row, utterance=_utterance(inside)))
     if reason := reject_replacement(
-        (span.start, span.end), candidate, [], options, min_coverage=0.5
+        (span.start, span.end), candidate, [], options, min_coverage=0.5, language=language
     ):
         return None, reason
     result = _utterance(words)
@@ -191,6 +195,14 @@ class LiveTrack:
     @property
     def has_speech(self) -> bool:
         return bool(self._speech)
+
+    @property
+    def oldest_needed_sample(self) -> int:
+        scan_start = max(self._speech_floor, self._scanned - SAMPLE_RATE)
+        if not self._speech:
+            return scan_start
+        region = self._speech[0]
+        return min(scan_start, max(region.start, region.floor - _PRE_ROLL))
 
     def next_window(self, hop: int) -> Window | None:
         if not self._speech:

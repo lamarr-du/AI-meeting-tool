@@ -7,7 +7,7 @@ import pytest
 
 from meetmin.asr.base import Utterance
 from meetmin.asr.faster_whisper_asr import FasterWhisperASR
-from meetmin.asr.quality import Decoded, QualityOptions, review
+from meetmin.asr.quality import Decoded, QualityOptions, is_silence_hallucination, review
 from meetmin.audio.dsp import TARGET_SR, save_wav_mono
 from meetmin.pipeline import Pipeline
 
@@ -137,3 +137,55 @@ def test_global_hallucination_guard_requires_word_timestamps():
     asr._device = "cpu"
     with pytest.raises(ValueError, match="需要 asr.word_timestamps"):
         asr.transcribe(np.zeros(TARGET_SR, dtype=np.float32))
+
+
+def test_silence_hallucination_guard_filters_low_confidence_phrases_and_preserves_real_thanks():
+    # 模拟 large-v3-turbo 在低频底噪上输出 no_speech_prob=0.0 但对数概率与词概率极低的幻觉
+    hallu_thanks = Decoded(
+        Utterance(20.5, 21.1, "谢谢大家"),
+        compression_ratio=0.8,
+        avg_logprob=-0.89,
+        no_speech_prob=0.0,
+        mean_word_prob=0.28,
+    )
+    hallu_sleepy = Decoded(
+        Utterance(61.0, 61.9, "Sleepy state."),
+        compression_ratio=0.9,
+        avg_logprob=-1.91,
+        no_speech_prob=0.0,
+        mean_word_prob=0.08,
+    )
+    hallu_hum = Decoded(
+        Utterance(10.0, 11.2, "再去怒了"),
+        compression_ratio=0.9,
+        avg_logprob=-0.85,
+        no_speech_prob=0.0,
+        mean_word_prob=0.32,
+    )
+    real_closing = Decoded(
+        Utterance(5592.7, 5597.6, "我们今天就先到这里，谢谢大家。"),
+        compression_ratio=1.1,
+        avg_logprob=-0.21,
+        no_speech_prob=0.0,
+        mean_word_prob=0.89,
+    )
+    real_short_thanks = Decoded(
+        Utterance(159.3, 160.2, "谢谢。"),
+        compression_ratio=0.7,
+        avg_logprob=-0.25,
+        no_speech_prob=0.01,
+        mean_word_prob=0.88,
+    )
+
+    assert is_silence_hallucination(hallu_thanks, band_ratio=0.04) is True
+    assert is_silence_hallucination(hallu_sleepy, band_ratio=0.12) is True
+    assert is_silence_hallucination(hallu_hum, band_ratio=0.05) is True
+    assert (
+        is_silence_hallucination(
+            Decoded(Utterance(5.3, 5.9, "ご視聴ありがとうございました。"), avg_logprob=-0.4),
+            language="zh",
+        )
+        is True
+    )
+    assert is_silence_hallucination(real_closing, band_ratio=0.52, language="zh") is False
+    assert is_silence_hallucination(real_short_thanks, band_ratio=0.48, language="zh") is False

@@ -15,3 +15,7 @@ data/
 *.egg-info/
 build/
 dist/
+
+# 本地私有术语表（避免参会人真实姓名等敏感词条被误提交）
+glossary.yaml
+glossary.local.yaml

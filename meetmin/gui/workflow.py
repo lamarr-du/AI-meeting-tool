@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Event
 
 from ..asr.model_download import ModelDownloadProgress
+from ..asr.whisper_scheduler import WhisperScheduler
 from ..audio.segments import SessionLock
 from ..audio.session_recorder import SessionRecorder, recover_recording
 from ..live_pipeline import LiveEventCallback, LiveSessionCoordinator, SpeakerRenames
@@ -97,6 +98,8 @@ def record(
     stop_requested: Event,
     stage: Callable[[str], None],
     meter: Callable[[dict], None],
+    *,
+    on_device_released: Callable[[], None] | None = None,
 ) -> dict:
     recorder.start(session)
     try:
@@ -108,7 +111,7 @@ def record(
                 break
     finally:
         stage("正在保存录音…")
-        result = recorder.stop()
+        result = recorder.stop(on_device_released=on_device_released)
     return result
 
 
@@ -122,20 +125,30 @@ def record_live(
     cfg: dict,
     emit: LiveEventCallback,
     renames: SpeakerRenames | None = None,
+    scheduler: WhisperScheduler | None = None,
+    on_device_released: Callable[[], None] | None = None,
 ) -> dict:
     coordinator = LiveSessionCoordinator(
-        cfg, session, emit, dual_track=recorder.dual_track, renames=renames
+        cfg, session, emit, dual_track=recorder.dual_track, renames=renames, scheduler=scheduler
     )
     recorder.set_audio_tap(coordinator.feed)
     coordinator.start()
+
+    def device_released() -> None:
+        coordinator.archive_started()
+        if on_device_released is not None:
+            on_device_released()
+
     try:
-        result = record(recorder, session, stop_requested, stage, meter)
+        result = record(
+            recorder, session, stop_requested, stage, meter, on_device_released=device_released
+        )
         stage("正在归档实时转写…")
         result["live_transcript"] = coordinator.finish()
         result["live_error"] = coordinator.error
         return result
     finally:
-        coordinator.cancel()
+        coordinator.close()
 
 
 def transcribe(

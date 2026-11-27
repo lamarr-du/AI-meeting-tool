@@ -112,18 +112,21 @@ meetmin summarize -n weekly-20261113-090000123456-ab12
 asr:
   glossary:
     path: glossary.yaml
-    terms: [DRC Stat, demosaic, "@"]
+    max_terms: 24
+    correction_path: glossary.yaml
 ```
 
-路径相对于配置文件。术语提示只取 `term`，附在现有标点示例和手工热词之后，再一起传给本地 Whisper 的 `hotwords`。提示按模型的 token 上限和 `max_terms`（默认 20）选入整条术语。实际词条可在 `asr_raw.json` 的 `asr.parameters.glossary` 中核对。默认 `path: null`，适合不同主题的会议按需启用。
+路径相对于配置文件。当 `path` 或 `correction_path` 指向 `glossary.yaml` 时，若同目录下存在 `glossary.local.yaml`（默认已加入 `.gitignore`），程序会自动将两份文件的词条合并加载——通用领域术语可维护在 `glossary.yaml`，团队参会人真实姓名或内部代号建议放在本机 `glossary.local.yaml` 中以免上传泄露。桌面版不带 `--config` 启动时，若用户数据目录（`AppLocalDataLocation`）下没有自定义 `config.yaml`，会自动回退读取工程根目录（或便携版程序目录）下的 `config.yaml` 与同目录术语表，同时保留桌面「设置」面板已保存的会话路径与接口偏好。
 
-设置 `asr.glossary.correction_path: glossary.yaml` 可独立启用转写后纠错。规则优先替换较长的误听，按标准术语和已确认别名规范英文大小写。含汉字且只有三个或更少字母数字字符的误听，以及词条中标记 `needs_context: true` 的误听，仅记入待核对项。
+术语提示只取 `term`，附在现有标点示例和手工热词之后，再一起传给本地 Whisper 的 `hotwords`。提示按模型的 token 上限和 `max_terms`（代码内置默认 20，仓库 `config.yaml` 设为 24）选入整条术语。实际词条可在 `asr_raw.json` 的 `asr.parameters.glossary` 中核对。代码内置默认 `path: null`，仓库提供的 `config.yaml` 已默认启用 `glossary.yaml`。
 
-`diarize` 会另存纠错 JSON 和 Markdown。JSON 的 `glossary_correction.changes` 记录每次替换的句子索引、时间、原文、新文和字符范围，`context_review` 列出待核对项。启用时，生成纪要或导出网页版提示词会从当前 `transcript.json` 重新应用纠错。将 `correction_path` 设回 `null` 即可使用原转写。
+设置 `asr.glossary.correction_path: glossary.yaml` 可启用转写后确定性纠错。规则优先替换较长的误听，按标准术语和已确认别名规范英文大小写。词条中未显式指定 `needs_context` 时，含汉字且只有三个或更少字母数字字符的误听默认仅记入待核对项（防止短同音词误伤日常用语）；对于无歧义的专有名词或姓名，可在词条中显式设置 `needs_context: false` 直接执行替换，或设置 `needs_context: true` 强制留作待核对项。
 
-本地 Whisper 默认体检相邻重复句、异常压缩比和 VAD 检出的连续有声缺口。体检只记录疑点，结果在 `asr_raw.json` 的 `asr.quality` 中，双轨的麦克风报告在 `microphone.asr.quality`。可以按其中的起止时间回听。
+`diarize` 会另存纠错 JSON 和 Markdown（桌面端存在 `transcript_corrected.md` 时默认优先展示）。JSON 的 `glossary_correction.changes` 记录每次替换的句子索引、时间、原文、新文和字符范围，`context_review` 列出待核对项。启用时，生成纪要或导出网页版提示词会从当前 `transcript.json` 重新应用纠错。将 `correction_path` 设回 `null` 即可使用原转写。
 
-设 `asr.quality.mode: retry` 可重跑疑点音频，单片最多 20 秒，每轨默认最多 6 次。只有在置信度、时间边界和邻近重复等检查通过后才更新转写。每次重试都会记录结果，替换已有片段时同时保留原文与词级时间戳。设 `mode: "off"` 可关闭体检。
+本地 Whisper 在 VAD 切分与模型推理前默认对波形执行零相位 85 Hz 高通滤波以消除电源/空调超低频嗡鸣，并结合句级 `avg_logprob`、词级平均概率、人声核心频带能量占比及中文模式下的非中英假名脚本检测，在实时流、离线首轮解码与局部重试阶段自动过滤“谢谢大家”等静音底噪幻觉。同时体检相邻重复句、异常压缩比和 VAD 检出的连续有声缺口，结果记录在 `asr_raw.json` 的 `asr.quality` 中，双轨的麦克风报告在 `microphone.asr.quality`，可以按其中的起止时间回听。
+
+设 `asr.quality.mode: retry`（仓库 `config.yaml` 已默认开启，配合 `no_repeat_ngram_size: 4` 与 `hallucination_silence_threshold: 1.0`）可自动重跑疑点音频，单片最多 20 秒，每轨默认最多 6 次。只有在置信度、非静音幻觉、时间边界和邻近重复等检查通过后才更新转写。每次重试都会记录结果，替换已有片段时同时保留原文与词级时间戳。设 `mode: "off"` 可关闭体检。
 
 ## 配置要点
 

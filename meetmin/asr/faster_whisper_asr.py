@@ -10,41 +10,67 @@ import math
 import os
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
 import numpy as np
 
-from ..audio.dsp import TARGET_SR
+from ..audio.dsp import TARGET_SR, highpass_speech, speech_band_ratio
 from ..glossary import glossary_hotwords, load_terms, select_terms
 from ..model_cache import configure_xet_cache, hub_cache_dir
 from .base import ASRProvider, ASRResult, Utterance
 from .model_download import ModelDownloadProgress, cached_model, download_model
 from .profile import memory_status, select_profile
-from .quality import Decoded, QualityOptions, Span, review
+from .quality import Decoded, QualityOptions, Span, is_silence_hallucination, review
+from .whisper_scheduler import (
+    ModelLease,
+    Priority,
+    SchedulingError,
+    WaitTime,
+    WhisperScheduler,
+    background_priority,
+)
 
 _VAD_PARAMETERS = {
-    "min_silence_duration_ms": 600,
+    "threshold": 0.55,
+    "min_silence_duration_ms": 500,
     "min_speech_duration_ms": 250,
-    "speech_pad_ms": 100,
+    "speech_pad_ms": 120,
 }
 _QUALITY_VAD_PARAMETERS = {"min_silence_duration_ms": 400}
+
+
+class _CudaLoadError(RuntimeError):
+    def __init__(self, reason: str, oom: bool):
+        super().__init__(reason)
+        self.failure = reason, oom
 
 
 def _speech_spans(audio: np.ndarray) -> list[Span]:
     from faster_whisper.vad import get_speech_timestamps
 
-    # 不把 Silero 的边缘补齐样本计成有声缺口。
-    chunks = get_speech_timestamps(audio, **_QUALITY_VAD_PARAMETERS, speech_pad_ms=0)
+    # 先滤除超低频底噪，再检测语音段；不把 Silero 的边缘补齐样本计成有声缺口。
+    chunks = get_speech_timestamps(
+        highpass_speech(audio, TARGET_SR), **_QUALITY_VAD_PARAMETERS, speech_pad_ms=0
+    )
     return [(chunk["start"] / TARGET_SR, chunk["end"] / TARGET_SR) for chunk in chunks]
 
 
 def _decoded(segment: Any, offset: float = 0.0) -> Decoded:
+    raw_words = list(segment.words or [])
     words = [
         {"w": w.word, "s": round(float(w.start) + offset, 3), "e": round(float(w.end) + offset, 3)}
-        for w in (segment.words or [])
+        for w in raw_words
     ]
+    probs = [
+        float(prob)
+        for w in raw_words
+        if isinstance((prob := getattr(w, "probability", None)), (int, float))
+        and math.isfinite(prob)
+    ]
+    mean_word_prob = sum(probs) / len(probs) if probs else None
     return Decoded(
         Utterance(
             start=float(segment.start) + offset,
@@ -55,7 +81,18 @@ def _decoded(segment: Any, offset: float = 0.0) -> Decoded:
         compression_ratio=float(getattr(segment, "compression_ratio", 0.0)),
         avg_logprob=float(getattr(segment, "avg_logprob", 0.0)),
         no_speech_prob=float(getattr(segment, "no_speech_prob", 0.0)),
+        mean_word_prob=mean_word_prob,
     )
+
+
+def _segment_band_ratio(audio: np.ndarray, start_sec: float, end_sec: float) -> float | None:
+    if len(audio) < 32 or float(np.ptp(audio)) <= 1e-7:
+        return None
+    a = max(0, min(len(audio), round(start_sec * TARGET_SR)))
+    b = max(a, min(len(audio), round(end_sec * TARGET_SR)))
+    if b - a < 32:
+        return None
+    return speech_band_ratio(audio[a:b], TARGET_SR)
 
 
 def _decode_guards(config: dict, word_timestamps: bool) -> dict[str, Any]:
@@ -98,6 +135,10 @@ class FasterWhisperASR(ASRProvider):
         *,
         model_cache_dir: str | Path | None = None,
         on_model_download: Callable[[ModelDownloadProgress], None] | None = None,
+        scheduler: WhisperScheduler | None = None,
+        live_priority: Callable[[], Priority] | None = None,
+        check_input: Callable[[], None] | None = None,
+        wait_time: WaitTime | None = None,
     ):
         _configure_huggingface_download(acfg)
         configure_xet_cache(model_cache_dir)
@@ -116,6 +157,11 @@ class FasterWhisperASR(ASRProvider):
         self.acfg = acfg
         self._model_class = WhisperModel
         self._on_model_download = on_model_download
+        self._scheduler = scheduler
+        self._lease: ModelLease | None = None
+        self._live_priority = live_priority
+        self._check_input = check_input
+        self._wait_time = wait_time
         self._profile = select_profile(
             acfg,
             memory=memory_status(),
@@ -131,21 +177,14 @@ class FasterWhisperASR(ASRProvider):
     def _load_with_fallback(self) -> None:
         try:
             while True:
-                source = self._model_source()
                 try:
-                    self.model = self._model_class(
-                        source,
-                        device=self._device,
-                        compute_type=self._compute,
-                        download_root=str(self._hub_cache),
-                        **({"local_files_only": True} if self.acfg.get("local_files_only") else {}),
-                    )
+                    self._load_model()
                     return
-                except (OSError, RuntimeError) as error:
-                    failure = self._cuda_failure(error)
-                    if failure is None:
-                        raise
+                except _CudaLoadError as error:
+                    failure = error.failure
                 self._advance_fallback(*failure)
+        except SchedulingError:
+            raise
         except Exception as e:
             if self.acfg.get("local_files_only"):
                 raise RuntimeError(f"无法加载本地 Whisper 模型（{self._size}）：{e}") from e
@@ -155,6 +194,51 @@ class FasterWhisperASR(ASRProvider):
                 "  · 已默认关闭 Hugging Face Xet 下载；如需启用可设 asr.hf_disable_xet: false\n"
                 "  · 或先手动下载模型，把 asr.model_size 指向本地模型目录"
             ) from e
+
+    def _load_model(self) -> None:
+        def load() -> Any:
+            source = self._model_source()
+            try:
+                return self._model_class(
+                    source,
+                    device=self._device,
+                    compute_type=self._compute,
+                    download_root=str(self._hub_cache),
+                    **({"local_files_only": True} if self.acfg.get("local_files_only") else {}),
+                )
+            except (OSError, RuntimeError) as error:
+                failure = self._cuda_failure(error)
+                if failure is None:
+                    raise
+                raise _CudaLoadError(*failure) from error
+
+        if self._scheduler is None:
+            self.model = load()
+            return
+        path = Path(self._size).expanduser()
+        identity = str(path.resolve()) if path.is_dir() else f"{self._hub_cache}/{self._size}"
+        self._lease = self._scheduler.acquire_model(
+            (identity, self._device, self._compute),
+            load,
+            self.check_available,
+            self._wait_time,
+            live=self._live_priority is not None,
+        )
+        self.model = self._lease.model
+
+    def check_available(self) -> None:
+        if self._check_input is not None:
+            self._check_input()
+        if self._lease is not None and not self._lease.valid:
+            raise SchedulingError("后台转写需要更换模型，实时转写将在录音结束后补齐")
+
+    def _windows(self) -> ContextManager[None]:
+        scheduler = getattr(self, "_scheduler", None)
+        if scheduler is None:
+            return nullcontext()
+        return scheduler.windows(
+            self._live_priority or background_priority, self.check_available, self._wait_time
+        )
 
     def _model_source(self) -> str:
         source = self._size
@@ -203,9 +287,19 @@ class FasterWhisperASR(ASRProvider):
     def close(self) -> None:
         if hasattr(self, "model"):
             del self.model
+        lease = getattr(self, "_lease", None)
+        if lease is not None:
+            assert self._scheduler is not None
+            self._lease = None
+            self._scheduler.release_model(lease, live=self._live_priority is not None)
 
     def _advance_fallback(self, reason: str, oom: bool) -> None:
         previous = f"{self._size} / {self._device} / {self._compute}"
+        if self._scheduler is not None and self._lease is not None:
+            if not self._scheduler.invalidate_model(
+                self._lease, preserve_shared=self._live_priority is not None
+            ):
+                raise SchedulingError(f"实时转写的共享推理失败，将在录音结束后补齐 · {reason}")
         self.close()
         if (
             oom
@@ -300,13 +394,30 @@ class FasterWhisperASR(ASRProvider):
         options, _, _ = self._decode_options()
         return {**options, "vad_filter": False, "temperature": 0.0}
 
+    def _preprocess_for_model(self, audio: np.ndarray) -> np.ndarray:
+        model_cls = getattr(self, "_model_class", None)
+        if isinstance(model_cls, type) and isinstance(self.model, model_cls):
+            return highpass_speech(audio, TARGET_SR)
+        return audio
+
     def decode_window(
         self, audio: np.ndarray, offset: float, *, options: dict[str, Any]
     ) -> list[Decoded]:
+        clean_audio = self._preprocess_for_model(audio)
+        target_lang = options.get("language")
         while True:
             try:
-                segments, _ = self.model.transcribe(audio, **options)
-                return [_decoded(segment, offset) for segment in segments if segment.text.strip()]
+                with self._windows():
+                    segments, _ = self.model.transcribe(clean_audio, **options)
+                    results: list[Decoded] = []
+                    for segment in segments:
+                        if not segment.text.strip():
+                            continue
+                        row = _decoded(segment, offset)
+                        band = _segment_band_ratio(audio, float(segment.start), float(segment.end))
+                        if not is_silence_hallucination(row, band_ratio=band, language=target_lang):
+                            results.append(row)
+                return results
             except (OSError, RuntimeError) as error:
                 failure = self._cuda_failure(error)
                 if failure is None:
@@ -342,15 +453,21 @@ class FasterWhisperASR(ASRProvider):
 
         options, glossary, decode_guards = self._decode_options()
         quality_options = QualityOptions.from_config(self.acfg.get("quality", {}))
-        segments, info = self.model.transcribe(audio, **options)
-        detected_language = getattr(info, "language", None)
+        model_audio = self._preprocess_for_model(audio)
         decoded = []
         duration = len(audio) / TARGET_SR
-        total = float(getattr(info, "duration", 0.0) or duration)
-        for seg in segments:
-            decoded.append(_decoded(seg))
-            if progress_cb:
-                progress_cb(float(seg.end), total)
+        with self._windows():
+            segments, info = self.model.transcribe(model_audio, **options)
+            detected_language = getattr(info, "language", None)
+            total = float(getattr(info, "duration", 0.0) or duration)
+            effective_lang = detected_language or options.get("language")
+            for seg in segments:
+                row = _decoded(seg)
+                band = _segment_band_ratio(audio, float(seg.start), float(seg.end))
+                if not is_silence_hallucination(row, band_ratio=band, language=effective_lang):
+                    decoded.append(row)
+                if progress_cb:
+                    progress_cb(float(seg.end), total)
 
         retry_options = {
             **options,
@@ -363,12 +480,18 @@ class FasterWhisperASR(ASRProvider):
 
         def retry(start: float, end: float) -> list[Decoded]:
             first, last = round(start * TARGET_SR), round(end * TARGET_SR)
-            clips, _ = self.model.transcribe(audio[first:last], **retry_options)
-            return [_decoded(seg, first / TARGET_SR) for seg in clips if seg.text.strip()]
+            with self._windows():
+                clips, _ = self.model.transcribe(model_audio[first:last], **retry_options)
+                return [_decoded(seg, first / TARGET_SR) for seg in clips if seg.text.strip()]
 
         review_started = time.monotonic()
         utterances, quality_report = review(
-            decoded, duration, quality_options, lambda: _speech_spans(audio), retry
+            decoded,
+            duration,
+            quality_options,
+            lambda: _speech_spans(audio),
+            retry,
+            language=effective_lang,
         )
         if quality_options.mode != "off":
             quality_report["elapsed_sec"] = round(time.monotonic() - review_started, 3)

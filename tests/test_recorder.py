@@ -333,6 +333,28 @@ def test_loopback_boost_preserves_stereo_balance_and_peak_headroom(recording):
     assert stereo[4800, 1] == round(-0.95 * 32768)
 
 
+def test_loopback_suppresses_sub_100hz_hum_amplification_while_boosting_quiet_voice():
+    recorder = LoopbackRecorder(target_rms=0.05)
+    sr = 48000
+    t = np.arange(4800, dtype=np.float32) / sr
+
+    # 极微弱 50 Hz 电源哼声（RMS ~ 0.0002）：不应被暴力拉高到 target_rms=0.05
+    hum_50 = (0.00028 * np.sin(2 * np.pi * 50.0 * t)).astype("<f4")
+    ctrl_hum = recorder._create_level_control(sr, {"isLoopbackDevice": True})
+    assert ctrl_hum is not None
+    out_hum = np.frombuffer(ctrl_hum.to_pcm(hum_50.tobytes(), len(hum_50)), dtype="<i2") / 32768.0
+    assert float(np.sqrt(np.mean(out_hum**2))) < 0.01
+
+    # 同等微弱幅度的 500 Hz 真实人声频段：应正常全额增益补偿到接近 target_rms=0.05
+    voice_500 = (0.00028 * np.sin(2 * np.pi * 500.0 * t)).astype("<f4")
+    ctrl_voice = recorder._create_level_control(sr, {"isLoopbackDevice": True})
+    assert ctrl_voice is not None
+    out_voice = (
+        np.frombuffer(ctrl_voice.to_pcm(voice_500.tobytes(), len(voice_500)), dtype="<i2") / 32768.0
+    )
+    assert float(np.sqrt(np.mean(out_voice**2))) == pytest.approx(0.05, abs=0.003)
+
+
 def test_session_recording_saves_and_recovers_16k_mono_tracks(recording, tmp_path):
     r = recording
     recorder = Pipeline(
@@ -877,6 +899,50 @@ def test_dual_recording_shares_boundaries_across_device_clocks(recording, monkey
     rec.stop()
     assert session.recording_paths() == (session.audio_path, None)
     assert microphone.is_file()
+
+
+def test_dual_recording_releases_devices_before_merging(recording, tmp_path):
+    r = recording
+    first = Session(tmp_path, "first")
+    second = Session(tmp_path, "second")
+    a = SessionRecorder(r.rec, MicrophoneRecorder(channels=1, clock=r.clock))
+    b = SessionRecorder(LoopbackRecorder(device=0, clock=r.clock))
+    a.start(first)
+    r.streams[0].emit(0, value=1000)
+    r.streams[1].emit(0, value=1000, frames=200)
+
+    def released():
+        assert all(stream.closed for stream in r.streams)
+        assert all(instance.terminated for instance in r.instances)
+        assert not first.recording_manifest.exists()
+        b.start(second)
+
+    a.stop(on_device_released=released)
+    r.streams[2].emit(0, value=2000, received=r.clock.value + 0.1)
+    b.stop()
+    assert first.recording_manifest.is_file()
+    assert second.audio_path.is_file()
+    assert np.max(read_audio(first.recording_paths()[0])) == 1000
+    assert np.max(read_audio(second.audio_path)) == 2000
+
+
+def test_dual_recording_waits_for_both_devices_to_release(recording, tmp_path):
+    r = recording
+    session = Session(tmp_path, "dual")
+    recorder = SessionRecorder(r.rec, MicrophoneRecorder(channels=1, clock=r.clock))
+    recorder.start(session)
+    released = threading.Event()
+    r.streams[1].close_error = OSError("设备尚未释放")
+    with pytest.raises(RecordingError) as pending:
+        recorder.stop(on_device_released=released.set)
+    assert pending.value.info["cleanup_pending"]
+    assert not released.is_set()
+
+    r.streams[1].close_error = None
+    with pytest.raises(RecordingError) as finished:
+        recorder.stop(on_device_released=released.set)
+    assert not finished.value.info["cleanup_pending"]
+    assert released.is_set()
 
 
 @pytest.mark.parametrize("rate", [16000, 44100, 48000])

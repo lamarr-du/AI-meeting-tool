@@ -23,6 +23,7 @@ from .asr.punctuation import (
     reconstruct_sentences,
 )
 from .asr.quality import LIVE_REVIEW_TEXT
+from .asr.whisper_scheduler import WhisperScheduler
 from .asr.zh_convert import convert_utterances_to_simplified
 from .audio.dsp import audio_duration, to_mono_16k
 from .audio.loopback_recorder import LoopbackRecorder, MicrophoneRecorder
@@ -52,11 +53,14 @@ from .textutil import ts
 
 
 class Pipeline:
-    def __init__(self, cfg: dict, progress: Any = None):
+    def __init__(
+        self, cfg: dict, progress: Any = None, *, whisper_scheduler: WhisperScheduler | None = None
+    ):
         self.cfg = cfg
         self.out_dir = cfg.get("output_dir", "data")
         self._progress = progress or (lambda msg: print(msg, flush=True))
         self._last_report_time = 0.0
+        self._whisper_scheduler = whisper_scheduler
 
     def progress(self, msg: str, *, throttle_sec: float = 0.0) -> None:
         if throttle_sec:
@@ -130,11 +134,12 @@ class Pipeline:
         t0 = time.time()
         from .asr import get_asr
 
-        provider = (
-            get_asr(self.cfg, on_model_download=on_model_download)
-            if on_model_download is not None
-            else get_asr(self.cfg)
-        )
+        provider_options: dict[str, Any] = {}
+        if on_model_download is not None:
+            provider_options["on_model_download"] = on_model_download
+        if self._whisper_scheduler is not None:
+            provider_options["scheduler"] = self._whisper_scheduler
+        provider = get_asr(self.cfg, **provider_options)
         # 本地 ASR 传解码后的 16k 数组；云端（需 URL）传 None 由 provider 处理
         local_like = provider.name == "faster_whisper"
 
