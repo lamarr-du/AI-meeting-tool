@@ -196,6 +196,14 @@ class LiveTrack:
     def has_speech(self) -> bool:
         return bool(self._speech)
 
+    @property
+    def oldest_needed_sample(self) -> int:
+        scan_start = max(self._speech_floor, self._scanned - SAMPLE_RATE)
+        if not self._speech:
+            return scan_start
+        region = self._speech[0]
+        return min(scan_start, max(region.start, region.floor - _PRE_ROLL))
+
     def next_window(self, hop: int) -> Window | None:
         if not self._speech:
             return None

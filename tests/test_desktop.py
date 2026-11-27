@@ -249,8 +249,10 @@ def test_recording_stops_and_finalizes_on_button_or_device_failure(device_failed
     assert result == recorder.stop.return_value
 
 
-@pytest.mark.parametrize("first_live", [False, True])
-def test_recordings_can_overlap_background_transcription(tmp_path, monkeypatch, first_live):
+@pytest.mark.parametrize("first_live, second_live", [(False, False), (True, False), (True, True)])
+def test_recordings_can_overlap_background_transcription(
+    tmp_path, monkeypatch, first_live, second_live
+):
     pytest.importorskip("PySide6")
     from PySide6.QtCore import QSettings
     from PySide6.QtTest import QTest
@@ -314,18 +316,27 @@ def test_recordings_can_overlap_background_transcription(tmp_path, monkeypatch, 
             self.session, self.emit = session, emit
 
         def start(self):
-            live_sessions.append(title(self.session))
+            name = title(self.session)
+            live_sessions.append(name)
+            self.emit({"type": "live.status", "message": f"实时转写会议 {name}"})
+
+        def archive_started(self):
+            pass
 
         def feed(self, _track, _event):
             pass
 
         def finish(self):
+            if title(self.session) == "B":
+                self.error = "实时音频积压超出缓冲区"
+                return None
             started_transcribing.append("A")
             self.emit({"type": "live.status", "message": "仅属于 A 场的实时事件"})
             return finish_transcript(self.session)
 
         def close(self):
-            wait_for_gate(allow_first_asr)
+            if title(self.session) == "A":
+                wait_for_gate(allow_first_asr)
 
     def transcribe(pipe, session, stage, **_kwargs):
         name = title(session)
@@ -359,13 +370,17 @@ def test_recordings_can_overlap_background_transcription(tmp_path, monkeypatch, 
         wait_until(window.new.isEnabled)
         assert not first.audio_path.exists()
 
-        second = start("B")
-        assert "本场先录音" in window.record_hint.text()
+        second = start("B", live=second_live)
+        if second_live:
+            view = window.transcript_stack.currentWidget()
+            wait_until(lambda: "实时转写会议 B" in view.status.text())
         window.stop.click()
         wait_until(lambda: second.audio_path.exists() and "已排队" in window.stage.text())
+        if second_live:
+            assert "积压超出缓冲区" in window.log.toPlainText()
         assert not started_transcribing
 
-        third = start("C")
+        third = start("C", live=False)
         allow_merge.set()
         wait_until(lambda: started_transcribing == ["A"])
         assert title(window.session) == "C" and window.stop.isEnabled()
@@ -374,7 +389,7 @@ def test_recordings_can_overlap_background_transcription(tmp_path, monkeypatch, 
         assert title(window.session) == "C" and window.stop.isEnabled()
         assert "会议 A" not in window.log.toPlainText()
         assert "会议 B" not in window.log.toPlainText()
-        assert live_sessions == (["A"] if first_live else [])
+        assert live_sessions == (["A"] if first_live else []) + (["B"] if second_live else [])
 
         window.stop.click()
         wait_until(lambda: third.audio_path.exists() and "已排队" in window.stage.text())

@@ -6,10 +6,14 @@ from collections.abc import Callable
 
 from .base import ASRProvider, ASRResult, Utterance  # noqa: F401
 from .model_download import ModelDownloadProgress
+from .whisper_scheduler import WhisperScheduler
 
 
 def get_asr(
-    cfg: dict, *, on_model_download: Callable[[ModelDownloadProgress], None] | None = None
+    cfg: dict,
+    *,
+    on_model_download: Callable[[ModelDownloadProgress], None] | None = None,
+    scheduler: WhisperScheduler | None = None,
 ) -> ASRProvider:
     name = (cfg["asr"].get("provider") or "faster_whisper").lower()
     if name in ("faster_whisper", "faster-whisper", "whisper"):
@@ -19,6 +23,7 @@ def get_asr(
             cfg["asr"],
             model_cache_dir=cfg.get("model_cache_dir"),
             on_model_download=on_model_download,
+            scheduler=scheduler,
         )
     if name in ("dashscope", "paraformer"):
         from .dashscope_asr import DashScopeParaformerASR

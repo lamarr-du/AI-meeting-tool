@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..asr.model_download import ModelDownloadProgress
+from ..asr.whisper_scheduler import WhisperScheduler
 from ..audio.loopback_recorder import RecordingError, list_loopback_devices, list_microphone_devices
 from ..audio.session_recorder import RECORDING_DIAGNOSTICS, SessionRecorder
 from ..config import MAX_TARGET_RMS, MIN_TARGET_RMS, deep_merge, load_config
@@ -239,6 +240,7 @@ class CaptureJob(Job):
         self.recorder = recorder
         self.stop_requested = stop_requested
         self.speaker_renames: SpeakerRenames = SimpleQueue()
+        self.live_view: LiveTranscriptView | None = None
 
 
 class HistoryList(QListWidget):
@@ -287,7 +289,7 @@ class MeetingWindow(QMainWindow):
         self.job: Job | None = None
         self.jobs: dict[Path, Job] = {}
         self.capture_job: CaptureJob | None = None
-        self.live_job: CaptureJob | None = None
+        self.whisper_scheduler = WhisperScheduler()
         self.blocked_capture: Path | None = None
         self.failed_recorders: dict[Path, SessionRecorder] = {}
         self.session_logs: dict[Path, deque[str]] = {}
@@ -448,11 +450,8 @@ class MeetingWindow(QMainWindow):
         result_layout.setContentsMargins(1, 1, 1, 1)
         self.tabs = QTabWidget()
         self.transcript = MarkdownPreview("会议转写")
-        self.live_transcript = LiveTranscriptView()
-        self.live_transcript.rename_requested.connect(self.rename_live_speaker)
         self.transcript_stack = QStackedWidget()
         self.transcript_stack.addWidget(self.transcript)
-        self.transcript_stack.addWidget(self.live_transcript)
         self.minutes = MarkdownPreview("会议纪要")
         self.log = QPlainTextEdit(readOnly=True, maximumBlockCount=300)
         self.log.setAccessibleName("处理日志")
@@ -760,9 +759,8 @@ class MeetingWindow(QMainWindow):
         else:
             outcome = self.session_outcomes.get(session.root) if session else None
             self.set_status(*(outcome or (message, tone)))
-        self.transcript_stack.setCurrentWidget(
-            self.live_transcript if job is not None and job is self.live_job else self.transcript
-        )
+        live_view = job.live_view if isinstance(job, CaptureJob) else None
+        self.transcript_stack.setCurrentWidget(live_view or self.transcript)
         self.transcript.show_file(
             self.transcript_path, "转写完成后在这里查看带时间戳的发言。", f"# 会议转写 {session_id}"
         )
@@ -811,7 +809,7 @@ class MeetingWindow(QMainWindow):
             self.capture_job is None and not foreground and not self.close_after_recording
         )
         can_capture = can_navigate and self.blocked_capture is None
-        ready = can_capture and self.job is None and self.live_job is None and not running
+        ready = can_capture and self.job is None and not running
         setup = session is None and can_capture
         self.capture_card.setVisible(setup or capturing)
         self.capture_setup.setVisible(setup)
@@ -975,8 +973,6 @@ class MeetingWindow(QMainWindow):
         self.jobs.pop(root)
         if self.job is job:
             self.job = None
-        if self.live_job is job:
-            self.live_job = None
         cleanup = isinstance(job.error, RecordingError) and job.error.info["cleanup_pending"]
         if isinstance(job, CaptureJob):
             if job.error is not None:
@@ -988,6 +984,10 @@ class MeetingWindow(QMainWindow):
             else:
                 self.failed_recorders.pop(root, None)
             self.capture_device_released(job)
+            if job.live_view is not None:
+                self.transcript_stack.removeWidget(job.live_view)
+                job.live_view.deleteLater()
+                job.live_view = None
         job.deleteLater()
         if self.is_selected(session):
             self.render_session()
@@ -1045,8 +1045,7 @@ class MeetingWindow(QMainWindow):
         )
         recorder = Pipeline(cfg).recorder(for_session=True)
         stop_requested = Event()
-        live_requested = self.live_enabled.isChecked()
-        live = live_requested and not self.jobs
+        live = self.live_enabled.isChecked()
 
         def record_job(worker: Job) -> dict:
             job = cast(CaptureJob, worker)
@@ -1057,6 +1056,7 @@ class MeetingWindow(QMainWindow):
                     cfg=cfg,
                     emit=job.live_event.emit,
                     renames=job.speaker_renames,
+                    scheduler=self.whisper_scheduler,
                     on_device_released=job.device_released.emit,
                 )
             return workflow.record(*args, on_device_released=job.device_released.emit)
@@ -1073,16 +1073,15 @@ class MeetingWindow(QMainWindow):
         self.mute_microphone.setChecked(False)
         self.recorded_at = time.monotonic()
         if live:
-            self.record_hint.setText("停止后归档转写")
-        elif live_requested:
-            self.record_hint.setText("后台有会议正在处理，本场先录音，结束后自动转写。")
+            self.record_hint.setText("音频持续保存，转写按后台任务进度调度。")
+            view = job.live_view = LiveTranscriptView()
+            view.rename_requested.connect(self.rename_live_speaker)
+            view.reset(dual_track=recorder.dual_track)
+            self.transcript_stack.addWidget(view)
+            self.transcript_stack.setCurrentWidget(view)
+            self.tabs.setCurrentWidget(self.transcript_stack)
         else:
             self.record_hint.setText("停止后自动转写")
-        if live:
-            self.live_job = job
-            self.live_transcript.reset(dual_track=recorder.dual_track)
-            self.transcript_stack.setCurrentWidget(self.live_transcript)
-            self.tabs.setCurrentWidget(self.transcript_stack)
         self.start_capture_job(job)
         self.show_meter({"microphone": {} if recorder.dual_track else None})
 
@@ -1095,11 +1094,7 @@ class MeetingWindow(QMainWindow):
             lambda status: self.show_meter(status) if self.capture_job is job else None, queued
         )
         job.live_event.connect(
-            lambda event: (
-                self.live_transcript.apply_event(event)
-                if self.live_job is job and self.is_selected(job.session)
-                else None
-            ),
+            lambda event: job.live_view.apply_event(event) if job.live_view is not None else None,
             queued,
         )
         self.start_job(job)
@@ -1107,13 +1102,15 @@ class MeetingWindow(QMainWindow):
     def capture_device_released(self, job: CaptureJob) -> None:
         if self.capture_job is job:
             self.capture_job = None
-            self.live_transcript.renaming_enabled = False
+            if job.live_view is not None:
+                job.live_view.renaming_enabled = False
             self.update_controls()
 
     def request_stop(self) -> None:
         job = self.capture_job
         if job is not None and job.stop_requested is not None:
-            self.live_transcript.renaming_enabled = False
+            if job.live_view is not None:
+                job.live_view.renaming_enabled = False
             job.stop_requested.set()
             self.update_job_stage(job, "正在保存录音…")
             self.update_controls()
@@ -1127,12 +1124,9 @@ class MeetingWindow(QMainWindow):
         meter.setValue(0)
 
     def rename_live_speaker(self, speaker: int, name: str) -> None:
-        if (
-            self.live_job is not None
-            and self.live_job is self.capture_job
-            and self.recording_active()
-        ):
-            self.live_job.speaker_renames.put((speaker, name))
+        job = self.capture_job
+        if job is not None and job.live_view is not None and self.recording_active():
+            job.speaker_renames.put((speaker, name))
 
     def rename_transcript_speaker(self) -> None:
         session = self.session
@@ -1206,11 +1200,14 @@ class MeetingWindow(QMainWindow):
         if transcript := result.get("live_transcript"):
             self.set_session_outcome(session, "实时转写已归档。", "success")
             self.transcription_saved(session, transcript)
-        elif error := result.get("live_error"):
+            return
+        error = result.get("live_error")
+        if error:
             self.append_session_log(session, f"实时转写未完成：{error}")
-            self.set_session_outcome(session, "录音已保存，可继续转写。", "warning")
-        elif not self.close_after_recording:
+        if not self.close_after_recording:
             self.transcribe_session(session, queued_at=job.queued_at)
+        elif error:
+            self.set_session_outcome(session, "录音已保存，可继续转写。", "warning")
 
     def import_audio(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -1239,7 +1236,7 @@ class MeetingWindow(QMainWindow):
             session,
             "已排队，等待转写…",
             lambda job: workflow.transcribe(
-                Pipeline(self.cfg, progress=job.log.emit),
+                Pipeline(self.cfg, progress=job.log.emit, whisper_scheduler=self.whisper_scheduler),
                 session,
                 job.stage.emit,
                 align_only=align_only,
@@ -1258,7 +1255,7 @@ class MeetingWindow(QMainWindow):
         self.update_controls()
 
     def start_next_transcription(self) -> None:
-        if self.job is not None or self.live_job is not None:
+        if self.job is not None:
             return
         job = min(
             (item for item in self.jobs.values() if item.background),

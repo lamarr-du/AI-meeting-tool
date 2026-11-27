@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Event
 
 from ..asr.model_download import ModelDownloadProgress
+from ..asr.whisper_scheduler import WhisperScheduler
 from ..audio.segments import SessionLock
 from ..audio.session_recorder import SessionRecorder, recover_recording
 from ..live_pipeline import LiveEventCallback, LiveSessionCoordinator, SpeakerRenames
@@ -124,16 +125,23 @@ def record_live(
     cfg: dict,
     emit: LiveEventCallback,
     renames: SpeakerRenames | None = None,
+    scheduler: WhisperScheduler | None = None,
     on_device_released: Callable[[], None] | None = None,
 ) -> dict:
     coordinator = LiveSessionCoordinator(
-        cfg, session, emit, dual_track=recorder.dual_track, renames=renames
+        cfg, session, emit, dual_track=recorder.dual_track, renames=renames, scheduler=scheduler
     )
     recorder.set_audio_tap(coordinator.feed)
     coordinator.start()
+
+    def device_released() -> None:
+        coordinator.archive_started()
+        if on_device_released is not None:
+            on_device_released()
+
     try:
         result = record(
-            recorder, session, stop_requested, stage, meter, on_device_released=on_device_released
+            recorder, session, stop_requested, stage, meter, on_device_released=device_released
         )
         stage("正在归档实时转写…")
         result["live_transcript"] = coordinator.finish()

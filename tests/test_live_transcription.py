@@ -9,6 +9,7 @@ from meetmin.asr.base import Utterance
 from meetmin.asr.live_whisper import LiveTrack, ReviewSpan, review_redecode
 from meetmin.asr.model_download import cached_model
 from meetmin.asr.quality import LIVE_REVIEW_TEXT, Decoded, QualityOptions
+from meetmin.asr.whisper_scheduler import Priority, SchedulingError, WhisperScheduler
 from meetmin.audio.ring_buffer import SAMPLE_RATE, AudioRingBuffer, IdleTick, PcmChunk
 from meetmin.live_pipeline import LiveSessionCoordinator
 from meetmin.session import Session
@@ -23,6 +24,26 @@ def test_audio_ring_keeps_absolute_sample_ranges():
         ring.read(1, 5)
     with pytest.raises(ValueError, match="音频缺失"):
         ring.append(PcmChunk(7, b"\0\0"))
+
+
+def test_live_scheduling_prioritizes_backlog_and_checks_capacity_per_track(tmp_path):
+    coordinator = LiveSessionCoordinator(
+        {"live": {"ring_buffer_sec": 60}},
+        Session(tmp_path, "recording"),
+        lambda _event: None,
+        dual_track=True,
+        scheduler=WhisperScheduler(),
+    )
+    assert coordinator._inference_priority() == Priority.LIVE
+    coordinator.feed("microphone", PcmChunk(0, bytes(45 * SAMPLE_RATE * 2)))
+    coordinator.feed("loopback", PcmChunk(0, bytes(20 * SAMPLE_RATE * 2)))
+    assert coordinator._inference_priority() == Priority.CATCH_UP
+    coordinator._check_input()  # The two tracks do not share a 60-second capacity.
+    coordinator.archive_started()
+    assert coordinator._inference_priority() == Priority.BACKGROUND
+    coordinator.feed("microphone", PcmChunk(45 * SAMPLE_RATE, bytes(16 * SAMPLE_RATE * 2)))
+    with pytest.raises(SchedulingError, match="积压超出缓冲区"):
+        coordinator._check_input()
 
 
 def test_idle_closes_a_draft_without_synthesizing_pcm_or_duplicate_text():
