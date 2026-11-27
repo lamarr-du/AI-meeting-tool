@@ -97,6 +97,8 @@ def record(
     stop_requested: Event,
     stage: Callable[[str], None],
     meter: Callable[[dict], None],
+    *,
+    on_device_released: Callable[[], None] | None = None,
 ) -> dict:
     recorder.start(session)
     try:
@@ -108,7 +110,7 @@ def record(
                 break
     finally:
         stage("正在保存录音…")
-        result = recorder.stop()
+        result = recorder.stop(on_device_released=on_device_released)
     return result
 
 
@@ -122,6 +124,7 @@ def record_live(
     cfg: dict,
     emit: LiveEventCallback,
     renames: SpeakerRenames | None = None,
+    on_device_released: Callable[[], None] | None = None,
 ) -> dict:
     coordinator = LiveSessionCoordinator(
         cfg, session, emit, dual_track=recorder.dual_track, renames=renames
@@ -129,13 +132,15 @@ def record_live(
     recorder.set_audio_tap(coordinator.feed)
     coordinator.start()
     try:
-        result = record(recorder, session, stop_requested, stage, meter)
+        result = record(
+            recorder, session, stop_requested, stage, meter, on_device_released=on_device_released
+        )
         stage("正在归档实时转写…")
         result["live_transcript"] = coordinator.finish()
         result["live_error"] = coordinator.error
         return result
     finally:
-        coordinator.cancel()
+        coordinator.close()
 
 
 def transcribe(

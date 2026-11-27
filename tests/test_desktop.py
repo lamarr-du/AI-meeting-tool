@@ -249,6 +249,154 @@ def test_recording_stops_and_finalizes_on_button_or_device_failure(device_failed
     assert result == recorder.stop.return_value
 
 
+@pytest.mark.parametrize("first_live", [False, True])
+def test_recordings_can_overlap_background_transcription(tmp_path, monkeypatch, first_live):
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from meetmin.gui import app
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(app.MeetingWindow, "refresh_devices", lambda self: None)
+    cfg = {**load_config(tmp_path / "defaults.yaml"), "output_dir": str(tmp_path)}
+    window = app.MeetingWindow(
+        cfg, QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    )
+    window.loopback_available = True
+    window.update_controls()
+    allow_merge, allow_first_asr, allow_second_asr = Event(), Event(), Event()
+    started_recording, started_transcribing, live_sessions = [], [], []
+
+    def title(session):
+        return workflow.metadata(session)["title"]
+
+    def wait_until(condition):
+        for _ in range(300):
+            if condition():
+                return
+            QTest.qWait(10)
+        assert condition()
+
+    def wait_for_gate(gate):
+        assert gate.wait(10), "test did not release the background job"
+
+    class Recorder:
+        dual_track = False
+
+        def start(self, session):
+            self.session = session
+            started_recording.append(title(session))
+
+        def status(self):
+            return {"failed": False}
+
+        def set_audio_tap(self, _callback):
+            pass
+
+        def stop(self, *, on_device_released):
+            on_device_released()
+            if title(self.session) == "A":
+                wait_for_gate(allow_merge)
+            self.session.audio_path.write_bytes(title(self.session).encode())
+            return {}
+
+    def finish_transcript(session):
+        session.save_text("transcript.md", f"会议 {title(session)} 的转写")
+        return {"utterances": [{"text": title(session)}]}
+
+    class LiveCoordinator:
+        error = None
+
+        def __init__(self, _cfg, session, emit, **_kwargs):
+            self.session, self.emit = session, emit
+
+        def start(self):
+            live_sessions.append(title(self.session))
+
+        def feed(self, _track, _event):
+            pass
+
+        def finish(self):
+            started_transcribing.append("A")
+            self.emit({"type": "live.status", "message": "仅属于 A 场的实时事件"})
+            return finish_transcript(self.session)
+
+        def close(self):
+            wait_for_gate(allow_first_asr)
+
+    def transcribe(pipe, session, stage, **_kwargs):
+        name = title(session)
+        stage(f"正在转写会议 {name}")
+        pipe.progress(f"会议 {name} 的日志")
+        started_transcribing.append(name)
+        if name == "A":
+            wait_for_gate(allow_first_asr)
+        elif name == "B":
+            wait_for_gate(allow_second_asr)
+        return finish_transcript(session)
+
+    monkeypatch.setattr(Pipeline, "recorder", lambda *a, **k: Recorder())
+    monkeypatch.setattr(workflow, "LiveSessionCoordinator", LiveCoordinator)
+    monkeypatch.setattr(workflow, "transcribe", transcribe)
+
+    def start(name, *, live=True):
+        assert window.new.isEnabled()
+        window.new.click()
+        assert window.start.isEnabled()
+        window.meeting_name.setText(name)
+        window.live_enabled.setChecked(live)
+        window.start.click()
+        wait_until(lambda: name in started_recording)
+        assert window.session is not None and title(window.session) == name
+        return window.session
+
+    try:
+        first = start("A", live=first_live)
+        window.stop.click()
+        wait_until(window.new.isEnabled)
+        assert not first.audio_path.exists()
+
+        second = start("B")
+        assert "本场先录音" in window.record_hint.text()
+        window.stop.click()
+        wait_until(lambda: second.audio_path.exists() and "已排队" in window.stage.text())
+        assert not started_transcribing
+
+        third = start("C")
+        allow_merge.set()
+        wait_until(lambda: started_transcribing == ["A"])
+        assert title(window.session) == "C" and window.stop.isEnabled()
+        allow_first_asr.set()
+        wait_until(lambda: started_transcribing == ["A", "B"])
+        assert title(window.session) == "C" and window.stop.isEnabled()
+        assert "会议 A" not in window.log.toPlainText()
+        assert "会议 B" not in window.log.toPlainText()
+        assert live_sessions == (["A"] if first_live else [])
+
+        window.stop.click()
+        wait_until(lambda: third.audio_path.exists() and "已排队" in window.stage.text())
+        window.refresh_history(second)
+        assert "正在转写会议 B" in window.stage.text()
+        assert "会议 B 的日志" in window.log.toPlainText()
+        allow_second_asr.set()
+        wait_until(lambda: not window.jobs)
+        assert started_transcribing == ["A", "B", "C"]
+        for session, name in ((first, "A"), (second, "B"), (third, "C")):
+            assert session.audio_path.read_bytes() == name.encode()
+            assert f"会议 {name} 的转写" in session.transcript_md.read_text(encoding="utf-8")
+    finally:
+        allow_merge.set()
+        allow_first_asr.set()
+        allow_second_asr.set()
+        window.request_stop()
+        wait_until(lambda: not window.jobs)
+        window.close()
+        application.processEvents()
+
+
 def test_align_only_retry_does_not_need_original_audio_or_repeat_asr(tmp_path):
     cfg = load_config(tmp_path / "defaults.yaml")
     pipe = Mock(spec=Pipeline)

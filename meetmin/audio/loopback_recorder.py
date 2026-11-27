@@ -896,6 +896,16 @@ class LoopbackRecorder:
         self._producer_done.set()
         return True
 
+    def _release_device(self) -> bool:
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception as error:
+                self._fail(error)
+                return False
+            self._pa = None
+        return True
+
     def _shutdown(self, *, stream_already_closed: bool = False) -> bool:
         if not stream_already_closed and not self._close_stream():
             return False
@@ -921,14 +931,7 @@ class LoopbackRecorder:
                 except Exception as error:
                     self._fail(error)
                 self._sealed_writer = None
-        if self._pa is not None:
-            try:
-                self._pa.terminate()
-            except Exception as error:
-                self._fail(error)
-                return False
-            self._pa = None
-        return True
+        return self._release_device()
 
     def _info(self) -> dict:
         return {

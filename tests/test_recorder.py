@@ -901,6 +901,50 @@ def test_dual_recording_shares_boundaries_across_device_clocks(recording, monkey
     assert microphone.is_file()
 
 
+def test_dual_recording_releases_devices_before_merging(recording, tmp_path):
+    r = recording
+    first = Session(tmp_path, "first")
+    second = Session(tmp_path, "second")
+    a = SessionRecorder(r.rec, MicrophoneRecorder(channels=1, clock=r.clock))
+    b = SessionRecorder(LoopbackRecorder(device=0, clock=r.clock))
+    a.start(first)
+    r.streams[0].emit(0, value=1000)
+    r.streams[1].emit(0, value=1000, frames=200)
+
+    def released():
+        assert all(stream.closed for stream in r.streams)
+        assert all(instance.terminated for instance in r.instances)
+        assert not first.recording_manifest.exists()
+        b.start(second)
+
+    a.stop(on_device_released=released)
+    r.streams[2].emit(0, value=2000, received=r.clock.value + 0.1)
+    b.stop()
+    assert first.recording_manifest.is_file()
+    assert second.audio_path.is_file()
+    assert np.max(read_audio(first.recording_paths()[0])) == 1000
+    assert np.max(read_audio(second.audio_path)) == 2000
+
+
+def test_dual_recording_waits_for_both_devices_to_release(recording, tmp_path):
+    r = recording
+    session = Session(tmp_path, "dual")
+    recorder = SessionRecorder(r.rec, MicrophoneRecorder(channels=1, clock=r.clock))
+    recorder.start(session)
+    released = threading.Event()
+    r.streams[1].close_error = OSError("设备尚未释放")
+    with pytest.raises(RecordingError) as pending:
+        recorder.stop(on_device_released=released.set)
+    assert pending.value.info["cleanup_pending"]
+    assert not released.is_set()
+
+    r.streams[1].close_error = None
+    with pytest.raises(RecordingError) as finished:
+        recorder.stop(on_device_released=released.set)
+    assert not finished.value.info["cleanup_pending"]
+    assert released.is_set()
+
+
 @pytest.mark.parametrize("rate", [16000, 44100, 48000])
 def test_microphone_mute_preserves_wav_and_live_timeline(recording, tmp_path, rate):
     r = recording

@@ -160,6 +160,13 @@ class LiveSessionCoordinator:
         self._cancelled.set()
         self._voice_cancelled.set()
 
+    def close(self) -> None:
+        """Wait for the model owner and the voice worker after cancelling input."""
+        self.cancel()
+        self._thread.join()
+        if self._voice_thread is not None:
+            self._voice_thread.join()
+
     def _status(self, message: str) -> None:
         if not self._cancelled.is_set():
             self.emit({"type": "live.status", "message": message})
